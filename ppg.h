@@ -1,0 +1,83 @@
+/*
+ * MAX30105/MAX30102 (PPG) -> BPM, SpO2, dan estimasi glukosa EKSPERIMENTAL.
+ *
+ * Diadaptasi dari sketch ESP32-C3 standalone. Yang HARUS berubah untuk board
+ * ini dan alasannya -- ketiganya bukan preferensi gaya, tapi hal yang membuat
+ * kode aslinya tidak bisa dipakai di sini:
+ *
+ *  1. Bus I2C 100 kHz, BUKAN 400 kHz. Sketch asli memanggil
+ *     begin(Wire, I2C_SPEED_FAST) dan begin() itu melakukan setClock() -- jadi
+ *     ia akan menaikkan bus jadi 400 kHz. Touch CST816T di board ini tidak
+ *     stabil di 400 kHz (lihat catatan di touch.ino), jadi sentuhan akan rusak.
+ *
+ *  2. Pembacaan non-blocking. getRed()/getIR() memanggil safeCheck(250) yang
+ *     MENUNGGU sampai 250 ms per pemanggilan -- dua pemanggilan per sampel
+ *     berarti loop bisa berhenti sampai setengah detik. LVGL akan membeku
+ *     total. Di sini dipakai check()/available()/getFIFO*()/nextSample() yang
+ *     hanya mengambil apa yang sudah ada di FIFO.
+ *
+ *  3. Tidak ada while(1) saat sensor tak terdeteksi. Sketch asli menggantung
+ *     selamanya; di jam tangan itu berarti seluruh UI mati hanya karena satu
+ *     sensor tidak terpasang. Di sini kegagalan dilaporkan lalu diabaikan.
+ *
+ * Semua fungsi dipanggil dari konteks loop() -- sama seperti touch dan RTC,
+ * supaya tidak ada dua transaksi I2C yang saling menyela.
+ *
+ * PERINGATAN MEDIS (dipertahankan dari sketch asli):
+ * Nilai glukosa TIDAK punya dasar fisiologis tervalidasi. Tidak ada metode PPG
+ * non-invasif berbasis Red/IR yang tervalidasi klinis untuk glukosa pada
+ * perangkat konsumen. Angkanya adalah model linear placeholder atas fitur
+ * sinyal (PI, R, HR) yang harus dikalibrasi sendiri, dan bahkan setelah
+ * dikalibrasi akurasinya tidak bisa dijamin. JANGAN dipakai untuk keputusan
+ * medis apa pun, termasuk dosis obat atau insulin.
+ */
+#pragma once
+
+typedef enum {
+  PPG_ABSENT = 0,     /* sensor tidak terdeteksi di I2C          */
+  PPG_NO_CONTACT,     /* tidak ada kulit menempel                */
+  PPG_SETTLING,       /* filter DC sedang konvergen              */
+  PPG_ACQUIRING,      /* mencari detak yang konsisten            */
+  PPG_STABLE          /* bacaan sudah bisa dipakai               */
+} ppg_state_t;
+
+typedef struct {
+  ppg_state_t state;
+
+  bool  bpm_valid;
+  float bpm;
+
+  bool  spo2_valid;
+  float spo2;         /* sudah termasuk koreksi bias situs wrist */
+
+  bool  glu_valid;
+  float glucose;      /* EKSPERIMENTAL -- lihat peringatan di atas */
+
+  float pi;           /* perfusion index IR (%), fitur kalibrasi   */
+  float r;            /* rasio R, fitur kalibrasi                  */
+
+  /* Statistik sepanjang sesi kontak berjalan. Dipakai untuk chip di halaman
+   * detail supaya angka di bawah tidak dikarang saat angka utamanya nyata. */
+  int   bpm_min, bpm_avg, bpm_max;
+  int   spo2_min, spo2_avg;
+  int   glu_min, glu_max;
+  bool  stats_valid;
+} ppg_data_t;
+
+/* Deteksi + konfigurasi sensor. Panggil setelah Wire.begin().
+ * false = sensor tidak ada; modul lalu diam saja dan UI tetap jalan. */
+bool ppg_begin(void);
+
+/* Kuras FIFO dan proses sampel. Murah dan non-blocking; panggil dari loop().
+ * Sampling internal 100 Hz, FIFO 32 sampel, jadi dipanggil tiap <=20 ms
+ * sudah cukup jauh dari risiko overflow. */
+void ppg_update(void);
+
+/* Salinan hasil terakhir. */
+void ppg_get(ppg_data_t *out);
+
+/* true kalau sensor terdeteksi saat ppg_begin(). */
+bool ppg_present(void);
+
+/* Teks status singkat untuk log/diagnostik. */
+const char *ppg_state_text(void);

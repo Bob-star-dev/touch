@@ -18,6 +18,15 @@
  *
  * Aset gambar (pesawat+bulan, ikon) ada di ui_assets.h, dibuat otomatis dari
  * mockup. Jalankan genassets.py kalau mockup berubah.
+ *
+ * Modul data (semua akses I2C ada di konteks loop, lihat net.h soal thread):
+ *   rtc / time_manager  - PCF85063 + sinkronisasi NTP
+ *   net / weather       - Wi-Fi, NTP, OpenWeatherMap
+ *   battery             - ADC1 + kurva Li-Po
+ *   ppg                 - MAX30105/30102: BPM, SpO2, glukosa EKSPERIMENTAL
+ *
+ * PERINGATAN: nilai glukosa tidak punya dasar fisiologis tervalidasi dan tidak
+ * boleh dipakai untuk keputusan medis apa pun. Lihat ppg.h.
  */
 
 #include <lvgl.h>
@@ -32,6 +41,7 @@
 #include "weather.h"
 #include "net.h"
 #include "battery.h"
+#include "ppg.h"
 
 /* Tujuan navigasi satu tombol/kartu. Definisinya harus di sini, di atas fungsi
  * pertama: Arduino menyuntikkan prototipe otomatis tepat sebelum definisi fungsi
@@ -234,26 +244,19 @@ static void my_touch_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
 #define C_RED       0xE05B5B
 
 /* ================= SUMBER DATA =================
- * NYATA  : jam/hari/tanggal/bulan/tahun  -> RTC PCF85063 + sinkronisasi NTP
- *          cuaca + suhu                  -> OpenWeatherMap lewat Wi-Fi
- *          kapasitas baterai              -> ADC1 + kurva Li-Po
- * PLACEHOLDER (belum ada sensornya di board ini):
- *          detak jantung, SpO2, glukosa
+ * Semua nilai di UI kini berasal dari perangkat keras nyata:
+ *   jam/hari/tanggal/bulan/tahun  -> RTC PCF85063 + sinkronisasi NTP
+ *   cuaca + suhu                  -> OpenWeatherMap lewat Wi-Fi
+ *   kapasitas baterai             -> ADC1 + kurva Li-Po
+ *   BPM + SpO2                    -> MAX30105/30102 (PPG, Red+IR)
+ *   glukosa                       -> MAX30105/30102, EKSPERIMENTAL (lihat ppg.h)
  *
- * Nilai placeholder di bawah memakai angka mockup dengan sedikit drift supaya
- * tidak terlihat beku. Ganti isi health_tick() kalau sensornya sudah terpasang.
+ * Tidak ada lagi angka yang dikarang. Kalau sebuah nilai belum tersedia --
+ * sensor tidak menempel, cuaca belum terambil -- label menampilkan "--", bukan
+ * angka contoh. Pada layar kesehatan, angka contoh yang tampak nyata lebih
+ * berbahaya daripada tanda hubung.
  */
-static int   hr_bpm      = 78;    /* detak jantung, bpm     */
-static int   hr_rest     = 62;
-static int   hr_avg      = 74;
-static int   hr_max      = 121;
-static int   spo2_pct    = 98;    /* saturasi oksigen, %    */
-static int   spo2_min    = 95;
-static int   spo2_avg    = 97;
-static int   glu_mgdl    = 96;    /* glukosa, mg/dL         */
-static int   glu_fast    = 88;
-static int   glu_meal    = 124;
-static int   glu_target  = 92;
+
 /* ================= Handle layar & widget ================= */
 static lv_obj_t *scr_home, *scr_menu, *scr_hr, *scr_spo2, *scr_glu;
 
@@ -265,6 +268,13 @@ static lv_obj_t *lbl_card_hr, *lbl_card_sp, *lbl_card_gl;
 /* detail */
 static lv_obj_t *arc_hr, *lbl_hr_big, *ring_sp, *lbl_sp_big, *lbl_glu_big;
 static lv_obj_t *dot_live;
+/* Handle tambahan supaya chip statistik, teks zona, dan penanda bar ikut
+ * mengikuti data nyata. Ini hanya menyimpan pointer objek yang sudah ada --
+ * posisi, ukuran, font, dan warnanya tidak diubah. Perlu, karena angka utama
+ * yang nyata di atas angka yang dikarang di bawahnya justru menyesatkan. */
+static lv_obj_t *chip_hr[3], *chip_sp[3], *chip_gl[3];
+static lv_obj_t *lbl_hr_zone, *lbl_glu_status;
+static lv_obj_t *mark_hr, *mark_glu;
 
 /* ================= Helper pembuat widget ================= */
 
@@ -318,25 +328,27 @@ static void mk_deco(lv_obj_t *scr, int cx, int cy, int r, uint32_t color) {
 }
 
 /* Bar tersegmen (zona hijau/kuning/merah) + penanda putih. */
-static void mk_zonebar(lv_obj_t *parent, int x, int y, int w, int h,
-                       const int *seg_w, const uint32_t *seg_c, int n, int marker_x) {
+static lv_obj_t *mk_zonebar(lv_obj_t *parent, int x, int y, int w, int h,
+                            const int *seg_w, const uint32_t *seg_c, int n,
+                            int marker_x) {
   int cx = x;
   for (int i = 0; i < n; i++) {
     int r = (i == 0 || i == n - 1) ? h / 2 : 0;
     mk_box(parent, cx, y, seg_w[i], h, seg_c[i], r);
     cx += seg_w[i];
   }
-  mk_box(parent, x + marker_x, y - 1, 3, h + 2, 0xFFFFFF, 1);
+  return mk_box(parent, x + marker_x, y - 1, 3, h + 2, 0xFFFFFF, 1);
 }
 
 /* Tiga chip statistik di bagian bawah halaman detail. */
 static void mk_chips(lv_obj_t *parent, const char *a, const char *b, const char *c,
-                     uint32_t bg, uint32_t fg) {
+                     uint32_t bg, uint32_t fg, lv_obj_t **out) {
   const char *txt[3] = { a, b, c };
   for (int i = 0; i < 3; i++) {
     lv_obj_t *chip = mk_box(parent, 10 + i * 75, 235, 70, 30, bg, 10);
     lv_obj_t *l = mk_label(chip, txt[i], &lv_font_montserrat_12, fg, 0, 0);
     lv_obj_center(l);
+    if (out) out[i] = l;
   }
 }
 
@@ -511,11 +523,11 @@ static void build_menu(void) {
 
   mk_header(scr_menu, "Menu kesehatan", C_S2_BTN, &NAV_HOME);
 
-  lv_obj_t *c1 = mk_card(scr_menu, 44,  C_HR_BG, "Heart rate", "78 bpm",
+  lv_obj_t *c1 = mk_card(scr_menu, 44,  C_HR_BG, "Heart rate", "-- bpm",
                          C_HR_TITLE, C_HR_SUB, &NAV_HR,   &lbl_card_hr);
-  lv_obj_t *c2 = mk_card(scr_menu, 116, C_SP_BG, "SpO2", "98 %",
+  lv_obj_t *c2 = mk_card(scr_menu, 116, C_SP_BG, "SpO2", "-- %",
                          C_SP_TITLE, C_SP_SUB, &NAV_SPO2, &lbl_card_sp);
-  lv_obj_t *c3 = mk_card(scr_menu, 188, C_GL_BG, "Glukosa", "96 mg/dL",
+  lv_obj_t *c3 = mk_card(scr_menu, 188, C_GL_BG, "Glukosa", "-- mg/dL",
                          C_GL_TITLE, C_GL_SUB, &NAV_GLU,  &lbl_card_gl);
 
   /* ikon kartu: posisi vertikal ditengahkan manual terhadap tinggi kartu 64 */
@@ -575,7 +587,7 @@ static void build_hr(void) {
   lv_arc_set_rotation(arc_hr, 135);
   lv_arc_set_bg_angles(arc_hr, 0, 270);
   lv_arc_set_range(arc_hr, 0, 100);
-  lv_arc_set_value(arc_hr, 60);
+  lv_arc_set_value(arc_hr, 0);
   lv_obj_remove_style(arc_hr, NULL, LV_PART_KNOB);
   lv_obj_clear_flag(arc_hr, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_set_style_arc_width(arc_hr, 7, LV_PART_MAIN);
@@ -587,15 +599,15 @@ static void build_hr(void) {
   lv_obj_set_style_border_width(arc_hr, 0, 0);
   mk_img(scr_hr, &img_heart_lg, 35, 69);
 
-  lbl_hr_big = mk_label(scr_hr, "78", &lv_font_montserrat_30, 0xFFFFFF, 96, 64);
+  lbl_hr_big = mk_label(scr_hr, "--", &lv_font_montserrat_30, 0xFFFFFF, 96, 64);
   mk_label(scr_hr, "bpm", &lv_font_montserrat_14, C_S3_MUTE, 151, 84);
 
-  mk_label(scr_hr, "Zona: ringan " TXT_DOT " 60% target",
-           &lv_font_montserrat_10, C_PINK, 94, 103);
+  lbl_hr_zone = mk_label(scr_hr, "Zona: -- " TXT_DOT " -- target",
+                         &lv_font_montserrat_10, C_PINK, 94, 103);
 
   static const int    zw[3] = { 36, 37, 37 };
   static const uint32_t zc[3] = { C_GREEN, C_YELLOW, C_RED };
-  mk_zonebar(scr_hr, 94, 118, 110, 9, zw, zc, 3, 26);
+  mark_hr = mk_zonebar(scr_hr, 94, 118, 110, 9, zw, zc, 3, 26);
 
   /* EKG */
   ecg_build();
@@ -615,11 +627,7 @@ static void build_hr(void) {
            i == 11 ? C_PINK : C_S3_BAR, 3);
   }
 
-  char a[16], b[16], c[16];
-  snprintf(a, sizeof(a), "Ist. %d", hr_rest);
-  snprintf(b, sizeof(b), "Avg %d", hr_avg);
-  snprintf(c, sizeof(c), "Max %d", hr_max);
-  mk_chips(scr_hr, a, b, c, C_S3_CARD, C_HR_TITLE);
+  mk_chips(scr_hr, "Ist. --", "Avg --", "Max --", C_S3_CARD, C_HR_TITLE, chip_hr);
 }
 
 /* ================= Halaman 4 : SpO2 ================= */
@@ -649,7 +657,7 @@ static void build_spo2(void) {
   lv_arc_set_rotation(ring_sp, 270);
   lv_arc_set_bg_angles(ring_sp, 0, 360);
   lv_arc_set_range(ring_sp, 0, 100);
-  lv_arc_set_value(ring_sp, 98);
+  lv_arc_set_value(ring_sp, 0);
   lv_obj_remove_style(ring_sp, NULL, LV_PART_KNOB);
   lv_obj_clear_flag(ring_sp, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_set_style_arc_width(ring_sp, 9, LV_PART_MAIN);
@@ -660,7 +668,7 @@ static void build_spo2(void) {
   lv_obj_set_style_bg_opa(ring_sp, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(ring_sp, 0, 0);
 
-  lbl_sp_big = mk_label(scr_spo2, "98%", &lv_font_montserrat_30, 0xFFFFFF, 0, 0);
+  lbl_sp_big = mk_label(scr_spo2, "--", &lv_font_montserrat_30, 0xFFFFFF, 0, 0);
   lv_obj_align_to(lbl_sp_big, ring_sp, LV_ALIGN_CENTER, 0, -8);
   lv_obj_t *ok = mk_label(scr_spo2, "oksigen", &lv_font_montserrat_14, C_BLUE, 0, 0);
   lv_obj_align_to(ok, ring_sp, LV_ALIGN_CENTER, 0, 16);
@@ -694,10 +702,7 @@ static void build_spo2(void) {
   static const int spv[7] = { 95, 96, 95, 97, 96, 98, 98 };
   for (int i = 0; i < 7; i++) lv_chart_set_value_by_id(sp_chart, sp_ser, i, spv[i]);
 
-  char a[16], b[16];
-  snprintf(a, sizeof(a), "Min %d", spo2_min);
-  snprintf(b, sizeof(b), "Avg %d", spo2_avg);
-  mk_chips(scr_spo2, a, b, "Normal", C_S4_CARD, C_S4_TITLE);
+  mk_chips(scr_spo2, "Min --", "Avg --", "--", C_S4_CARD, C_S4_TITLE, chip_sp);
 }
 
 /* ================= Halaman 5 : Glukosa ================= */
@@ -717,17 +722,19 @@ static void build_glu(void) {
   mk_header(scr_glu, "Glukosa darah", C_S5_CARD, &NAV_MENU);
   mk_pill(scr_glu, 168, 72, "stabil " LV_SYMBOL_RIGHT, C_S5_CARD, C_GREEN2);
 
-  lbl_glu_big = mk_label(scr_glu, "96", &lv_font_montserrat_46, 0xFFFFFF, 12, 42);
+  lbl_glu_big = mk_label(scr_glu, "--", &lv_font_montserrat_46, 0xFFFFFF, 12, 42);
   mk_label(scr_glu, "mg/dL", &lv_font_montserrat_14, C_S5_MUTE, 72, 66);
 
   /* Bar digeser ke x=122 (mockup: 110) karena montserrat_46 lebih lebar dari
    * font mockup, jadi "96" + "mg/dL" butuh 12 px ekstra. */
   static const int    gw[3] = { 19, 53, 25 };
   static const uint32_t gc[3] = { C_YELLOW, C_GREEN, C_RED };
-  mk_zonebar(scr_glu, 122, 62, 97, 7, gw, gc, 3, 32);
+  mark_glu = mk_zonebar(scr_glu, 122, 62, 97, 7, gw, gc, 3, 32);
 
-  mk_label(scr_glu, LV_SYMBOL_OK " Normal (70-140) " TXT_DOT " waktu dalam target 92%",
-           &lv_font_montserrat_10, C_GREEN2, 10, 91);
+  /* Teks ini semula mengklaim "Normal" tanpa melihat data. Sekarang mengikuti
+   * nilai sebenarnya -- klaim klinis yang salah lebih buruk daripada "--". */
+  lbl_glu_status = mk_label(scr_glu, "Menunggu pengukuran",
+                            &lv_font_montserrat_10, C_GREEN2, 10, 91);
 
   mk_label(scr_glu, "Tren hari ini", &lv_font_montserrat_12, C_S5_MUTE, 10, 111);
 
@@ -760,33 +767,123 @@ static void build_glu(void) {
   lv_obj_set_width(r, 230);
   lv_obj_set_style_text_align(r, LV_TEXT_ALIGN_RIGHT, 0);
 
-  char a[16], b[16], c[16];
-  snprintf(a, sizeof(a), "Puasa %d", glu_fast);
-  snprintf(b, sizeof(b), "Makan %d", glu_meal);
-  snprintf(c, sizeof(c), "Target %d%%", glu_target);
-  mk_chips(scr_glu, a, b, c, C_S5_CARD, C_GL_TITLE);
+  mk_chips(scr_glu, "Min --", "Maks --", "PI --", C_S5_CARD, C_GL_TITLE, chip_gl);
 }
 
-/* ================= Timer: perbarui isi layar ================= */
-/* Drift kecil supaya angka placeholder tidak terlihat beku. Ganti seluruh
- * fungsi ini dengan pembacaan sensor asli kalau sensornya sudah terpasang. */
-static void health_tick(void) {
-  static int t = 0;
-  t++;
-  hr_bpm   = 78 + (t % 7) - 3;
-  spo2_pct = 97 + ((t / 3) % 2);
-  glu_mgdl = 96 + (t % 5) - 2;
+/* ================= Timer: perbarui isi layar =================
+ * Semua label diperbarui HANYA saat nilainya berubah. lv_label_set_text()
+ * selalu meng-invalidate area labelnya, dan beberapa di antaranya memakai
+ * montserrat_46/48 -- redraw dua kali per detik tanpa alasan membuat animasi
+ * transisi layar tersendat.
+ */
+
+/* Tulis label hanya kalau isinya beda. Mengembalikan true kalau berubah. */
+static bool set_if_changed(lv_obj_t *lbl, const char *txt) {
+  const char *cur = lv_label_get_text(lbl);
+  if (cur && strcmp(cur, txt) == 0) return false;
+  lv_label_set_text(lbl, txt);
+  return true;
+}
+
+/* Perbarui seluruh tampilan kesehatan dari data PPG. */
+static void update_health_ui(void) {
+  ppg_data_t p;
+  ppg_get(&p);
+  /* 48 byte, bukan 24: "Zona: rendah <bullet> 100% target" = 28 byte (bullet
+   * UTF-8 3 byte) dan "Estimasi dalam rentang (70-140)" = 31 byte. */
+  char b[48];
+
+  /* ---- kartu menu ---- */
+  if (p.bpm_valid) snprintf(b, sizeof(b), "%d bpm", (int)lroundf(p.bpm));
+  else             snprintf(b, sizeof(b), "-- bpm");
+  set_if_changed(lbl_card_hr, b);
+
+  if (p.spo2_valid) snprintf(b, sizeof(b), "%d %%", (int)lroundf(p.spo2));
+  else              snprintf(b, sizeof(b), "-- %%");
+  set_if_changed(lbl_card_sp, b);
+
+  if (p.glu_valid) snprintf(b, sizeof(b), "%d mg/dL", (int)lroundf(p.glucose));
+  else             snprintf(b, sizeof(b), "-- mg/dL");
+  set_if_changed(lbl_card_gl, b);
+
+  /* ---- halaman 3: heart rate ---- */
+  if (p.bpm_valid) {
+    int bpm = (int)lroundf(p.bpm);
+    snprintf(b, sizeof(b), "%d", bpm);
+    set_if_changed(lbl_hr_big, b);
+    lv_arc_set_value(arc_hr, bpm > 100 ? 100 : bpm);
+
+    /* Zona dihitung dari nilai sebenarnya, bukan teks tetap. */
+    const char *zona = bpm < 60  ? "rendah"
+                     : bpm < 100 ? "ringan"
+                     : bpm < 140 ? "sedang" : "berat";
+    int target = (int)((bpm * 100L) / 190);      /* 190 = perkiraan HR maks */
+    snprintf(b, sizeof(b), "Zona: %s " TXT_DOT " %d%% target", zona, target);
+    set_if_changed(lbl_hr_zone, b);
+    lv_obj_set_x(mark_hr, 94 + (bpm > 200 ? 110 : bpm * 110 / 200));
+  } else {
+    set_if_changed(lbl_hr_big, "--");
+    lv_arc_set_value(arc_hr, 0);
+    set_if_changed(lbl_hr_zone, "Zona: -- " TXT_DOT " -- target");
+  }
+
+  /* ---- halaman 4: SpO2 ---- */
+  if (p.spo2_valid) {
+    int sp = (int)lroundf(p.spo2);
+    snprintf(b, sizeof(b), "%d%%", sp);
+    set_if_changed(lbl_sp_big, b);
+    lv_arc_set_value(ring_sp, sp);
+  } else {
+    set_if_changed(lbl_sp_big, "--");
+    lv_arc_set_value(ring_sp, 0);
+  }
+
+  /* ---- halaman 5: glukosa (EKSPERIMENTAL) ---- */
+  if (p.glu_valid) {
+    int gl = (int)lroundf(p.glucose);
+    snprintf(b, sizeof(b), "%d", gl);
+    set_if_changed(lbl_glu_big, b);
+    /* Status mengikuti nilai. Sengaja TIDAK memakai centang "Normal" seperti
+     * sebelumnya: nilainya berasal dari model yang belum tervalidasi, jadi
+     * klaim klinis tidak pantas. Kata "estimasi" dipertahankan agar terlihat. */
+    snprintf(b, sizeof(b), "Estimasi %s (70-140)",
+             gl < 70 ? "rendah" : gl <= 140 ? "dalam rentang" : "tinggi");
+    set_if_changed(lbl_glu_status, b);
+    lv_obj_set_x(mark_glu, 122 + (gl < 40 ? 0 : gl > 240 ? 97
+                                  : (gl - 40) * 97 / 200));
+  } else {
+    set_if_changed(lbl_glu_big, "--");
+    set_if_changed(lbl_glu_status, "Menunggu pengukuran");
+  }
+
+  /* ---- chip statistik sesi ---- */
+  if (p.stats_valid) {
+    snprintf(b, sizeof(b), "Ist. %d", p.bpm_min);  set_if_changed(chip_hr[0], b);
+    snprintf(b, sizeof(b), "Avg %d",  p.bpm_avg);  set_if_changed(chip_hr[1], b);
+    snprintf(b, sizeof(b), "Max %d",  p.bpm_max);  set_if_changed(chip_hr[2], b);
+
+    snprintf(b, sizeof(b), "Min %d", p.spo2_min);  set_if_changed(chip_sp[0], b);
+    snprintf(b, sizeof(b), "Avg %d", p.spo2_avg);  set_if_changed(chip_sp[1], b);
+    set_if_changed(chip_sp[2], p.spo2_min >= 95 ? "Normal" : "Rendah");
+
+    snprintf(b, sizeof(b), "Min %d",  p.glu_min);  set_if_changed(chip_gl[0], b);
+    snprintf(b, sizeof(b), "Maks %d", p.glu_max);  set_if_changed(chip_gl[1], b);
+    snprintf(b, sizeof(b), "PI %.1f", p.pi);       set_if_changed(chip_gl[2], b);
+  }
+
+  /* LED "live" hanya berkedip saat pengukuran benar-benar berjalan. */
+  static bool blink = false;
+  blink = !blink;
+  if (p.state == PPG_STABLE)
+    lv_obj_set_style_opa(dot_live, blink ? LV_OPA_COVER : LV_OPA_40, 0);
+  else
+    lv_obj_set_style_opa(dot_live, LV_OPA_20, 0);
 }
 
 static void refresh_cb(lv_timer_t *tm) {
   (void)tm;
-  static bool blink = false;
-  blink = !blink;
-  lv_obj_set_style_opa(dot_live, blink ? LV_OPA_COVER : LV_OPA_40, 0);
-
   /* Konteks loop: di sinilah RTC dibaca dan hasil NTP diterapkan. */
   tm_tick();
-  health_tick();
 
   /* ---- halaman 1: jam & tanggal dari RTC/NTP ----
    * Timer ini 500 ms, tapi label hanya disentuh saat nilainya benar-benar
@@ -837,17 +934,7 @@ static void refresh_cb(lv_timer_t *tm) {
     }
   }
 
-  /* halaman 2 */
-  lv_label_set_text_fmt(lbl_card_hr, "%d bpm", hr_bpm);
-  lv_label_set_text_fmt(lbl_card_sp, "%d %%", spo2_pct);
-  lv_label_set_text_fmt(lbl_card_gl, "%d mg/dL", glu_mgdl);
-
-  /* halaman 3..5 */
-  lv_label_set_text_fmt(lbl_hr_big, "%d", hr_bpm);
-  lv_arc_set_value(arc_hr, hr_bpm > 100 ? 100 : hr_bpm);
-  lv_label_set_text_fmt(lbl_sp_big, "%d%%", spo2_pct);
-  lv_arc_set_value(ring_sp, spo2_pct);
-  lv_label_set_text_fmt(lbl_glu_big, "%d", glu_mgdl);
+  update_health_ui();
 
   /* Heartbeat tiap 5 s. Sengaja jarang: USB CDC board ini re-enumerate setelah
    * reset sehingga print di setup() hampir selalu hilang, jadi baris inilah
@@ -876,6 +963,12 @@ static void refresh_cb(lv_timer_t *tm) {
                   w.valid ? w.cond : "--", w.temp_c,
                   (unsigned long)touch_irq_count, (unsigned long)touch_readerr,
                   (unsigned long)touch_events, (unsigned long)ESP.getFreeHeap());
+    ppg_data_t pp; ppg_get(&pp);
+    Serial.printf("[ppg]  %s  bpm=%s%.0f  spo2=%s%.1f  glukosa*=%s%.0f\n",
+                  ppg_state_text(),
+                  pp.bpm_valid ? "" : "(-)", pp.bpm,
+                  pp.spo2_valid ? "" : "(-)", pp.spo2,
+                  pp.glu_valid ? "" : "(-)", pp.glucose);
     Serial.printf("[batt] counts=%d/4095  raw=%d mV (sebaran %d mV)  "
                   "baterai=%d mV  %d%%\n",
                   battery_raw_counts(), battery_raw_millivolts(),
@@ -959,6 +1052,7 @@ void setup() {
   rtc_begin();
   tm_begin();
   battery_begin();
+  ppg_begin();
 
   build_home();
   build_menu();
@@ -980,6 +1074,14 @@ void setup() {
 
 void loop() {
   touch_poll();          /* tangkap IRQ secepat mungkin, jangan tunggu LVGL */
+
+  /* PPG ditunda selama masih ada IRQ touch yang belum diproses. Keduanya berbagi
+   * bus I2C, dan satu transaksi FIFO MAX30105 (~1 ms di 100 kHz) cukup untuk
+   * menunda pembacaan touch yang datanya hilang hampir seketika setelah IRQ.
+   * Touch selalu menang; PPG cuma mundur satu iterasi (~2 ms) dan FIFO-nya
+   * punya cadangan 320 ms, jadi tidak ada sampel yang hilang. */
+  if (!touch_irq_flag) ppg_update();
+
   lv_timer_handler();
   delay(2);
 }
