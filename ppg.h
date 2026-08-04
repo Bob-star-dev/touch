@@ -62,6 +62,12 @@ typedef struct {
   int   spo2_min, spo2_avg;
   int   glu_min, glu_max;
   bool  stats_valid;
+
+  /* true = angka ini salinan hasil terakhir, bukan bacaan langsung (sensor
+   * sudah diangkat). Nilainya tetap valid untuk ditampilkan; penandanya ada
+   * supaya UI bisa membedakan "sedang mengukur" dari "hasil terakhir". */
+  bool     held;
+  uint32_t hold_age_ms;   /* usia salinan dalam ms; 0 kalau bacaan langsung */
 } ppg_data_t;
 
 /* Deteksi + konfigurasi sensor. Panggil setelah Wire.begin().
@@ -73,11 +79,24 @@ bool ppg_begin(void);
  * sudah cukup jauh dari risiko overflow. */
 void ppg_update(void);
 
-/* Salinan hasil terakhir. */
+/* Hasil terkini. Selama kulit menempel isinya bacaan langsung; setelah sensor
+ * diangkat isinya salinan hasil terakhir dengan held=true, sehingga angka di
+ * layar tidak hilang. */
 void ppg_get(ppg_data_t *out);
+
+/* Hapus salinan hasil terakhir sehingga UI kembali menampilkan "--".
+ * Dipanggil dari luar saat layar dimatikan. Pengukuran baru (kulit menempel
+ * lagi) sudah menghapusnya sendiri, jadi tidak perlu dipanggil untuk itu. */
+void ppg_clear_hold(void);
 
 /* true kalau sensor terdeteksi saat ppg_begin(). */
 bool ppg_present(void);
+
+/* Nilai mentah terakhir + jumlah sampel yang sudah diproses, untuk membedakan
+ * "tidak ada jari" dari "FIFO tidak jalan" dan "ambang terlalu tinggi".
+ * Argumen mana pun boleh NULL. */
+void ppg_diag(long *ir, long *red, uint32_t *samples, long *threshold,
+              uint32_t *polls);
 
 /* Teks status singkat untuk log/diagnostik. */
 const char *ppg_state_text(void);

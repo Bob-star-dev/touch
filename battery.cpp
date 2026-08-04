@@ -16,6 +16,47 @@ static bool s_valid    = false;
 static int  s_spread   = 0;    /* max-min jendela sampel terakhir */
 static int  s_counts   = 0;    /* hitungan ADC mentah 0..4095 -- deteksi saturasi */
 
+/* ---- dasar perhitungan persen: minimum jendela bergerak ----
+ *
+ * Median di atas hanya mampu menolak pencilan yang LEBIH PENDEK dari jendelanya
+ * (~2.5 detik). Sag akibat radio Wi-Fi bukan pencilan pendek: ia bertahan
+ * selama seluruh upaya sambung, jadi seluruh jendela berada di dalam satu
+ * keadaan beban dan medianya ikut pindah.
+ *
+ * Terukur di board ini: radio aktif -> 1365 counts, radio mati -> 1382 counts.
+ * Selisih 17 counts = 18 mV di pin = 53 mV di baterai = sekitar 4% pada kurva
+ * di dekat penuh. Kalau persen mengikuti nilai sesaat, angkanya naik-turun 4%
+ * mengikuti radio -- bukan mengikuti daya.
+ *
+ * Versi sebelumnya memakai floor ABADI (terendah yang pernah teramati). Itu
+ * cacat: floor terpasang di 4143 mV saat sel hampir penuh, sementara pemulihan
+ * butuh kenaikan +100 mV = 4243 mV -- di atas batas fisik Li-Po 4200 mV. Jadi
+ * angkanya terpaku permanen dan tidak akan pernah bisa naik lagi.
+ *
+ * Sekarang dasarnya minimum selama 3 menit terakhir. Karena siklus retry Wi-Fi
+ * ~60 detik, setiap jendela hampir pasti memuat satu sag, sehingga angkanya
+ * stabil DAN konsisten (selalu "tegangan saat berbeban"). Bedanya dari floor
+ * abadi: jendela ini ikut bergerak NAIK saat baterai benar-benar diisi.
+ */
+#define WMIN_SLOTS      36            /* 36 x 5 s = 3 menit */
+#define WMIN_SLOT_MS    5000UL
+static uint16_t s_wmin[WMIN_SLOTS];
+static int      s_wmin_n = 0, s_wmin_i = 0;
+static int      s_slot_min = 0;       /* minimum slot 5 s yang sedang berjalan */
+static uint32_t s_slot_ms  = 0;
+static int      s_base_mv  = 0;       /* minimum jendela -> dasar persen */
+static bool     s_charging = false;
+
+/* Acuan sejak nyala. Tanpa ini tidak ada cara membedakan dua sebab yang sama
+ * sekali berbeda ketika persen tidak bergerak:
+ *   - tegangan memang belum turun (kurva Li-Po sangat datar di dekat penuh,
+ *     dan 10 menit pada sel 1000 mAh hanya sekitar 2%)
+ *   - tegangan turun tapi angkanya tertelan plafon 4200 mV = 100% karena
+ *     BATT_DIVIDER terlalu tinggi
+ * Selisih dalam mV memperlihatkan keduanya, jauh sebelum persen bergerak. */
+static int      s_first_mv = 0;
+static uint32_t s_first_ms = 0;
+
 /* Kurva pelepasan Li-Po 1 sel. Hubungan tegangan-kapasitas jauh dari linear --
  * peta linear 3.3-4.2 V akan salah besar di tengah rentang. Titik-titik ini
  * diinterpolasi linear di antaranya. */
@@ -69,7 +110,11 @@ static int  s_ring_i = 0;
  * board mencatat sendiri. Begitu USB dicolok lagi board TIDAK reset -- ia hanya
  * mulai mengisi -- sehingga riwayat ini masih utuh dan bisa dibaca. Inilah satu-
  * satunya cara melihat apakah tegangan benar-benar turun saat memakai baterai. */
-#define HIST_N 12
+/* 30 menit. Cukup untuk tes pelepasan: cabut USB, pakai 20-30 menit, colok lagi
+ * (board TIDAK reset, hanya mulai mengisi) lalu baca riwayatnya. Itu satu-satunya
+ * cara melihat tegangan saat benar-benar jalan dari baterai, karena serial hanya
+ * hidup saat USB tertancap -- dan saat USB tertancap sel sedang diisi. */
+#define HIST_N 30
 static uint16_t s_hist[HIST_N];
 static int      s_hist_n = 0;
 static int      s_hist_i = 0;
@@ -92,18 +137,50 @@ void battery_update(void) {
   int mv = (int)(s_raw_mv * BATT_DIVIDER + 0.5f);
 
   if (!s_valid) {
-    s_batt_mv = mv;                              /* pengukuran pertama langsung */
-    s_valid = true;
+    s_batt_mv  = mv;                             /* pengukuran pertama langsung */
+    s_valid    = true;
+    s_slot_min = mv;
+    s_slot_ms  = millis();
+    s_base_mv  = mv;
   } else {
-    /* EMA alpha 0.2: menahan riak sisa tanpa membuat tanggapan terasa lambat. */
+    /* EMA simetris alpha 0.2. Tidak perlu asimetris lagi: yang menahan artefak
+     * beban sekarang minimum jendela di bawah, bukan penghalusan ini. */
     s_batt_mv = (s_batt_mv * 8 + mv * 2) / 10;
   }
 
-  int p = mv_to_percent(s_batt_mv);
+  /* ---- minimum jendela bergerak 3 menit -> dasar persen ---- */
+  if (s_batt_mv < s_slot_min) s_slot_min = s_batt_mv;
 
-  /* Histeresis 1%: tanpa ini angka di layar bergetar naik-turun satu satuan
-   * setiap detik ketika tegangan tepat di ambang. */
-  if (p > s_percent + 1 || p < s_percent - 1 || s_percent == 0) s_percent = p;
+  if ((uint32_t)(millis() - s_slot_ms) >= WMIN_SLOT_MS) {
+    s_slot_ms = millis();
+    s_wmin[s_wmin_i] = (uint16_t)s_slot_min;
+    s_wmin_i = (s_wmin_i + 1) % WMIN_SLOTS;
+    if (s_wmin_n < WMIN_SLOTS) s_wmin_n++;
+    s_slot_min = s_batt_mv;                      /* mulai slot berikutnya */
+  }
+
+  /* Minimum atas seluruh slot penuh + slot berjalan. */
+  int wmin = s_slot_min;
+  for (int k = 0; k < s_wmin_n; k++)
+    if (s_wmin[k] < wmin) wmin = s_wmin[k];
+
+  /* Naik/turun dinilai dari slot tertua vs terbaru, bukan dari nilai sesaat --
+   * keduanya sama-sama "minimum berbeban" jadi bisa dibandingkan langsung. */
+  if (s_wmin_n >= WMIN_SLOTS) {
+    int oldest = s_wmin[s_wmin_i];               /* slot berikut = yang tertua */
+    int newest = s_wmin[(s_wmin_i + WMIN_SLOTS - 1) % WMIN_SLOTS];
+    s_charging = (newest - oldest) >= 20;
+  }
+
+  s_base_mv = wmin;
+  int p = mv_to_percent(s_base_mv);
+
+  /* Histeresis ASIMETRIS. Versi sebelumnya memakai |selisih| > 1 di kedua arah,
+   * sehingga penurunan 1% tidak pernah tampil -- baterai harus turun 2% dulu
+   * sebelum angkanya bergerak, dan itulah sebab angkanya terasa "macet".
+   * Sekarang: turun 1% langsung tampil (itu informasi yang dicari pemakai),
+   * naik butuh 2% supaya tidak bergetar di ambang. */
+  if (p < s_percent || p >= s_percent + 2 || s_percent == 0) s_percent = p;
 
   /* Catat satu titik per menit. */
   if (!s_hist_ms || (uint32_t)(millis() - s_hist_ms) >= 60000UL) {
@@ -126,6 +203,8 @@ void battery_history(char *buf, int n) {
 
 int battery_history_count(void) { return s_hist_n; }
 
+int  battery_floor_mv(void)       { return s_base_mv; }
+bool battery_charging(void)       { return s_charging; }
 int  battery_percent(void)        { return s_percent; }
 int  battery_millivolts(void)     { return s_batt_mv; }
 int  battery_raw_millivolts(void) { return s_raw_mv; }

@@ -597,7 +597,11 @@ static void build_hr(void) {
   lv_obj_set_style_arc_rounded(arc_hr, true, LV_PART_INDICATOR);
   lv_obj_set_style_bg_opa(arc_hr, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(arc_hr, 0, 0);
-  mk_img(scr_hr, &img_heart_lg, 35, 69);
+  /* Posisi dihitung, bukan dikira: aset sekarang 21x20 dengan pusat hati di
+   * (9.5, 9.0) di dalamnya, jadi (40,75) menempatkan pusat hati di (49.5, 84.0)
+   * -- pusat arc ada di (16+34, 50+34) = (50, 84). Sebelumnya aset 30x30 di
+   * (35,69) menaruh hati di (45, 78.5) karena padding crop-nya tidak simetris. */
+  mk_img(scr_hr, &img_heart_lg, 40, 75);
 
   lbl_hr_big = mk_label(scr_hr, "--", &lv_font_montserrat_30, 0xFFFFFF, 96, 64);
   mk_label(scr_hr, "bpm", &lv_font_montserrat_14, C_S3_MUTE, 151, 84);
@@ -668,10 +672,32 @@ static void build_spo2(void) {
   lv_obj_set_style_bg_opa(ring_sp, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(ring_sp, 0, 0);
 
-  lbl_sp_big = mk_label(scr_spo2, "--", &lv_font_montserrat_30, 0xFFFFFF, 0, 0);
-  lv_obj_align_to(lbl_sp_big, ring_sp, LV_ALIGN_CENTER, 0, -8);
-  lv_obj_t *ok = mk_label(scr_spo2, "oksigen", &lv_font_montserrat_14, C_BLUE, 0, 0);
-  lv_obj_align_to(ok, ring_sp, LV_ALIGN_CENTER, 0, 16);
+  /* Ukuran font diambil dari mockup 4.png, bukan dikira-kira. Terukur di sana:
+   * "98%" lebar 45.5 px dengan tinggi cap 15 px. montserrat_22 memberi 46.3 px
+   * dan cap 16 px -- selisih di bawah 1 px. montserrat_30 yang dipakai
+   * sebelumnya menghasilkan 63.1 px, 39% lebih lebar dari desainnya.
+   *
+   * Itu juga sebab "100%" meleset: pada font 30 lebarnya 76.4 px, sementara
+   * ring hanya membentang x=24..117 dan kotak legenda mulai di x=132 -- jadi
+   * angkanya keluar ring lalu menabrak legenda. Pada font 22 lebarnya 56.1 px,
+   * masuk nyaman di ruang dalam ring yang di puncak angka hanya ~65 px. */
+  lbl_sp_big = mk_label(scr_spo2, "--", &lv_font_montserrat_22, 0xFFFFFF, 0, 0);
+  /* Lebar dipatok selebar ring dengan teks di-center. Tanpa ini angkanya
+   * bergeser setiap kali jumlah digit berubah: lv_obj_align_to() menghitung
+   * posisi SEKALI saat dipanggil -- dan saat itu isinya masih "--" (16.9 px) --
+   * lalu tidak pernah menghitung ulang ketika label melebar. Dengan lebar
+   * tetap, yang bergeser isi labelnya, bukan kotaknya. */
+  lv_obj_set_width(lbl_sp_big, 93);
+  lv_obj_set_style_text_align(lbl_sp_big, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_align_to(lbl_sp_big, ring_sp, LV_ALIGN_CENTER, 0, -7);
+
+  /* "oksigen" ikut dikecilkan ke montserrat_10 (40.2 px, mockup 37.5 px).
+   * Kalau dibiarkan di montserrat_14 ia jadi 56.2 px -- LEBIH LEBAR dari
+   * nilainya sendiri (46.3 px), sehingga hierarki visualnya terbalik.
+   * dy +13, bukan +16: terukur dari mockup, pusat ink-nya +14 dari pusat ring
+   * dan pusat ink label ada +1 px di bawah pusat kotaknya. */
+  lv_obj_t *ok = mk_label(scr_spo2, "oksigen", &lv_font_montserrat_10, C_BLUE, 0, 0);
+  lv_obj_align_to(ok, ring_sp, LV_ALIGN_CENTER, 0, 13);
 
   /* legend zona */
   static const char *lg[3] = { "95-100 normal", "90-94 rendah", "<90 kritis" };
@@ -964,17 +990,28 @@ static void refresh_cb(lv_timer_t *tm) {
                   (unsigned long)touch_irq_count, (unsigned long)touch_readerr,
                   (unsigned long)touch_events, (unsigned long)ESP.getFreeHeap());
     ppg_data_t pp; ppg_get(&pp);
-    Serial.printf("[ppg]  %s  bpm=%s%.0f  spo2=%s%.1f  glukosa*=%s%.0f\n",
+    long dir, dred, dthr; uint32_t dn, dp;
+    ppg_diag(&dir, &dred, &dn, &dthr, &dp);
+    Serial.printf("[ppg]  %s%s  bpm=%s%.0f  spo2=%s%.1f  glukosa*=%s%.0f\n",
                   ppg_state_text(),
+                  pp.held ? " [tahan]" : "",
                   pp.bpm_valid ? "" : "(-)", pp.bpm,
                   pp.spo2_valid ? "" : "(-)", pp.spo2,
                   pp.glu_valid ? "" : "(-)", pp.glucose);
+    /* Baris mentah: ir/red dan sampel. sampel yang diam di satu angka berarti
+     * FIFO tidak menghasilkan apa pun -- biasanya sensor tidak dicatu daya. */
+    Serial.printf("[ppg] mentah ir=%ld red=%ld (ambang %ld)  sampel=%lu  poll=%lu\n",
+                  dir, dred, dthr, (unsigned long)dn, (unsigned long)dp);
     Serial.printf("[batt] counts=%d/4095  raw=%d mV (sebaran %d mV)  "
-                  "baterai=%d mV  %d%%\n",
+                  "baterai=%d mV  floor=%d mV%s  %d%%\n",
                   battery_raw_counts(), battery_raw_millivolts(),
-                  battery_spread_mv(), battery_millivolts(), battery_percent());
+                  battery_spread_mv(), battery_millivolts(),
+                  battery_floor_mv(), battery_charging() ? " [mengisi]" : "",
+                  battery_percent());
     if (battery_history_count() > 1) {
-      char hb[128];
+      /* 192, bukan 128: riwayat kini 30 titik x 5 karakter = 150. battery_history()
+       * memang memotong dengan aman, tapi 128 akan memangkas sepertiga datanya. */
+      char hb[192];
       battery_history(hb, sizeof(hb));
       Serial.printf("[batt] riwayat/menit (mV di pin, tertua dulu): %s\n", hb);
     }

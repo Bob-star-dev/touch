@@ -13,7 +13,15 @@ ASSETS = [
     ("img_battery",  "1baru.png", (394, 16, 450,  42), (28, 13)),
     ("img_heart_sm", "2.png", (44, 134,  84, 172), (20, 19)),
     ("img_drop",     "2.png", (48, 272,  80, 316), (16, 22)),
-    ("img_heart_lg", "3.png", (80, 150, 140, 210), (30, 30)),
+    # Crop lama (80,150,140,210) berukuran 60x60 padahal hatinya hanya menempati
+    # x 80..120, y 150..188 -- tepat menempel di sudut kiri-atas crop, menyisakan
+    # 19 px latar di kanan dan 21 px di bawah. Karena aset ini TRUE_COLOR tanpa
+    # alpha, padding itu ikut jadi bagian gambar: hati tergambar di kiri-atas
+    # kotak 30x30 sehingga pusatnya jatuh di (45, 78.5) padahal pusat arc
+    # (50, 84) -- meleset 5 px. Crop dirapatkan ke hati, ditambah 1 px di kanan
+    # dan bawah supaya ukurannya genap (42x40 -> tepat 21x20 di layar) dan pusat
+    # hati jatuh persis di pusat aset.
+    ("img_heart_lg", "3.png", (80, 150, 122, 190), (21, 20)),
     ("img_diamond",  "1baru.png", (230, 358, 250, 378), (10, 10)),
 ]
 

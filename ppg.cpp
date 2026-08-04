@@ -130,6 +130,50 @@ static int   statGluMin = 0, statGluMax = 0;
 
 static ppg_state_t s_state = PPG_ABSENT;
 
+/* Diagnostik mentah. Tanpa ini, status "tidak menempel" tidak bisa dibedakan
+ * dari tiga sebab yang sangat berbeda penanganannya:
+ *   ir = 0 dan sampel tidak bertambah -> FIFO tidak jalan / sensor tak dicatu
+ *   ir kecil tapi sampel bertambah    -> sensor jalan, ambang terlalu tinggi
+ *   ir >= ambang                      -> memang tidak ada jari saja
+ * LED MAX30105 butuh puluhan mA; chip bisa ACK di I2C hanya dari pull-up
+ * sementara LED-nya tetap gelap, jadi "0x57 menjawab" bukan bukti sensor hidup. */
+static long     s_last_ir = 0, s_last_red = 0;
+static uint32_t s_samples = 0;
+/* Berapa kali FIFO benar-benar ditanyai. Memisahkan "sensor tidak mengirim data"
+ * dari "ppg_update() tidak pernah jalan" -- keduanya membuat sampel=0. */
+static uint32_t s_polls = 0;
+
+/* ================= tahan hasil terakhir =================
+ * Sensor ini hanya menghasilkan angka selama kulit menempel, dan reset DSP saat
+ * kontak lepas memang WAJIB (lihat alasan di process_sample). Jadi nilai
+ * terakhir tidak bisa "dibiarkan saja" -- harus disalin ke tempat lain sebelum
+ * reset menghapusnya.
+ *
+ * Salinan ini yang dipakai UI setelah sensor diangkat, supaya angkanya tetap
+ * terbaca. Dihapus hanya pada dua kejadian:
+ *   - pengukuran baru dimulai (kulit menempel lagi)
+ *   - ppg_clear_hold() dipanggil dari luar (mis. layar dimatikan)
+ */
+static ppg_data_t s_hold;
+static bool       s_hold_valid = false;
+static uint32_t   s_hold_ms    = 0;   /* millis() saat snapshot diambil */
+static bool       s_new_result = false; /* window baru menghasilkan angka sah */
+
+static void reset_hold(void) {
+  memset(&s_hold, 0, sizeof(s_hold));
+  s_hold_valid = false;
+  s_hold_ms    = 0;
+  /* Ikut dinolkan: process_sample() keluar lebih awal saat kontak lepas, jadi
+   * tanda "ada hasil baru" bisa tertinggal true dan memicu salinan palsu pada
+   * sampel pertama sesi berikutnya. */
+  s_new_result = false;
+}
+
+/* Definisinya di bawah, setelah fill_live(). Dideklarasikan di sini karena
+ * pemanggilnya (accumulate_spo2) ada lebih dulu dan ini file .cpp biasa --
+ * tidak ada penyisipan prototipe otomatis seperti pada .ino. */
+static void capture_hold(void);
+
 /* ================= util ================= */
 static void reset_beat_detector(void) {
   acIRSmoothPrev = 0;
@@ -277,6 +321,11 @@ static void accumulate_spo2(double acRed, double acIR, double dRed, double dIR) 
         push_smoothed(spo2, currentGlucose);
         readingsStable = true;
         update_session_stats();
+        /* Jangan panggil capture_hold() di sini: s_state baru ditetapkan setelah
+         * accumulate_spo2() selesai, jadi salinan akan lahir dengan state basi
+         * (PPG_SETTLING pada window pertama) dan bpm_valid-nya false. Cukup
+         * tandai bahwa ada hasil baru; salinannya diambil di process_sample. */
+        s_new_result = true;
 
 #if NET_DEBUG
         /* PI & R dicetak supaya bisa dicatat berpasangan dengan hasil
@@ -303,6 +352,10 @@ static void accumulate_spo2(double acRed, double acIR, double dRed, double dIR) 
 
 /* Proses satu sampel Red/IR mentah. */
 static void process_sample(long redVal, long irVal) {
+  s_last_ir  = irVal;
+  s_last_red = redVal;
+  s_samples++;
+
   bool rawInContact = irVal >= IR_PRESENCE_THRESHOLD;
   if (rawInContact != rawContactCandidate) {
     rawContactCandidate = rawInContact;
@@ -317,9 +370,16 @@ static void process_sample(long redVal, long irVal) {
   if (inContact != wasInContact) {
     if (inContact) {
       contactStartMs = millis();
+      /* Pengukuran baru: hasil lama dibuang supaya layar tidak mencampur angka
+       * sesi sebelumnya dengan sesi yang sedang berjalan. Selama menstabilkan,
+       * layar menampilkan "--". */
+      reset_hold();
       Serial.println("[ppg] kontak kulit terdeteksi, menstabilkan sinyal...");
     } else {
-      Serial.println("[ppg] sensor terlepas dari kulit");
+      /* Sensor diangkat. Salinan TIDAK dihapus di sini -- justru inilah saat
+       * salinan itu mulai dipakai UI. Dihapus hanya oleh pengukuran baru atau
+       * ppg_clear_hold(). */
+      Serial.println("[ppg] sensor terlepas dari kulit, menahan hasil terakhir");
     }
     /* Reset tiap sesi kontak berganti. Tanpa ini, lonjakan transien saat filter
      * DC "mengejar" baseline baru ikut termakan peakEnvelope dan menaikkan
@@ -360,6 +420,14 @@ static void process_sample(long redVal, long irVal) {
   if (!dcSettled)                              s_state = PPG_SETTLING;
   else if (!readingsStable)                    s_state = PPG_ACQUIRING;
   else                                         s_state = PPG_STABLE;
+
+  /* Salinan hasil diambil DI SINI, setelah s_state di atas ditetapkan, karena
+   * fill_live() menurunkan bpm_valid dari s_state. Hanya saat ada hasil window
+   * baru, bukan tiap sampel -- 100 Hz x memcpy struct itu pemborosan. */
+  if (s_new_result) {
+    s_new_result = false;
+    capture_hold();
+  }
 }
 
 /* ================= API ================= */
@@ -398,6 +466,7 @@ void ppg_update(void) {
   if ((uint32_t)(millis() - lastPoll) < 20) return;
   lastPoll = millis();
 
+  s_polls++;
   sensor.check();                   /* non-blocking: isi FIFO lokal */
 
   int guard = 0;
@@ -409,8 +478,10 @@ void ppg_update(void) {
   }
 }
 
-void ppg_get(ppg_data_t *out) {
-  if (!out) return;
+/* Isi struct dari keadaan DSP saat ini (bacaan langsung). Dipakai bersama oleh
+ * ppg_get() dan capture_hold() supaya salinan tidak pernah beda isi dari
+ * bacaan langsungnya. */
+static void fill_live(ppg_data_t *out) {
   memset(out, 0, sizeof(*out));
 
   out->state = s_state;
@@ -439,8 +510,51 @@ void ppg_get(ppg_data_t *out) {
   }
 }
 
+/* Ambil salinan hasil terakhir yang sah. Dipanggil setiap kali sebuah window
+ * menghasilkan angka stabil, jadi salinannya selalu yang terbaru -- tidak
+ * bergantung pada berhasilnya menangkap momen sensor diangkat. */
+static void capture_hold(void) {
+  fill_live(&s_hold);
+  s_hold.held  = true;
+  s_hold_valid = true;
+  s_hold_ms    = millis();
+}
+
+void ppg_clear_hold(void) {
+  reset_hold();
+}
+
+void ppg_get(ppg_data_t *out) {
+  if (!out) return;
+  fill_live(out);
+
+  /* Selama masih ada bacaan langsung, itu yang dipakai. Begitu sensor diangkat,
+   * reset DSP membuat semuanya 0/invalid -- di titik itu salinan terakhir yang
+   * ditampilkan, supaya angka di layar tidak hilang.
+   *
+   * state sengaja TIDAK diambil dari salinan: ia harus tetap menggambarkan
+   * kondisi sensor yang sebenarnya, sehingga titik "live" di layar berhenti
+   * berkedip walaupun angkanya masih terbaca. */
+  if (!out->bpm_valid && !out->spo2_valid && s_hold_valid) {
+    ppg_state_t live_state = out->state;
+    *out = s_hold;
+    out->state       = live_state;
+    out->held        = true;
+    out->hold_age_ms = (uint32_t)(millis() - s_hold_ms);
+  }
+}
+
 bool ppg_present(void) {
   return s_present;
+}
+
+void ppg_diag(long *ir, long *red, uint32_t *samples, long *threshold,
+              uint32_t *polls) {
+  if (ir)        *ir        = s_last_ir;
+  if (red)       *red       = s_last_red;
+  if (samples)   *samples   = s_samples;
+  if (threshold) *threshold = IR_PRESENCE_THRESHOLD;
+  if (polls)     *polls     = s_polls;
 }
 
 const char *ppg_state_text(void) {

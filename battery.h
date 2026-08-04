@@ -29,6 +29,18 @@ int battery_percent(void);
 /* Tegangan hasil penghalusan, dalam milivolt. */
 int battery_millivolts(void);
 
+/* Tegangan terendah selama 3 menit terakhir -- inilah dasar persen, bukan nilai
+ * sesaat. Sebabnya: perubahan beban (radio Wi-Fi menyala/mati) menggeser
+ * tegangan ~53 mV di board ini, cukup memindahkan angka 4% sehingga persen
+ * naik-turun mengikuti radio, bukan mengikuti daya. Karena siklus Wi-Fi ~60 s,
+ * setiap jendela 3 menit hampir pasti memuat satu sag, jadi nilainya stabil dan
+ * selalu berarti hal yang sama: tegangan saat berbeban. */
+int battery_floor_mv(void);
+
+/* true kalau tegangan berbeban 3 menit terakhir naik (>=20 mV dari slot tertua
+ * ke terbaru) -- indikasi sedang diisi. Hanya berlaku setelah jendela penuh. */
+bool battery_charging(void);
+
 /* Tegangan mentah di pin ADC (sebelum dikali rasio pembagi) -- untuk kalibrasi. */
 int battery_raw_millivolts(void);
 
