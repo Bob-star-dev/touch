@@ -43,6 +43,15 @@
 #include "battery.h"
 #include "ppg.h"
 
+/* Subset digit-only dari montserrat_46/48 (cuma glyph 0-9 dan '-'), dipakai di
+ * layar jam & glukosa yang tidak pernah menampilkan huruf. Font bawaan LVGL di
+ * ukuran itu ikut membawa seluruh ASCII + ikon FontAwesome (~90 KB/font) yang
+ * tak pernah dirender di sini; lihat font_digits_46.c / font_digits_48.c. */
+extern "C" {
+LV_FONT_DECLARE(font_digits_46)
+LV_FONT_DECLARE(font_digits_48)
+}
+
 /* Tujuan navigasi satu tombol/kartu. Definisinya harus di sini, di atas fungsi
  * pertama: Arduino menyuntikkan prototipe otomatis tepat sebelum definisi fungsi
  * pertama, jadi tipe yang dipakai di parameter harus sudah dikenal sebelum itu. */
@@ -482,14 +491,14 @@ static void build_home(void) {
   lv_obj_set_style_text_align(lbl_day, LV_TEXT_ALIGN_CENTER, 0);
 
   /* --- jam: "10" [kotak][kotak] "24" --- */
-  lbl_hh = mk_label(scr_home, "10", &lv_font_montserrat_48, 0xFFFFFF, 0, 204);
+  lbl_hh = mk_label(scr_home, "10", &font_digits_48, 0xFFFFFF, 0, 204);
   lv_obj_set_width(lbl_hh, 112);
   lv_obj_set_style_text_align(lbl_hh, LV_TEXT_ALIGN_RIGHT, 0);
 
   mk_box(scr_home, 116, 220, 8, 8, C_AMBER, 1);
   mk_box(scr_home, 116, 236, 8, 8, C_AMBER, 1);
 
-  lbl_mm = mk_label(scr_home, "24", &lv_font_montserrat_48, 0xFFFFFF, 128, 204);
+  lbl_mm = mk_label(scr_home, "24", &font_digits_48, 0xFFFFFF, 128, 204);
 
   /* --- tanggal --- */
   lbl_date = mk_label(scr_home, "23 JULI 2026", &lv_font_montserrat_14, C_DATE, 0, 257);
@@ -748,7 +757,7 @@ static void build_glu(void) {
   mk_header(scr_glu, "Glukosa darah", C_S5_CARD, &NAV_MENU);
   mk_pill(scr_glu, 168, 72, "stabil " LV_SYMBOL_RIGHT, C_S5_CARD, C_GREEN2);
 
-  lbl_glu_big = mk_label(scr_glu, "--", &lv_font_montserrat_46, 0xFFFFFF, 12, 42);
+  lbl_glu_big = mk_label(scr_glu, "--", &font_digits_46, 0xFFFFFF, 12, 42);
   mk_label(scr_glu, "mg/dL", &lv_font_montserrat_14, C_S5_MUTE, 72, 66);
 
   /* Bar digeser ke x=122 (mockup: 110) karena montserrat_46 lebih lebar dari
