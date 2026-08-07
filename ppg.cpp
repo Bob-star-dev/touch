@@ -8,6 +8,10 @@
 static MAX30105 sensor;
 static bool s_present = false;
 
+/* Mulai MATI: LED baru menyala saat pengguna menekan tombol daya di home.
+ * Lihat alasan lengkapnya di ppg.h. */
+static bool s_enabled = false;
+
 /* ================= Konfigurasi sensor =================
  * Di pergelangan tangan (radial artery) sinyal jauh lebih lemah daripada di
  * ujung jari, sehingga arus LED perlu lebih tinggi dan rata-rata sampel lebih
@@ -449,15 +453,25 @@ bool ppg_begin(void) {
    * touch akan rusak. Lebih murah menegaskan daripada mendiagnosanya nanti. */
   Wire.setClock(100000);
 
-  s_state = PPG_NO_CONTACT;
-  Serial.println("[ppg] MAX30105/30102 OK (Red+IR, 100 Hz)");
+  /* setup() di atas WAJIB dijalankan -- ia yang menulis seluruh register mode,
+   * arus LED, sample rate, dan pulse width. Tapi ia juga langsung menyalakan
+   * kedua LED. Jadi begitu konfigurasinya tertanam, chip segera ditidurkan:
+   * boot berakhir dalam keadaan hemat daya, dan ppg_set_enabled(true) nanti
+   * cukup membalik satu bit tanpa mengonfigurasi ulang apa pun. */
+  sensor.shutDown();
+  s_enabled = false;
+  s_state = PPG_OFF;
+  Serial.println("[ppg] MAX30105/30102 OK (Red+IR, 100 Hz) -- mulai dalam keadaan MATI");
   Serial.println("[ppg] Glukosa* = estimasi EKSPERIMENTAL belum terkalibrasi, "
                  "bukan alat medis");
   return true;
 }
 
 void ppg_update(void) {
-  if (!s_present) return;
+  /* Saat mati: tidak ada satu pun transaksi I2C. Selain hemat daya, ini juga
+   * mengembalikan seluruh jatah bus ke touch CST816T yang datanya hilang
+   * hampir seketika setelah IRQ (lihat catatan di touch.ino). */
+  if (!s_present || !s_enabled) return;
 
   /* Gate waktu supaya transaksi I2C tidak dilakukan setiap iterasi loop (loop
    * berputar tiap ~2 ms). FIFO 32 sampel pada 100 Hz = 320 ms sebelum
@@ -548,6 +562,70 @@ bool ppg_present(void) {
   return s_present;
 }
 
+bool ppg_enabled(void) {
+  return s_enabled;
+}
+
+void ppg_set_enabled(bool on) {
+  if (on == s_enabled) return;
+  s_enabled = on;
+
+  /* Chip tidak terpasang: niat pengguna tetap dicatat supaya tombol di UI ikut
+   * berpindah keadaan dan halaman menu tetap bisa dibuka. Tanpa ini, board
+   * tanpa MAX30105 akan terkunci di halaman home -- tombolnya satu-satunya
+   * jalan ke menu. s_state dibiarkan PPG_ABSENT karena itu memang kondisinya. */
+  if (!s_present) {
+    Serial.printf("[ppg] tombol daya %s (chip tidak terdeteksi, tanpa efek)\n",
+                  on ? "ON" : "OFF");
+    return;
+  }
+
+  if (on) {
+    sensor.wakeUp();
+
+    /* FIFO masih memuat sampel dari sebelum chip ditidurkan. Kalau tidak
+     * dibuang, sampel basi itu masuk ke filter DC sebagai lompatan besar dan
+     * mencemari peakEnvelope -- envelope hanya naik, tidak pernah turun
+     * sendiri, jadi detak asli setelahnya tidak akan pernah melewatinya. */
+    sensor.clearFIFO();
+
+    /* Sesi baru: seluruh DSP dimulai dari nol, sama seperti saat kulit baru
+     * menempel. Akumulator window ikut dinolkan -- windowCount saja tidak
+     * cukup, sisa sumSq* akan ikut terbagi di window pertama berikutnya. */
+    dcInit = false;
+    windowCount = 0;
+    sumSqRed = sumSqIR = 0;
+    sumDcRed = sumDcIR = 0;
+    wasInContact = false;
+    rawContactCandidate = false;
+    reset_beat_detector();
+    reset_session_stats();
+    reset_hold();
+
+    s_state = PPG_NO_CONTACT;
+    Serial.println("[ppg] sensor DINYALAKAN, menunggu kulit menempel");
+  } else {
+    sensor.shutDown();
+
+    /* Salinan hasil terakhir ikut dihapus. Membiarkannya berarti layar
+     * kesehatan tetap memajang angka sementara pengukuran sudah dimatikan --
+     * pada layar kesehatan, angka basi yang tampak nyata lebih berbahaya
+     * daripada tanda hubung. */
+    reset_hold();
+
+    /* Statistik sesi ikut dinolkan. reset_hold() saja tidak cukup: fill_live()
+     * menurunkan stats_valid dari statN, yang tidak tersentuh salinan hasil --
+     * tanpa baris ini chip "Avg/Min/Max" tetap memajang angka sesi lama
+     * walaupun angka utama di atasnya sudah "--". */
+    reset_session_stats();
+
+    bpmValid = false;
+    readingsStable = false;
+    s_state = PPG_OFF;
+    Serial.println("[ppg] sensor DIMATIKAN (LED padam, hemat daya)");
+  }
+}
+
 void ppg_diag(long *ir, long *red, uint32_t *samples, long *threshold,
               uint32_t *polls) {
   if (ir)        *ir        = s_last_ir;
@@ -560,6 +638,7 @@ void ppg_diag(long *ir, long *red, uint32_t *samples, long *threshold,
 const char *ppg_state_text(void) {
   switch (s_state) {
     case PPG_ABSENT:     return "sensor tidak ada";
+    case PPG_OFF:        return "dimatikan";
     case PPG_NO_CONTACT: return "tidak menempel";
     case PPG_SETTLING:   return "menstabilkan";
     case PPG_ACQUIRING:  return "mencari detak";

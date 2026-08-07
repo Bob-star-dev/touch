@@ -35,6 +35,7 @@
 
 typedef enum {
   PPG_ABSENT = 0,     /* sensor tidak terdeteksi di I2C          */
+  PPG_OFF,            /* sengaja dimatikan lewat tombol daya     */
   PPG_NO_CONTACT,     /* tidak ada kulit menempel                */
   PPG_SETTLING,       /* filter DC sedang konvergen              */
   PPG_ACQUIRING,      /* mencari detak yang konsisten            */
@@ -91,6 +92,29 @@ void ppg_clear_hold(void);
 
 /* true kalau sensor terdeteksi saat ppg_begin(). */
 bool ppg_present(void);
+
+/* ---- Daya sensor (hemat baterai) ----------------------------------------
+ * MAX30105 menyalakan dua LED (Red + IR) pada arus penuh 100 Hz terus-menerus
+ * begitu dikonfigurasi -- puluhan mA, dan tetap mengalir walau tidak ada kulit
+ * menempel. Itu beban yang sia-sia selama pengguna hanya melihat jam.
+ *
+ * ppg_set_enabled(false) menulis bit SHUTDOWN di register MODECONFIG (datasheet
+ * hal. 19): LED padam dan ADC berhenti, chip turun ke ~0.7 uA tapi tetap
+ * menjawab I2C sehingga tidak perlu di-probe ulang. Konfigurasi register
+ * dipertahankan, jadi menyalakannya kembali cukup satu bit -- tidak ada
+ * sensor.setup() ulang.
+ *
+ * Saat mati ppg_update() tidak melakukan transaksi I2C sama sekali dan seluruh
+ * hasil (termasuk salinan hasil terakhir) dihapus, sehingga UI kembali ke "--".
+ * Angka lama yang menggantung saat pengukuran dimatikan akan menyesatkan.
+ *
+ * Keadaan awal setelah ppg_begin() adalah MATI. Pengukuran baru dimulai saat
+ * pengguna menekan tombol daya di halaman home.
+ *
+ * Kalau chip tidak terdeteksi, kedua fungsi ini tetap mencatat niat pengguna
+ * (tanpa menyentuh perangkat keras) supaya tombol di UI tetap berfungsi. */
+void ppg_set_enabled(bool on);
+bool ppg_enabled(void);
 
 /* Nilai mentah terakhir + jumlah sampel yang sudah diproses, untuk membedakan
  * "tidak ada jari" dari "FIFO tidak jalan" dan "ambang terlalu tinggi".

@@ -7,7 +7,9 @@
  * lv_conf.h : /home/harjo/Arduino/libraries/lv_conf.h  (LV_TICK_CUSTOM=1, 16bpp)
  *
  * Halaman :
- *   1 Home     - jam + tanggal, header cuaca & baterai        (tap layar -> menu)
+ *   1 Home     - ilustrasi, tombol daya sensor, jam + tanggal, header cuaca &
+ *                baterai. Tombol daya ON menyalakan MAX30105 sekaligus membuka
+ *                menu; OFF mematikan LED-nya dan tetap di halaman ini.
  *   2 Menu     - 3 kartu: Heart rate / SpO2 / Glukosa
  *   3 Detail   - Heart rate : arc, EKG, bar 12 jam, chip statistik
  *   4 Detail   - SpO2       : ring, legend zona, grafik riwayat
@@ -270,8 +272,13 @@ static void my_touch_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
 static lv_obj_t *scr_home, *scr_menu, *scr_hr, *scr_spo2, *scr_glu;
 
 /* home */
-static lv_obj_t *lbl_hh, *lbl_mm, *lbl_day, *lbl_date, *lbl_wthr, *lbl_batt;
+static lv_obj_t *lbl_hh, *lbl_mm, *lbl_wthr, *lbl_batt;
+/* Hari dan tanggal kini satu label. Keduanya dulu bertumpuk (dua baris, 32 px);
+ * setelah tombol daya masuk ke halaman ini tinggi itu tidak tersedia lagi, dan
+ * keduanya toh selalu berubah pada saat yang sama -- pergantian hari. */
+static lv_obj_t *lbl_date;
 static lv_obj_t *lbl_cond;   /* caption kondisi cuaca di header */
+static lv_obj_t *btn_pwr, *ic_pwr;   /* tombol daya sensor PPG */
 /* menu */
 static lv_obj_t *lbl_card_hr, *lbl_card_sp, *lbl_card_gl;
 /* detail */
@@ -384,10 +391,6 @@ static void go(lv_obj_t *target, bool forward, const char *name) {
                    180, 0, false);
 }
 
-/* Layar home: sentuhan apa pun (termasuk geseran) membuka menu -- di sini
- * geseran memang dibolehkan, dan berhentinya cukup sampai halaman 2. */
-static void to_menu_cb(lv_event_t *e)  { (void)e; go(scr_menu, true,  "menu"); }
-
 /* ---- Navigasi khusus ketukan ----
  * Kartu dan tombol back TIDAK boleh aktif karena geseran: dulu memakai
  * LV_EVENT_PRESSED, jadi menggeser jari melewati kartu SpO2 langsung membuka
@@ -441,6 +444,55 @@ static lv_obj_t *mk_header(lv_obj_t *scr, const char *title, uint32_t btn_bg,
   return mk_label(scr, title, &lv_font_montserrat_16, 0xFFFFFF, 43, 12);
 }
 
+/* ================= Tombol daya sensor =================
+ * Satu-satunya kendali di halaman home, dan sekarang juga satu-satunya jalan
+ * menuju menu kesehatan. Dulu sentuhan di mana pun membuka menu; itu dilepas
+ * karena pengukuran tidak boleh menyala hanya karena layar tersenggol -- LED
+ * MAX30105 menyedot puluhan mA dan tidak ada yang mematikannya kembali.
+ *
+ * Warnanya yang membawa keadaan, bukan teks: hijau = sensor hidup, gelap =
+ * mati. Ikonnya tetap LV_SYMBOL_POWER di kedua keadaan supaya arti tombolnya
+ * ("daya") tidak ikut berubah -- yang berubah hanya jawaban atas "sekarang
+ * sedang menyala atau tidak".
+ */
+static void power_btn_refresh(void) {
+  /* Style hanya disentuh saat keadaan benar-benar berpindah. Fungsi ini juga
+   * dipanggil dari refresh_cb tiap 500 ms, dan lv_obj_set_style_*() selalu
+   * meng-invalidate objeknya -- tanpa penjaga ini tombolnya digambar ulang dua
+   * kali per detik tanpa alasan. */
+  static int last = -1;
+  int on = ppg_enabled() ? 1 : 0;
+  if (on == last) return;
+  last = on;
+
+  lv_obj_set_style_bg_color(btn_pwr, lv_color_hex(on ? C_GREEN : C_S1_HDR), 0);
+  lv_obj_set_style_border_color(btn_pwr, lv_color_hex(on ? C_GREEN2 : C_S1_DIV), 0);
+  lv_obj_set_style_text_color(ic_pwr, lv_color_hex(on ? 0xFFFFFF : C_S1_LINE), 0);
+}
+
+/* Ketuk-saja, dengan pengukuran jarak yang sama seperti kartu menu: tombol ini
+ * menyalakan perangkat keras, jadi geseran yang kebetulan berakhir di atasnya
+ * jelas bukan maksud pengguna. */
+static void power_release_cb(lv_event_t *e) {
+  (void)e;
+  int dx = last_touch_x - tap_x0;
+  int dy = last_touch_y - tap_y0;
+  if (dx * dx + dy * dy > TAP_SLOP * TAP_SLOP) {
+    Serial.printf("[nav] geseran %d px, tombol daya dibatalkan\n",
+                  (int)sqrtf((float)(dx * dx + dy * dy)));
+    return;
+  }
+
+  bool on = !ppg_enabled();
+  ppg_set_enabled(on);
+  power_btn_refresh();
+
+  /* ON langsung membuka menu: menyalakan sensor dan ingin melihat hasilnya itu
+   * satu maksud yang sama. OFF tetap di home -- tidak ada gunanya berpindah ke
+   * halaman yang seluruh angkanya baru saja jadi "--". */
+  if (on) go(scr_menu, true, "menu (sensor ON)");
+}
+
 /* ================= Halaman 1 : Home ================= */
 static void build_home(void) {
   scr_home = lv_obj_create(NULL);
@@ -448,8 +500,6 @@ static void build_home(void) {
   lv_obj_set_style_bg_color(scr_home, lv_color_hex(C_S1_BG), 0);
   lv_obj_set_style_bg_opa(scr_home, LV_OPA_COVER, 0);
   lv_obj_clear_flag(scr_home, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_add_flag(scr_home, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_event_cb(scr_home, to_menu_cb, LV_EVENT_PRESSED, NULL);
 
   /* --- header --- */
   lv_obj_t *hdr = mk_box(scr_home, 0, 0, SCREEN_W, 31, C_S1_HDR, 0);
@@ -476,35 +526,75 @@ static void build_home(void) {
   /* 1baru.png menghapus label "BATERAI" -- tinggal persentase + ikon. */
   mk_img(hdr, &img_battery, 197, 8);
 
-  /* --- ilustrasi pesawat + bulan --- */
-  mk_img(scr_home, &img_plane, 44, 50);
+  /* ================= Tata letak vertikal halaman home =================
+   * Urutan: ilustrasi -> tombol daya -> jam -> hari+tanggal.
+   *
+   * Ruang di bawah header hanya 248 px (y=32..279) dan sekarang harus memuat
+   * satu elemen tambahan. Anggarannya, memakai tinggi kotak font sebenarnya:
+   *   pesawat 122 + tombol 46 + jam 52 (font_digits_48) + baris tanggal 15
+   *   = 235, menyisakan 13 px untuk SELURUH jarak antar-elemen.
+   *
+   * Karena itu dua hal berubah, dan keduanya memang menghasilkan tempat:
+   *   - hari dan tanggal digabung jadi satu baris (hemat 17 px). Keduanya toh
+   *     selalu berubah pada saat yang sama, yaitu saat tanggal berganti.
+   *   - pemisah garis-berlian-garis dilepas (hemat 10 px). Tempatnya persis
+   *     yang kini ditempati tombol daya, dan tombol itu sendiri sudah menjadi
+   *     pemisah visual antara ilustrasi dan blok jam.
+   *
+   * Jarak antar kotak terbaca rapat di koordinat, tapi tidak di layar: kotak
+   * font_digits_48 punya 9 px kosong di atas ink digit dan 9 px di bawahnya,
+   * dan montserrat_12 punya 4 px di atas kapital. Jarak visual dari ink jam ke
+   * kapital tanggal misalnya 14 px, bukan 1 px seperti yang terbaca dari
+   * selisih koordinatnya.
+   */
 
-  /* --- pemisah bergaya: garis - berlian - garis --- */
-  mk_box(scr_home, 84, 184, 26, 1, C_S1_LINE, 0);
-  mk_img(scr_home, &img_diamond, 115, 179);
-  mk_box(scr_home, 130, 184, 26, 1, C_S1_LINE, 0);
+  /* --- ilustrasi pesawat + bulan (152x122) --- */
+  mk_img(scr_home, &img_plane, 44, 33);
 
-  /* --- hari --- */
-  lbl_day = mk_label(scr_home, "KAMIS", &lv_font_montserrat_12, C_S1_MUTED, 0, 191);
-  lv_obj_set_style_text_letter_space(lbl_day, 3, 0);
-  lv_obj_set_width(lbl_day, SCREEN_W);
-  lv_obj_set_style_text_align(lbl_day, LV_TEXT_ALIGN_CENTER, 0);
+  /* --- tombol daya sensor, tepat di bawah ilustrasi --- */
+  btn_pwr = mk_box(scr_home, 97, 159, 46, 46, C_S1_HDR, LV_RADIUS_CIRCLE);
+  lv_obj_set_style_border_width(btn_pwr, 2, 0);
+  lv_obj_set_style_border_color(btn_pwr, lv_color_hex(C_S1_DIV), 0);
+  lv_obj_set_style_border_opa(btn_pwr, LV_OPA_COVER, 0);
+  mk_touchable(btn_pwr, 14);          /* target sentuh efektif jadi ~74x74 */
+  lv_obj_add_event_cb(btn_pwr, tap_press_cb,     LV_EVENT_PRESSED,  NULL);
+  lv_obj_add_event_cb(btn_pwr, power_release_cb, LV_EVENT_RELEASED, NULL);
 
-  /* --- jam: "10" [kotak][kotak] "24" --- */
-  lbl_hh = mk_label(scr_home, "10", &font_digits_48, 0xFFFFFF, 0, 204);
+  ic_pwr = mk_label(btn_pwr, LV_SYMBOL_POWER, &lv_font_montserrat_22, C_S1_LINE, 0, 0);
+  lv_obj_center(ic_pwr);
+
+  /* --- jam: "10" [kotak][kotak] "24" ---
+   * Kotak titik dua tetap di +16 dan +32 dari y label: jarak relatifnya
+   * terhadap ink digit (y+9..y+43) sama persis seperti tata letak sebelumnya. */
+  lbl_hh = mk_label(scr_home, "10", &font_digits_48, 0xFFFFFF, 0, 206);
   lv_obj_set_width(lbl_hh, 112);
   lv_obj_set_style_text_align(lbl_hh, LV_TEXT_ALIGN_RIGHT, 0);
 
-  mk_box(scr_home, 116, 220, 8, 8, C_AMBER, 1);
-  mk_box(scr_home, 116, 236, 8, 8, C_AMBER, 1);
+  mk_box(scr_home, 116, 222, 8, 8, C_AMBER, 1);
+  mk_box(scr_home, 116, 238, 8, 8, C_AMBER, 1);
 
-  lbl_mm = mk_label(scr_home, "24", &font_digits_48, 0xFFFFFF, 128, 204);
+  lbl_mm = mk_label(scr_home, "24", &font_digits_48, 0xFFFFFF, 128, 206);
 
-  /* --- tanggal --- */
-  lbl_date = mk_label(scr_home, "23 JULI 2026", &lv_font_montserrat_14, C_DATE, 0, 257);
-  lv_obj_set_style_text_letter_space(lbl_date, 2, 0);
+  /* --- hari + tanggal, satu baris ---
+   * letter_space 1, bukan 2: string terpanjang yang mungkin muncul
+   * ("MINGGU " TXT_DOT " 28 SEPTEMBER 2026") terukur 215 px di montserrat_12
+   * dengan spasi 1, tapi 240 px dengan spasi 2 -- tepat selebar layar, tanpa
+   * margin sama sekali. Diukur dari tabel advance width font-nya, bukan
+   * dikira-kira.
+   *
+   * y=259 menyisakan 6 px di bawah, sama seperti tata letak lama -- panel 1.69"
+   * ini bersudut membulat, jadi baris terakhir sengaja tidak dirapatkan ke tepi.
+   * Kotak jam (206..257) karenanya juga tidak menimpa kotak baris ini, dan
+   * jarak ink digit ke kapital tanggal jadi 14 px -- persis seperti sebelumnya,
+   * karena kotak font_digits_48 sendiri menyumbang 9 px kosong di bawah
+   * angkanya. */
+  lbl_date = mk_label(scr_home, "KAMIS " TXT_DOT " 23 JULI 2026",
+                      &lv_font_montserrat_12, C_DATE, 0, 259);
+  lv_obj_set_style_text_letter_space(lbl_date, 1, 0);
   lv_obj_set_width(lbl_date, SCREEN_W);
   lv_obj_set_style_text_align(lbl_date, LV_TEXT_ALIGN_CENTER, 0);
+
+  power_btn_refresh();
 }
 
 /* ================= Halaman 2 : Menu kesehatan ================= */
@@ -860,6 +950,10 @@ static void update_health_ui(void) {
     set_if_changed(lbl_hr_big, "--");
     lv_arc_set_value(arc_hr, 0);
     set_if_changed(lbl_hr_zone, "Zona: -- " TXT_DOT " -- target");
+    /* Penanda dikembalikan ke posisi awalnya. Kalau tidak, ia tetap menunjuk
+     * nilai terakhir di bar zona sementara angkanya sudah "--" -- bar yang
+     * menunjuk sesuatu itu klaim, dan saat sensor dimatikan klaim itu palsu. */
+    lv_obj_set_x(mark_hr, 94 + 26);
   }
 
   /* ---- halaman 4: SpO2 ---- */
@@ -889,6 +983,7 @@ static void update_health_ui(void) {
   } else {
     set_if_changed(lbl_glu_big, "--");
     set_if_changed(lbl_glu_status, "Menunggu pengukuran");
+    lv_obj_set_x(mark_glu, 122 + 32);
   }
 
   /* ---- chip statistik sesi ---- */
@@ -904,6 +999,22 @@ static void update_health_ui(void) {
     snprintf(b, sizeof(b), "Min %d",  p.glu_min);  set_if_changed(chip_gl[0], b);
     snprintf(b, sizeof(b), "Maks %d", p.glu_max);  set_if_changed(chip_gl[1], b);
     snprintf(b, sizeof(b), "PI %.1f", p.pi);       set_if_changed(chip_gl[2], b);
+  } else {
+    /* Tanpa cabang ini chip membeku di angka sesi sebelumnya. Paling terasa
+     * saat sensor dimatikan lewat tombol daya: angka utama jadi "--" sementara
+     * "Avg 72" tetap terpampang di bawahnya. Teksnya dikembalikan persis ke
+     * yang dipasang mk_chips() saat layar dibangun. */
+    set_if_changed(chip_hr[0], "Ist. --");
+    set_if_changed(chip_hr[1], "Avg --");
+    set_if_changed(chip_hr[2], "Max --");
+
+    set_if_changed(chip_sp[0], "Min --");
+    set_if_changed(chip_sp[1], "Avg --");
+    set_if_changed(chip_sp[2], "--");
+
+    set_if_changed(chip_gl[0], "Min --");
+    set_if_changed(chip_gl[1], "Maks --");
+    set_if_changed(chip_gl[2], "PI --");
   }
 
   /* LED "live" hanya berkedip saat pengukuran benar-benar berjalan. */
@@ -935,11 +1046,13 @@ static void refresh_cb(lv_timer_t *tm) {
       lv_label_set_text_fmt(lbl_hh, "%02d", t.tm_hour);
       lv_label_set_text_fmt(lbl_mm, "%02d", t.tm_min);
     }
+    /* Hari dan tanggal satu label, jadi satu penulisan. Tetap dikunci ke
+     * perubahan tm_mday: hari dan tanggal selalu berganti bersamaan. */
     if (t.tm_mday != last_mday) {
       last_mday = t.tm_mday;
-      lv_label_set_text(lbl_day, tm_day_name(t.tm_wday));
-      lv_label_set_text_fmt(lbl_date, "%d %s %d",
-                            t.tm_mday, tm_month_name(t.tm_mon), t.tm_year + 1900);
+      lv_label_set_text_fmt(lbl_date, "%s " TXT_DOT " %d %s %d",
+                            tm_day_name(t.tm_wday), t.tm_mday,
+                            tm_month_name(t.tm_mon), t.tm_year + 1900);
     }
   }
 
@@ -970,6 +1083,13 @@ static void refresh_cb(lv_timer_t *tm) {
   }
 
   update_health_ui();
+
+  /* Tombol daya disamakan dengan keadaan sensor yang sebenarnya. Perlu karena
+   * keadaan itu bertahan saat pengguna pindah halaman: kembali ke home lewat
+   * tombol back harus memperlihatkan tombol hijau kalau sensor memang masih
+   * hidup. Fungsinya sendiri tidak melakukan apa-apa kalau tidak ada
+   * perubahan. */
+  power_btn_refresh();
 
   /* Heartbeat tiap 5 s. Sengaja jarang: USB CDC board ini re-enumerate setelah
    * reset sehingga print di setup() hampir selalu hilang, jadi baris inilah
