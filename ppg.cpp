@@ -89,10 +89,29 @@ static const float SPO2_WRIST_OFFSET = 16.8f;   /* dari (99.9 - 83.1) */
  * Red/IR dengan kadar glukosa darah. */
 static double G0 = 82.1, G1 = -15.0, G2 = 0.3, G3 = 20.0;
 
+/* ---------- Model tekanan darah (SANGAT eksperimental -- BELUM PUNYA titik
+ * koreksi data nyata sama sekali, beda dengan G0 glukosa di atas yang sudah
+ * dapat satu titik dari perbandingan alat sungguhan. Peringatan yang sama
+ * berlaku, malah lebih keras: tidak ada sensor tekanan langsung di sini --
+ * perangkat medis biasa memakai pulse-transit-time (jeda EKG ke puncak nadi)
+ * yang butuh dua sensor terpisah, sementara di sini cuma ada satu PPG.
+ * Angka di bawah HANYA regresi placeholder atas fitur sinyal yang sama
+ * dipakai glukosa (PI, HR, R), memakai rata-rata tekanan darah dewasa
+ * (120/80) sebagai titik tolak. WAJIB dikalibrasi terhadap tensimeter
+ * sungguhan sebelum dipakai untuk apa pun, termasuk sekadar dipercaya.
+ *
+ *   sistol_mmHg  = SBP0 + SBP1*(HR-70) + SBP2*PI + SBP3*R
+ *   diastol_mmHg = DBP0 + DBP1*(HR-70) + DBP2*PI + DBP3*R
+ */
+static double SBP0 = 120.0, SBP1 = 0.3, SBP2 = -3.0, SBP3 = 15.0;
+static double DBP0 = 80.0,  DBP1 = 0.2, DBP2 = -2.0, DBP3 = 10.0;
+
 /* ---------- Smoothing antar-window ---------- */
 static const int SMOOTH_N = 5;
 static float spo2History[SMOOTH_N];
 static float glucoseHistory[SMOOTH_N];
+static float sbpHistory[SMOOTH_N];
+static float dbpHistory[SMOOTH_N];
 static byte  smoothIndex = 0, smoothCount = 0;
 static bool  readingsStable = false;
 
@@ -124,13 +143,18 @@ static float  currentSpO2 = 0;
 static float  currentPI = 0;
 static float  currentR = 0;
 static float  currentGlucose = 0;
+static float  currentSBP = 0;
+static float  currentDBP = 0;
 
 /* ---------- Statistik sesi ---------- */
 static long  statBpmSum = 0, statSpo2Sum = 0;
+static long  statSbpSum = 0, statDbpSum = 0;
 static int   statN = 0;
 static int   statBpmMin = 0, statBpmMax = 0;
 static int   statSpo2Min = 0;
 static int   statGluMin = 0, statGluMax = 0;
+static int   statSbpMin = 0, statSbpMax = 0;
+static int   statDbpMin = 0, statDbpMax = 0;
 
 static ppg_state_t s_state = PPG_ABSENT;
 
@@ -197,10 +221,13 @@ static void reset_beat_detector(void) {
 
 static void reset_session_stats(void) {
   statBpmSum = statSpo2Sum = 0;
+  statSbpSum = statDbpSum = 0;
   statN = 0;
   statBpmMin = statBpmMax = 0;
   statSpo2Min = 0;
   statGluMin = statGluMax = 0;
+  statSbpMin = statSbpMax = 0;
+  statDbpMin = statDbpMax = 0;
 }
 
 static void detect_beat(double acIR) {
@@ -249,39 +276,72 @@ static void estimate_glucose(void) {
                          + G3 * currentR);
 }
 
-static void push_smoothed(float spo2Raw, float glucoseRaw) {
+static void estimate_bp(void) {
+  currentSBP = (float)(SBP0
+                     + SBP1 * (currentBPM - 70.0)
+                     + SBP2 * currentPI
+                     + SBP3 * currentR);
+  currentDBP = (float)(DBP0
+                     + DBP1 * (currentBPM - 70.0)
+                     + DBP2 * currentPI
+                     + DBP3 * currentR);
+  /* Diastol tidak boleh melebihi sistol -- bisa terjadi kalau regresi
+   * placeholder ini kebetulan diberi input di ujung rentang plausible-nya.
+   * Bukan koreksi fisiologis, cuma jaring pengaman supaya angkanya tidak
+   * terang-terangan mustahil ("140/150") di layar. */
+  if (currentDBP > currentSBP - 10.0f) currentDBP = currentSBP - 10.0f;
+}
+
+static void push_smoothed(float spo2Raw, float glucoseRaw,
+                          float sbpRaw, float dbpRaw) {
   spo2History[smoothIndex] = spo2Raw;
   glucoseHistory[smoothIndex] = glucoseRaw;
+  sbpHistory[smoothIndex] = sbpRaw;
+  dbpHistory[smoothIndex] = dbpRaw;
   smoothIndex = (smoothIndex + 1) % SMOOTH_N;
   if (smoothCount < SMOOTH_N) smoothCount++;
 
-  float sumSpo2 = 0, sumGlucose = 0;
+  float sumSpo2 = 0, sumGlucose = 0, sumSbp = 0, sumDbp = 0;
   for (byte i = 0; i < smoothCount; i++) {
     sumSpo2 += spo2History[i];
     sumGlucose += glucoseHistory[i];
+    sumSbp += sbpHistory[i];
+    sumDbp += dbpHistory[i];
   }
   currentSpO2 = sumSpo2 / smoothCount;
   currentGlucose = sumGlucose / smoothCount;
+  currentSBP = sumSbp / smoothCount;
+  currentDBP = sumDbp / smoothCount;
 }
 
 static void update_session_stats(void) {
   int bpm = (int)lroundf(currentBPM);
   int sp  = (int)lroundf(currentSpO2);
   int gl  = (int)lroundf(currentGlucose);
+  int sb  = (int)lroundf(currentSBP);
+  int db  = (int)lroundf(currentDBP);
 
   if (statN == 0) {
     statBpmMin = statBpmMax = bpm;
     statSpo2Min = sp;
     statGluMin = statGluMax = gl;
+    statSbpMin = statSbpMax = sb;
+    statDbpMin = statDbpMax = db;
   } else {
     if (bpm < statBpmMin) statBpmMin = bpm;
     if (bpm > statBpmMax) statBpmMax = bpm;
     if (sp  < statSpo2Min) statSpo2Min = sp;
     if (gl  < statGluMin) statGluMin = gl;
     if (gl  > statGluMax) statGluMax = gl;
+    if (sb  < statSbpMin) statSbpMin = sb;
+    if (sb  > statSbpMax) statSbpMax = sb;
+    if (db  < statDbpMin) statDbpMin = db;
+    if (db  > statDbpMax) statDbpMax = db;
   }
   statBpmSum += bpm;
   statSpo2Sum += sp;
+  statSbpSum += sb;
+  statDbpSum += db;
   statN++;
 }
 
@@ -322,7 +382,8 @@ static void accumulate_spo2(double acRed, double acIR, double dRed, double dIR) 
         currentPI = (float)pi;
         currentR  = (float)R;
         estimate_glucose();
-        push_smoothed(spo2, currentGlucose);
+        estimate_bp();
+        push_smoothed(spo2, currentGlucose, currentSBP, currentDBP);
         readingsStable = true;
         update_session_stats();
         /* Jangan panggil capture_hold() di sini: s_state baru ditetapkan setelah
@@ -340,9 +401,9 @@ static void accumulate_spo2(double acRed, double acIR, double dRed, double dIR) 
         if ((uint32_t)(millis() - lastLog) >= 2000) {
           lastLog = millis();
           Serial.printf("[ppg] BPM %.1f  SpO2 %.1f%%  Glukosa* %.1f mg/dL  "
-                        "[PI %.3f  R %.4f]\n",
+                        "TD* %.0f/%.0f mmHg  [PI %.3f  R %.4f]\n",
                         currentBPM, currentSpO2, currentGlucose,
-                        currentPI, currentR);
+                        currentSBP, currentDBP, currentPI, currentR);
         }
 #endif
       }
@@ -509,6 +570,10 @@ static void fill_live(ppg_data_t *out) {
   out->glu_valid = readingsStable;
   out->glucose   = currentGlucose;
 
+  out->bp_valid = readingsStable;
+  out->sbp      = currentSBP;
+  out->dbp      = currentDBP;
+
   out->pi = currentPI;
   out->r  = currentR;
 
@@ -521,6 +586,12 @@ static void fill_live(ppg_data_t *out) {
     out->spo2_avg = (int)(statSpo2Sum / statN);
     out->glu_min = statGluMin;
     out->glu_max = statGluMax;
+    out->sbp_min = statSbpMin;
+    out->sbp_max = statSbpMax;
+    out->sbp_avg = (int)(statSbpSum / statN);
+    out->dbp_min = statDbpMin;
+    out->dbp_max = statDbpMax;
+    out->dbp_avg = (int)(statDbpSum / statN);
   }
 }
 

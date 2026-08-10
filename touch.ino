@@ -10,13 +10,16 @@
  *   1 Home     - ilustrasi, tombol daya sensor, jam + tanggal, header cuaca &
  *                baterai. Tombol daya ON menyalakan MAX30105 sekaligus membuka
  *                menu; OFF mematikan LED-nya dan tetap di halaman ini.
- *   2 Menu     - 3 kartu: Heart rate / SpO2 / Glukosa
- *   3 Detail   - Heart rate : arc, EKG, bar 12 jam, chip statistik
- *   4 Detail   - SpO2       : ring, legend zona, grafik riwayat
- *   5 Detail   - Glukosa    : angka besar, bar rentang, tren harian
+ *   2 Menu     - 4 kartu: Heart rate / SpO2 / Glukosa / Tekanan darah
+ *   3 Detail   - Heart rate     : arc, EKG, bar 12 jam, chip statistik
+ *   4 Detail   - SpO2           : ring, legend zona, grafik riwayat
+ *   5 Detail   - Glukosa        : angka besar, bar rentang, tren harian
+ *   6 Detail   - Tekanan darah  : angka sistol/diastol, bar zona, tren harian
  *
- * Geometri & warna diambil langsung dari mockup 480x560 (tepat 2x layar),
- * jadi semua koordinat di bawah = koordinat mockup / 2.
+ * Halaman 6 tidak punya acuan mockup (fitur ditambahkan belakangan) --
+ * geometrinya mengikuti pola halaman 5, bukan piksel dari gambar manapun.
+ * Sisanya: geometri & warna diambil langsung dari mockup 480x560 (tepat 2x
+ * layar), jadi semua koordinat di bawah = koordinat mockup / 2.
  *
  * Aset gambar (pesawat+bulan, ikon) ada di ui_assets.h, dibuat otomatis dari
  * mockup. Jalankan genassets.py kalau mockup berubah.
@@ -25,10 +28,12 @@
  *   rtc / time_manager  - PCF85063 + sinkronisasi NTP
  *   net / weather       - Wi-Fi, NTP, OpenWeatherMap
  *   battery             - ADC1 + kurva Li-Po
- *   ppg                 - MAX30105/30102: BPM, SpO2, glukosa EKSPERIMENTAL
+ *   ppg                 - MAX30105/30102: BPM, SpO2, glukosa, tekanan darah
+ *                         EKSPERIMENTAL
  *
- * PERINGATAN: nilai glukosa tidak punya dasar fisiologis tervalidasi dan tidak
- * boleh dipakai untuk keputusan medis apa pun. Lihat ppg.h.
+ * PERINGATAN: nilai glukosa dan tekanan darah tidak punya dasar fisiologis
+ * tervalidasi dan tidak boleh dipakai untuk keputusan medis apa pun. Lihat
+ * ppg.h.
  */
 
 #include <lvgl.h>
@@ -227,6 +232,9 @@ static void my_touch_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
 #define C_GL_BG     0x4D3A17
 #define C_GL_TITLE  0xFFF3D6
 #define C_GL_SUB    0xECCF94
+#define C_BP_BG     0x3A1E52
+#define C_BP_TITLE  0xEFE3FF
+#define C_BP_SUB    0xC9A8F0
 /* 3 Heart rate */
 #define C_S3_BG     0x2A1A24
 #define C_S3_DECO   0x39222E
@@ -248,6 +256,14 @@ static void my_touch_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
 #define C_S5_CARD   0x453413
 #define C_S5_MUTE   0xD9BD85
 #define C_AMBER2    0xFFCF70
+/* 6 Tekanan darah (tanpa acuan mockup, lihat catatan di atas file) */
+#define C_S6_BG     0x241A3D
+#define C_S6_DECO   0x33234F
+#define C_S6_CARD   0x3A2A54
+#define C_S6_TITLE  0xF0E6FF
+#define C_S6_MUTE   0xC7ADE8
+#define C_PURPLE    0xB48CFF  /* sistol */
+#define C_PURPLE2   0x7A5CC7  /* diastol */
 /* zona */
 #define C_GREEN     0x4FBF7A
 #define C_GREEN2    0x7EE2A8
@@ -269,7 +285,7 @@ static void my_touch_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
  */
 
 /* ================= Handle layar & widget ================= */
-static lv_obj_t *scr_home, *scr_menu, *scr_hr, *scr_spo2, *scr_glu;
+static lv_obj_t *scr_home, *scr_menu, *scr_hr, *scr_spo2, *scr_glu, *scr_bp;
 
 /* home */
 static lv_obj_t *lbl_hh, *lbl_mm, *lbl_wthr, *lbl_batt;
@@ -280,17 +296,18 @@ static lv_obj_t *lbl_date;
 static lv_obj_t *lbl_cond;   /* caption kondisi cuaca di header */
 static lv_obj_t *btn_pwr, *ic_pwr;   /* tombol daya sensor PPG */
 /* menu */
-static lv_obj_t *lbl_card_hr, *lbl_card_sp, *lbl_card_gl;
+static lv_obj_t *lbl_card_hr, *lbl_card_sp, *lbl_card_gl, *lbl_card_bp;
 /* detail */
 static lv_obj_t *arc_hr, *lbl_hr_big, *ring_sp, *lbl_sp_big, *lbl_glu_big;
+static lv_obj_t *lbl_bp_big;
 static lv_obj_t *dot_live;
 /* Handle tambahan supaya chip statistik, teks zona, dan penanda bar ikut
  * mengikuti data nyata. Ini hanya menyimpan pointer objek yang sudah ada --
  * posisi, ukuran, font, dan warnanya tidak diubah. Perlu, karena angka utama
  * yang nyata di atas angka yang dikarang di bawahnya justru menyesatkan. */
-static lv_obj_t *chip_hr[3], *chip_sp[3], *chip_gl[3];
-static lv_obj_t *lbl_hr_zone, *lbl_glu_status;
-static lv_obj_t *mark_hr, *mark_glu;
+static lv_obj_t *chip_hr[3], *chip_sp[3], *chip_gl[3], *chip_bp[3];
+static lv_obj_t *lbl_hr_zone, *lbl_glu_status, *lbl_bp_status;
+static lv_obj_t *mark_hr, *mark_glu, *mark_bp;
 
 /* ================= Helper pembuat widget ================= */
 
@@ -406,6 +423,7 @@ static const nav_target_t NAV_MENU = { &scr_menu, false, "menu (back)" };
 static const nav_target_t NAV_HR   = { &scr_hr,   true,  "heart rate" };
 static const nav_target_t NAV_SPO2 = { &scr_spo2, true,  "spo2" };
 static const nav_target_t NAV_GLU  = { &scr_glu,  true,  "glukosa" };
+static const nav_target_t NAV_BP   = { &scr_bp,   true,  "tekanan darah" };
 
 static int16_t tap_x0, tap_y0;
 
@@ -598,14 +616,18 @@ static void build_home(void) {
 }
 
 /* ================= Halaman 2 : Menu kesehatan ================= */
-/* Satu kartu menu: latar berwarna, ikon, judul, nilai, chevron. */
-static lv_obj_t *mk_card(lv_obj_t *scr, int y, uint32_t bg, const char *title,
+/* Satu kartu menu: latar berwarna, ikon, judul, nilai, chevron.
+ *
+ * Tinggi kartu diparameterkan (dulu tetap 64 px) sejak kartu ke-4 (Tekanan
+ * darah) ditambahkan -- 4 kartu 64 px + footer tidak muat di layar 280 px
+ * tinggi, jadi seluruh kartu diperkecil bersama-sama, bukan cuma yang baru. */
+static lv_obj_t *mk_card(lv_obj_t *scr, int y, int h, uint32_t bg, const char *title,
                          const char *val, uint32_t c_title, uint32_t c_sub,
                          const nav_target_t *nav, lv_obj_t **out_val) {
-  lv_obj_t *card = mk_box(scr, 10, y, 220, 64, bg, 12);
-  mk_tap_nav(card, 0, nav);         /* 220x64, sudah cukup besar */
+  lv_obj_t *card = mk_box(scr, 10, y, 220, h, bg, 12);
+  mk_tap_nav(card, 0, nav);         /* 220 px lebar, sudah cukup besar */
 
-  mk_label(card, title, &lv_font_montserrat_14, c_title, 45, 7);
+  mk_label(card, title, &lv_font_montserrat_14, c_title, 45, 6);
   *out_val = mk_label(card, val, &lv_font_montserrat_14, c_sub, 45, 24);
 
   lv_obj_t *ch = mk_label(card, LV_SYMBOL_RIGHT, &lv_font_montserrat_12, c_sub, 0, 0);
@@ -622,22 +644,27 @@ static void build_menu(void) {
 
   mk_header(scr_menu, "Menu kesehatan", C_S2_BTN, &NAV_HOME);
 
-  lv_obj_t *c1 = mk_card(scr_menu, 44,  C_HR_BG, "Heart rate", "-- bpm",
+  /* 4 kartu tinggi 52 px, jarak 60 px (gap 8 px): 42, 102, 162, 222 ->
+   * kartu terakhir berakhir di 274, menyisakan 6 px ke tepi bawah layar
+   * bundar -- sama seperti margin bawah di halaman home. Footer
+   * "3 sensor aktif..." dihapus: tidak ada lagi ruang untuknya, dan dengan
+   * 4 metrik dari sensor yang sama, "3 sensor" sudah tidak akurat juga. */
+  static const int CARD_H = 52, CARD_Y0 = 42, CARD_DY = 60;
+  lv_obj_t *c1 = mk_card(scr_menu, CARD_Y0,              CARD_H, C_HR_BG, "Heart rate", "-- bpm",
                          C_HR_TITLE, C_HR_SUB, &NAV_HR,   &lbl_card_hr);
-  lv_obj_t *c2 = mk_card(scr_menu, 116, C_SP_BG, "SpO2", "-- %",
+  lv_obj_t *c2 = mk_card(scr_menu, CARD_Y0 + CARD_DY,     CARD_H, C_SP_BG, "SpO2", "-- %",
                          C_SP_TITLE, C_SP_SUB, &NAV_SPO2, &lbl_card_sp);
-  lv_obj_t *c3 = mk_card(scr_menu, 188, C_GL_BG, "Glukosa", "-- mg/dL",
+  lv_obj_t *c3 = mk_card(scr_menu, CARD_Y0 + CARD_DY * 2, CARD_H, C_GL_BG, "Glukosa", "-- mg/dL",
                          C_GL_TITLE, C_GL_SUB, &NAV_GLU,  &lbl_card_gl);
+  lv_obj_t *c4 = mk_card(scr_menu, CARD_Y0 + CARD_DY * 3, CARD_H, C_BP_BG, "Tekanan darah", "--/-- mmHg",
+                         C_BP_TITLE, C_BP_SUB, &NAV_BP,   &lbl_card_bp);
 
-  /* ikon kartu: posisi vertikal ditengahkan manual terhadap tinggi kartu 64 */
-  mk_img(c1, &img_heart_sm, 12, 22);
-  mk_img(c2, &img_drop,     14, 21);
-  mk_box(c3, 14, 24, 16, 16, C_AMBER2, LV_RADIUS_CIRCLE);
-
-  lv_obj_t *f = mk_label(scr_menu, "3 sensor aktif " TXT_DOT " sinkron 2 mnt lalu",
-                         &lv_font_montserrat_10, C_S2_FOOT, 0, 265);
-  lv_obj_set_width(f, SCREEN_W);
-  lv_obj_set_style_text_align(f, LV_TEXT_ALIGN_CENTER, 0);
+  /* ikon kartu: dipusatkan vertikal lewat align, bukan koordinat y tetap --
+   * tahan terhadap perubahan tinggi kartu di masa depan. */
+  lv_obj_t *i1 = mk_img(c1, &img_heart_sm, 12, 0); lv_obj_align(i1, LV_ALIGN_LEFT_MID, 12, 0);
+  lv_obj_t *i2 = mk_img(c2, &img_drop,     14, 0); lv_obj_align(i2, LV_ALIGN_LEFT_MID, 14, 0);
+  lv_obj_t *i3 = mk_box(c3, 0, 0, 16, 16, C_AMBER2, LV_RADIUS_CIRCLE); lv_obj_align(i3, LV_ALIGN_LEFT_MID, 14, 0);
+  lv_obj_t *i4 = mk_box(c4, 0, 0, 16, 16, C_PURPLE, LV_RADIUS_CIRCLE); lv_obj_align(i4, LV_ALIGN_LEFT_MID, 14, 0);
 }
 
 /* ================= Halaman 3 : Heart rate ================= */
@@ -895,6 +922,85 @@ static void build_glu(void) {
   mk_chips(scr_glu, "Min --", "Maks --", "PI --", C_S5_CARD, C_GL_TITLE, chip_gl);
 }
 
+/* ================= Halaman 6 : Tekanan darah =================
+ * Tidak ada mockup untuk halaman ini (fitur ditambahkan belakangan). Geometri
+ * di bawah SENGAJA meniru rima vertikal halaman 5 (Glukosa) piksel demi piksel
+ * -- itu satu-satunya halaman yang sudah terbukti muat di layar 240x280 dengan
+ * struktur setara (angka besar + bar zona + status + tren + chip), jadi lebih
+ * aman menyalin proporsinya daripada menerka ulang dari nol. */
+static lv_chart_series_t *bp_ser_sbp, *bp_ser_dbp;
+static lv_obj_t *bp_chart;
+
+static void build_bp(void) {
+  scr_bp = lv_obj_create(NULL);
+  lv_obj_remove_style_all(scr_bp);
+  lv_obj_set_style_bg_color(scr_bp, lv_color_hex(C_S6_BG), 0);
+  lv_obj_set_style_bg_opa(scr_bp, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(scr_bp, LV_OBJ_FLAG_SCROLLABLE);
+
+  mk_deco(scr_bp, 220, 55, 45, C_S6_DECO);
+  mk_deco(scr_bp, 15, 235, 45, C_S6_DECO);
+
+  mk_header(scr_bp, "Tekanan darah", C_S6_CARD, &NAV_MENU);
+  /* Lencana permanen, bukan data yang bisa jadi basi seperti pill "terukur
+   * 10:20" di halaman SpO2 -- di sini lebih penting selalu terlihat mengingat
+   * modelnya bahkan belum dapat satu titik kalibrasi pun (lihat ppg.cpp). */
+  mk_pill(scr_bp, 152, 78, "eksperimental", C_S6_CARD, C_S6_MUTE);
+
+  /* "120/80" pakai montserrat_30 biasa, bukan font_digits: font_digits cuma
+   * berisi glyph 0-9 dan '-', tidak ada '/' untuk memisahkan sistol/diastol. */
+  lbl_bp_big = mk_label(scr_bp, "--/--", &lv_font_montserrat_30, 0xFFFFFF, 12, 42);
+  mk_label(scr_bp, "mmHg", &lv_font_montserrat_14, C_S6_MUTE, 150, 60);
+
+  static const int    bw[4] = { 14, 40, 25, 18 };
+  static const uint32_t bc[4] = { C_BLUE, C_GREEN, C_YELLOW, C_RED };
+  mark_bp = mk_zonebar(scr_bp, 122, 62, 97, 7, bw, bc, 4, 32);
+
+  lbl_bp_status = mk_label(scr_bp, "Menunggu pengukuran",
+                           &lv_font_montserrat_10, C_S6_MUTE, 10, 91);
+
+  mk_label(scr_bp, "Tren hari ini", &lv_font_montserrat_12, C_S6_MUTE, 10, 111);
+
+  /* panel + grafik tren, dua seri (sistol/diastol) */
+  mk_box(scr_bp, 10, 128, 224, 30, C_S6_CARD, 6);
+  bp_chart = lv_chart_create(scr_bp);
+  lv_obj_set_pos(bp_chart, 10, 126);
+  lv_obj_set_size(bp_chart, 224, 40);
+  lv_chart_set_type(bp_chart, LV_CHART_TYPE_LINE);
+  lv_chart_set_point_count(bp_chart, 7);
+  lv_chart_set_range(bp_chart, LV_CHART_AXIS_PRIMARY_Y, 50, 160);
+  lv_chart_set_div_line_count(bp_chart, 0, 0);
+  lv_obj_set_style_bg_opa(bp_chart, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(bp_chart, 0, 0);
+  lv_obj_set_style_pad_all(bp_chart, 5, 0);
+  lv_obj_set_style_line_width(bp_chart, 2, LV_PART_ITEMS);
+  /* Titik indikator dimatikan (size 0), beda dengan chart SpO2/glukosa yang
+   * cuma satu seri: dengan dua seri di sini titiknya akan memakai satu warna
+   * default yang sama untuk sistol maupun diastol dan malah membingungkan --
+   * warna garis saja sudah cukup membedakan keduanya. */
+  lv_obj_set_style_size(bp_chart, 0, LV_PART_INDICATOR);
+  lv_obj_clear_flag(bp_chart, LV_OBJ_FLAG_SCROLLABLE);
+  bp_ser_sbp = lv_chart_add_series(bp_chart, lv_color_hex(C_PURPLE), LV_CHART_AXIS_PRIMARY_Y);
+  bp_ser_dbp = lv_chart_add_series(bp_chart, lv_color_hex(C_PURPLE2), LV_CHART_AXIS_PRIMARY_Y);
+  static const int sbpv[7] = { 118, 121, 125, 119, 123, 127, 120 };
+  static const int dbpv[7] = { 76,  78,  80,  77,  79,  82,  78  };
+  for (int i = 0; i < 7; i++) {
+    lv_chart_set_value_by_id(bp_chart, bp_ser_sbp, i, sbpv[i]);
+    lv_chart_set_value_by_id(bp_chart, bp_ser_dbp, i, dbpv[i]);
+  }
+
+  /* label sumbu waktu */
+  mk_label(scr_bp, "06.00", &lv_font_montserrat_10, C_S6_MUTE, 10, 175);
+  lv_obj_t *m = mk_label(scr_bp, "08.00", &lv_font_montserrat_10, C_S6_MUTE, 0, 175);
+  lv_obj_set_width(m, SCREEN_W);
+  lv_obj_set_style_text_align(m, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_t *r = mk_label(scr_bp, "10.00", &lv_font_montserrat_10, C_S6_MUTE, 0, 175);
+  lv_obj_set_width(r, 230);
+  lv_obj_set_style_text_align(r, LV_TEXT_ALIGN_RIGHT, 0);
+
+  mk_chips(scr_bp, "Sistol --", "Diastol --", "Nadi --", C_S6_CARD, C_S6_TITLE, chip_bp);
+}
+
 /* ================= Timer: perbarui isi layar =================
  * Semua label diperbarui HANYA saat nilainya berubah. lv_label_set_text()
  * selalu meng-invalidate area labelnya, dan beberapa di antaranya memakai
@@ -930,6 +1036,11 @@ static void update_health_ui(void) {
   if (p.glu_valid) snprintf(b, sizeof(b), "%d mg/dL", (int)lroundf(p.glucose));
   else             snprintf(b, sizeof(b), "-- mg/dL");
   set_if_changed(lbl_card_gl, b);
+
+  if (p.bp_valid) snprintf(b, sizeof(b), "%d/%d mmHg",
+                           (int)lroundf(p.sbp), (int)lroundf(p.dbp));
+  else            snprintf(b, sizeof(b), "--/-- mmHg");
+  set_if_changed(lbl_card_bp, b);
 
   /* ---- halaman 3: heart rate ---- */
   if (p.bpm_valid) {
@@ -986,6 +1097,28 @@ static void update_health_ui(void) {
     lv_obj_set_x(mark_glu, 122 + 32);
   }
 
+  /* ---- halaman 6: tekanan darah (EKSPERIMENTAL) ---- */
+  if (p.bp_valid) {
+    int sb = (int)lroundf(p.sbp);
+    int db = (int)lroundf(p.dbp);
+    snprintf(b, sizeof(b), "%d/%d", sb, db);
+    set_if_changed(lbl_bp_big, b);
+    /* Status mengikuti sistol saja, sama seperti zona HR yang cuma memakai
+     * satu angka -- diastol tetap terlihat di angka besar & chip, cukup
+     * tidak ikut menentukan kategori supaya logikanya tetap sederhana. */
+    const char *kat = sb < 90  ? "rendah"
+                    : sb < 120 ? "normal"
+                    : sb < 140 ? "meningkat" : "tinggi";
+    snprintf(b, sizeof(b), "Estimasi %s (normal ~90-120)", kat);
+    set_if_changed(lbl_bp_status, b);
+    int sb_clamped = sb < 70 ? 70 : (sb > 160 ? 160 : sb);
+    lv_obj_set_x(mark_bp, 122 + (sb_clamped - 70) * 97 / 90);
+  } else {
+    set_if_changed(lbl_bp_big, "--/--");
+    set_if_changed(lbl_bp_status, "Menunggu pengukuran");
+    lv_obj_set_x(mark_bp, 122 + 32);
+  }
+
   /* ---- chip statistik sesi ---- */
   if (p.stats_valid) {
     snprintf(b, sizeof(b), "Ist. %d", p.bpm_min);  set_if_changed(chip_hr[0], b);
@@ -999,6 +1132,13 @@ static void update_health_ui(void) {
     snprintf(b, sizeof(b), "Min %d",  p.glu_min);  set_if_changed(chip_gl[0], b);
     snprintf(b, sizeof(b), "Maks %d", p.glu_max);  set_if_changed(chip_gl[1], b);
     snprintf(b, sizeof(b), "PI %.1f", p.pi);       set_if_changed(chip_gl[2], b);
+
+    snprintf(b, sizeof(b), "Sistol %d",  p.sbp_avg); set_if_changed(chip_bp[0], b);
+    snprintf(b, sizeof(b), "Diastol %d", p.dbp_avg); set_if_changed(chip_bp[1], b);
+    /* Tekanan nadi (pulse pressure) = sistol - diastol, dari rata-rata sesi
+     * -- bukan chip generik ketiga seperti "PI" di glukosa, karena angka ini
+     * memang turunan langsung dua kolom di atasnya, bukan fitur kalibrasi. */
+    snprintf(b, sizeof(b), "Nadi %d", p.sbp_avg - p.dbp_avg); set_if_changed(chip_bp[2], b);
   } else {
     /* Tanpa cabang ini chip membeku di angka sesi sebelumnya. Paling terasa
      * saat sensor dimatikan lewat tombol daya: angka utama jadi "--" sementara
@@ -1015,6 +1155,10 @@ static void update_health_ui(void) {
     set_if_changed(chip_gl[0], "Min --");
     set_if_changed(chip_gl[1], "Maks --");
     set_if_changed(chip_gl[2], "PI --");
+
+    set_if_changed(chip_bp[0], "Sistol --");
+    set_if_changed(chip_bp[1], "Diastol --");
+    set_if_changed(chip_bp[2], "Nadi --");
   }
 
   /* LED "live" hanya berkedip saat pengukuran benar-benar berjalan. */
@@ -1121,12 +1265,14 @@ static void refresh_cb(lv_timer_t *tm) {
     ppg_data_t pp; ppg_get(&pp);
     long dir, dred, dthr; uint32_t dn, dp;
     ppg_diag(&dir, &dred, &dn, &dthr, &dp);
-    Serial.printf("[ppg]  %s%s  bpm=%s%.0f  spo2=%s%.1f  glukosa*=%s%.0f\n",
+    Serial.printf("[ppg]  %s%s  bpm=%s%.0f  spo2=%s%.1f  glukosa*=%s%.0f  "
+                  "td*=%s%.0f/%.0f\n",
                   ppg_state_text(),
                   pp.held ? " [tahan]" : "",
                   pp.bpm_valid ? "" : "(-)", pp.bpm,
                   pp.spo2_valid ? "" : "(-)", pp.spo2,
-                  pp.glu_valid ? "" : "(-)", pp.glucose);
+                  pp.glu_valid ? "" : "(-)", pp.glucose,
+                  pp.bp_valid ? "" : "(-)", pp.sbp, pp.dbp);
     /* Baris mentah: ir/red dan sampel. sampel yang diam di satu angka berarti
      * FIFO tidak menghasilkan apa pun -- biasanya sensor tidak dicatu daya. */
     Serial.printf("[ppg] mentah ir=%ld red=%ld (ambang %ld)  sampel=%lu  poll=%lu\n",
@@ -1225,6 +1371,7 @@ void setup() {
   build_hr();
   build_spo2();
   build_glu();
+  build_bp();
   lv_scr_load(scr_home);
 
   lv_timer_create(refresh_cb, 500, NULL);

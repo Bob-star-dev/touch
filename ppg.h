@@ -1,5 +1,6 @@
 /*
- * MAX30105/MAX30102 (PPG) -> BPM, SpO2, dan estimasi glukosa EKSPERIMENTAL.
+ * MAX30105/MAX30102 (PPG) -> BPM, SpO2, dan estimasi glukosa + tekanan darah
+ * EKSPERIMENTAL.
  *
  * Diadaptasi dari sketch ESP32-C3 standalone. Yang HARUS berubah untuk board
  * ini dan alasannya -- ketiganya bukan preferensi gaya, tapi hal yang membuat
@@ -54,6 +55,15 @@ typedef struct {
   bool  glu_valid;
   float glucose;      /* EKSPERIMENTAL -- lihat peringatan di atas */
 
+  /* Tekanan darah, EKSPERIMENTAL -- sama sekali belum tervalidasi, bahkan
+   * lebih mentah daripada model glukosa (lihat SBP0.. di ppg.cpp). Diturunkan
+   * dari fitur PPG yang sama (PI, HR, R) karena sensor ini satu-satunya
+   * sumber data -- tidak ada jalur EKG untuk pulse-transit-time yang biasanya
+   * dipakai perangkat medis. JANGAN dipakai untuk keputusan medis apa pun. */
+  bool  bp_valid;
+  float sbp;           /* sistol, mmHg, EKSPERIMENTAL */
+  float dbp;           /* diastol, mmHg, EKSPERIMENTAL */
+
   float pi;           /* perfusion index IR (%), fitur kalibrasi   */
   float r;            /* rasio R, fitur kalibrasi                  */
 
@@ -62,6 +72,8 @@ typedef struct {
   int   bpm_min, bpm_avg, bpm_max;
   int   spo2_min, spo2_avg;
   int   glu_min, glu_max;
+  int   sbp_min, sbp_avg, sbp_max;
+  int   dbp_min, dbp_avg, dbp_max;
   bool  stats_valid;
 
   /* true = angka ini salinan hasil terakhir, bukan bacaan langsung (sensor
