@@ -1,0 +1,374 @@
+/*
+ * Catatan pustaka -- baca sebelum membandingkan berkas ini dengan dokumen.
+ *
+ * Contoh kode di dokumen ditulis untuk NimBLE-Arduino >= 2.0 (NimBLEDevice,
+ * NIMBLE_PROPERTY, NimBLEAdvertisementData). Berkas ini memakai pustaka BLE
+ * BAWAAN core Arduino-ESP32 (BLEDevice, BLECharacteristic::PROPERTY_*,
+ * BLEAdvertisementData) -- dan itu bukan penyimpangan protokol: di ESP32-C6
+ * pustaka bawaan core ITU SENDIRI adalah NimBLE (CONFIG_BT_NIMBLE_ENABLED=y di
+ * sdkconfig chip ini), jadi yang berbeda hanya nama kelas pembungkusnya. Byte
+ * di kawat identik.
+ *
+ * Alasannya bukan selera: NimBLE-Arduino 2.5.0 membawa salinan stack NimBLE-nya
+ * sendiri, dan di C6 salinan itu tidak bisa di-link -- porting layer-nya
+ * mengharapkan simbol NPL dari ROM (r_os_memblock_get, r_os_mempool_init, ...)
+ * yang memang tidak ada di ROM maupun libbt.a C6, karena di chip ini
+ * CONFIG_BT_LE_CONTROLLER_NPL_OS_PORTING_SUPPORT=y dan implementasinya milik
+ * controller. Gejalanya "undefined reference" saat linking, bukan saat
+ * kompilasi, jadi jangan tergoda memasang NimBLE-Arduino lagi kalau kode ini
+ * suatu saat dipindah: kegagalannya akan terlihat seperti masalah lain.
+ *
+ * Seluruh isi dokumen bagian 3, 4, 10, 11, dan 13.1 tetap diikuti apa adanya.
+ */
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLESecurity.h>
+#include <BLEAdvertising.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <esp_mac.h>
+#include <string.h>
+
+#include "aw_ble.h"
+#include "aw_store.h"
+
+/* ---------------- Keadaan modul ---------------- */
+static BLEServer         *s_server = nullptr;
+static BLECharacteristic *s_c_info = nullptr;
+static BLECharacteristic *s_c_kontrol = nullptr;
+static BLECharacteristic *s_c_peristiwa = nullptr;
+static BLECharacteristic *s_c_sampel = nullptr;
+static BLECharacteristic *s_c_status = nullptr;
+static BLECharacteristic *s_c_batt = nullptr;
+
+static QueueHandle_t s_antrean = nullptr;
+
+static uint8_t s_serial[6];
+static char    s_nama[24];
+
+static volatile bool     s_terhubung = false;
+static volatile uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+static volatile bool     s_langganan_sampel = false;
+static volatile bool     s_langganan_peristiwa = false;
+static volatile bool     s_siap_baru = false;
+
+/* Interval iklan: 100 ms selama 60 detik pertama, lalu 1000 ms (dokumen 3.2).
+ * Satuan BLE 0,625 ms. */
+#define ADV_CEPAT      160    /* 100 ms  */
+#define ADV_LAMBAT    1600    /* 1000 ms */
+#define ADV_CEPAT_MS 60000UL
+
+static uint32_t s_adv_cepat_sampai = 0;
+static bool     s_adv_sedang_cepat = false;
+static volatile bool s_perlu_iklan_ulang = false;
+
+/* ---------------- Paket Info (dokumen 4) ----------------
+ * Disusun TEPAT saat dibaca supaya uptime_s-nya segar, dan WAJIB murni RAM:
+ * fungsi ini berjalan di task host NimBLE, tempat NVS dan ring buffer dilarang
+ * disentuh. Semua yang dipakainya -- serial, boot_id, uptime, flag anchor --
+ * memang sudah ada sebagai salinan RAM sejak boot. */
+static void susun_info(uint8_t *b) {
+  memset(b, 0, AW_LEN_INFO);
+  b[0] = AW_VERSI_MAYOR;
+  b[1] = AW_VERSI_MINOR;
+  memcpy(&b[2], s_serial, 6);
+  aw_tulis_u16(&b[8], AW_FIRMWARE_BUILD);
+  b[10] = AW_KAPASITAS_BUFFER;
+  b[11] = AW_KEMAMPUAN;
+  aw_tulis_u16(&b[12], aw_boot_id());
+  aw_tulis_u32(&b[14], aw_uptime_s());
+  b[18] = aw_anchor_boot_ini() ? 0x01 : 0x00;
+  b[19] = 0;
+}
+
+/* ---------------- Callback ---------------- */
+class SrvCB : public BLEServerCallbacks {
+  /* Varian NimBLE dipakai karena hanya ia yang membawa ble_gap_conn_desc, dan
+   * conn_handle di dalamnya diperlukan updateConnParams(). */
+  void onConnect(BLEServer *srv, ble_gap_conn_desc *desc) override {
+    (void)srv;
+    s_terhubung = true;
+    s_conn_handle = desc->conn_handle;
+    /* Belum boleh mengirim apa-apa: CCCD ditulis ulang tiap koneksi, jadi
+     * langganan koneksi sebelumnya tidak berlaku (dokumen 11). */
+    s_langganan_sampel = s_langganan_peristiwa = false;
+    Serial.printf("[ble] tersambung, handle=%u\n", (unsigned)s_conn_handle);
+  }
+
+  void onDisconnect(BLEServer *srv, ble_gap_conn_desc *desc) override {
+    (void)srv; (void)desc;
+    s_terhubung = false;
+    s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    s_langganan_sampel = s_langganan_peristiwa = false;
+    /* Jam SELALU kembali beriklan setelah putus dan tidak pernah memutus
+     * koneksi sendiri saat idle: setiap koneksi yang terbentuk adalah
+     * kesempatan memasang anchor (dokumen 3.2). Penyetelan intervalnya ditunda
+     * ke konteks loop lewat flag ini. */
+    s_perlu_iklan_ulang = true;
+    Serial.println("[ble] terputus");
+  }
+};
+
+class InfoCB : public BLECharacteristicCallbacks {
+  void onRead(BLECharacteristic *c) override {
+    uint8_t b[AW_LEN_INFO];
+    susun_info(b);
+    c->setValue(b, sizeof(b));
+  }
+  void onWrite(BLECharacteristic *c) override {
+    /* Karakteristik Info memang berproperti Write di tabel dokumen 3.1, tetapi
+     * dokumen tidak memberinya arti apa pun. Tulisan diterima dan diabaikan --
+     * bukan di-NAK, karena NAK dicadangkan untuk opcode di karakteristik
+     * Kontrol dan menjawab di sini justru membingungkan aplikasi. */
+    (void)c;
+    Serial.println("[ble] tulisan ke Info diabaikan (tidak punya arti di v1.1)");
+  }
+};
+
+class KontrolCB : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *c) override {
+    /* Yang boleh dilakukan di sini hanyalah memindahkan byte mentah ke antrean.
+     * Tidak ada penguraian opcode, tidak ada sentuhan ring buffer atau NVS --
+     * dokumen 13.1. Callback ini juga harus cepat: respons write baru dikirim
+     * setelah ia kembali. */
+    String v = c->getValue();
+    aw_perintah_t p;
+    size_t n = v.length();
+    if (n > AW_MAKS_PERINTAH) n = AW_MAKS_PERINTAH;
+    p.panjang = (uint8_t)n;
+    memcpy(p.data, v.c_str(), n);
+    if (xQueueSend(s_antrean, &p, 0) != pdTRUE)
+      Serial.println("[ble] antrean perintah penuh, satu perintah hilang");
+  }
+};
+
+/* onSubscribe untuk Sampel dan Peristiwa. Pengurasan buffer dipicu di sini,
+ * BUKAN saat koneksi terbentuk: notifikasi yang dikirim sebelum CCCD ditulis
+ * hilang tanpa jejak, sementara entrinya terlanjur ditandai "sudah dikirim" dan
+ * tidak datang lagi sampai ada SINKRON berikutnya (dokumen 11). */
+class LanggananCB : public BLECharacteristicCallbacks {
+public:
+  explicit LanggananCB(volatile bool *bendera) : m_bendera(bendera) {}
+  void onSubscribe(BLECharacteristic *c, ble_gap_conn_desc *desc,
+                   uint16_t nilai) override {
+    (void)c; (void)desc;
+    *m_bendera = (nilai != 0);
+    if (s_langganan_sampel && s_langganan_peristiwa) s_siap_baru = true;
+  }
+private:
+  volatile bool *m_bendera;
+};
+
+/* Status disegarkan saat dibaca (dokumen 8). Yang benar-benar basi hanyalah
+ * uptime_s -- empat byte pertama sudah diperbarui aw_jam setiap kali berubah --
+ * jadi cukup keempat byte itu yang ditambal, dan penambalannya murni RAM. */
+class StatusCB : public BLECharacteristicCallbacks {
+  void onRead(BLECharacteristic *c) override {
+    if (c->getLength() != AW_LEN_STATUS) return;
+    uint8_t b[AW_LEN_STATUS];
+    memcpy(b, c->getData(), AW_LEN_STATUS);
+    aw_tulis_u32(&b[4], aw_uptime_s());
+    c->setValue(b, sizeof(b));
+  }
+};
+
+/* ---------------- Iklan ---------------- */
+static void setel_iklan(bool cepat) {
+  BLEAdvertising *adv = BLEDevice::getAdvertising();
+  adv->stop();
+
+  /* Paket iklan: flags + Complete List of 128-bit Service UUIDs.
+   *
+   * UUID-nya HARUS di paket iklan, bukan di scan response. Aplikasi memfilter
+   * service UUID di level OS, dan filter itu bekerja pada paket iklan; jam yang
+   * menaruh UUID-nya di scan response tidak akan pernah terlihat sama sekali --
+   * bukan muncul lalu gagal, melainkan tidak muncul, dengan gejala yang di
+   * layar tidak bisa dibedakan dari jam yang mati (dokumen 3.2 & 15).
+   *
+   * Anggarannya juga tidak menyisakan pilihan: batas 31 byte, UUID 128-bit
+   * memakan 18 byte, nama 15, manufacturer data 5 -- total 38. Nama dan
+   * manufacturer data yang harus pindah. */
+  BLEAdvertisementData data_iklan;
+  data_iklan.setFlags(BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP);
+  data_iklan.setCompleteServices(BLEUUID(AW_UUID_SERVICE));
+
+  BLEAdvertisementData data_scan;
+  data_scan.setName(s_nama);
+  /* 2 byte company id little-endian + 1 byte versi mayor, supaya aplikasi bisa
+   * menandai firmware terlalu tua SEBELUM menyambung. Disusun byte demi byte
+   * lewat concat(char): String(const char*) akan berhenti di NUL pertama, dan
+   * payload biner tidak boleh bergantung pada kebetulan bahwa ia tidak memuat
+   * nol. */
+  String md;
+  md.concat((char)(AW_COMPANY_ID & 0xFF));
+  md.concat((char)((AW_COMPANY_ID >> 8) & 0xFF));
+  md.concat((char)AW_VERSI_MAYOR);
+  data_scan.setManufacturerData(md);
+
+  adv->setAdvertisementData(data_iklan);
+  adv->setScanResponseData(data_scan);
+  adv->setScanResponse(true);
+  adv->setMinInterval(cepat ? ADV_CEPAT : ADV_LAMBAT);
+  adv->setMaxInterval(cepat ? ADV_CEPAT : ADV_LAMBAT);
+  adv->start();
+
+  s_adv_sedang_cepat = cepat;
+  if (cepat) s_adv_cepat_sampai = millis() + ADV_CEPAT_MS;
+}
+
+/* ---------------- Init ---------------- */
+void aw_ble_begin(void) {
+  /* Serial 6 byte dari MAC efuse: stabil lintas boot DAN lintas platform, tidak
+   * seperti id perangkat dari OS (MAC di Android, UUID di iOS). */
+  esp_efuse_mac_get_default(s_serial);
+  snprintf(s_nama, sizeof(s_nama), "AsaWatch %02X%02X", s_serial[4], s_serial[5]);
+
+  s_antrean = xQueueCreate(8, sizeof(aw_perintah_t));
+
+  BLEDevice::init(String(s_nama));
+  /* Minta 185; sampel 31 byte harus utuh dalam SATU notifikasi, tidak boleh
+   * dipecah (dokumen 10 & 15). */
+  BLEDevice::setMTU(185);
+
+  /* Bonding + LE Secure Connections + Just Works, persis dokumen 10.
+   *
+   * Catatan supaya tidak terlihat seperti salah ketik: MITM diminta true
+   * sementara IO capability-nya NO_INPUT_OUTPUT, yang secara definisi tidak
+   * bisa memberi perlindungan MITM -- pairing akan turun ke Just Works. Itu
+   * memang yang diinginkan: jam tidak punya layar pairing, dan satu-satunya
+   * passkey yang bisa dipakai adalah angka yang dipatok di firmware, yang bukan
+   * perlindungan melainkan tampilannya saja. Kombinasi ini yang tertulis di
+   * dokumen dan sudah diuji, jadi jangan "dirapikan". */
+  BLESecurity::setAuthenticationMode(true, true, true);
+  BLESecurity::setCapability(BLE_HS_IO_NO_INPUT_OUTPUT);
+
+  s_server = BLEDevice::createServer();
+  s_server->setCallbacks(new SrvCB());
+
+  /* ---- Layanan AsaWatch: enkripsi wajib di kelima karakteristik ---- */
+  BLEService *svc = s_server->createService(BLEUUID(AW_UUID_SERVICE), 40);
+
+  s_c_info = svc->createCharacteristic(
+    BLEUUID(AW_UUID_INFO),
+    BLECharacteristic::PROPERTY_READ  | BLECharacteristic::PROPERTY_READ_ENC |
+    BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_ENC);
+  s_c_info->setCallbacks(new InfoCB());
+  { uint8_t b[AW_LEN_INFO]; susun_info(b); s_c_info->setValue(b, sizeof(b)); }
+
+  s_c_kontrol = svc->createCharacteristic(
+    BLEUUID(AW_UUID_KONTROL),
+    BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_ENC);
+  s_c_kontrol->setCallbacks(new KontrolCB());
+
+  s_c_peristiwa = svc->createCharacteristic(
+    BLEUUID(AW_UUID_PERISTIWA),
+    BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ_ENC);
+  s_c_peristiwa->setCallbacks(new LanggananCB(&s_langganan_peristiwa));
+
+  s_c_sampel = svc->createCharacteristic(
+    BLEUUID(AW_UUID_SAMPEL),
+    BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ_ENC);
+  s_c_sampel->setCallbacks(new LanggananCB(&s_langganan_sampel));
+
+  s_c_status = svc->createCharacteristic(
+    BLEUUID(AW_UUID_STATUS),
+    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_READ_ENC |
+    BLECharacteristic::PROPERTY_NOTIFY);
+  s_c_status->setCallbacks(new StatusCB());
+  { uint8_t b[AW_LEN_STATUS] = { 0 }; s_c_status->setValue(b, sizeof(b)); }
+
+  svc->start();
+
+  /* ---- Baterai: layanan standar, bukan karakteristik kustom (dokumen 3.1).
+   * Sengaja TANPA syarat enkripsi -- ia standar SIG, dipakai apa adanya oleh OS
+   * dan aplikasi mana pun, dan persentase baterai bukan data kesehatan. */
+  BLEService *svc_batt = s_server->createService(BLEUUID(AW_UUID_SVC_BATT));
+  s_c_batt = svc_batt->createCharacteristic(
+    BLEUUID(AW_UUID_CHR_BATT),
+    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  { uint8_t nol = 0; s_c_batt->setValue(&nol, 1); }
+  svc_batt->start();
+
+  /* Descriptor 0x2902 (CCCD) TIDAK ditambahkan manual: NimBLE membuatnya
+   * sendiri begitu sebuah karakteristik punya properti notify, dan menambahkan
+   * yang kedua justru ditolak. */
+
+  setel_iklan(true);
+  Serial.printf("[ble] \"%s\" mengiklan, serial %02X%02X%02X%02X%02X%02X\n",
+                s_nama, s_serial[0], s_serial[1], s_serial[2],
+                s_serial[3], s_serial[4], s_serial[5]);
+}
+
+/* ---------------- Putaran ---------------- */
+void aw_ble_putar(void) {
+  if (s_perlu_iklan_ulang) {
+    s_perlu_iklan_ulang = false;
+    setel_iklan(true);          /* 60 detik cepat lagi setelah putus */
+    return;
+  }
+  if (s_adv_sedang_cepat && !s_terhubung &&
+      (int32_t)(millis() - s_adv_cepat_sampai) >= 0) {
+    setel_iklan(false);
+  }
+}
+
+/* ---------------- Perintah masuk ---------------- */
+bool aw_ble_ambil_perintah(aw_perintah_t *out) {
+  if (!s_antrean) return false;
+  return xQueueReceive(s_antrean, out, 0) == pdTRUE;
+}
+
+/* ---------------- Pengiriman ---------------- */
+bool aw_ble_kirim_sampel(const uint8_t *paket) {
+  if (!s_terhubung || !s_langganan_sampel) return false;
+  s_c_sampel->setValue(paket, AW_LEN_SAMPEL);
+  s_c_sampel->notify();
+  return true;
+}
+
+bool aw_ble_kirim_peristiwa(const uint8_t *paket) {
+  if (!s_terhubung || !s_langganan_peristiwa) return false;
+  s_c_peristiwa->setValue(paket, AW_LEN_PERISTIWA);
+  s_c_peristiwa->notify();
+  return true;
+}
+
+void aw_ble_set_status(const uint8_t *paket) {
+  if (!s_c_status) return;
+  s_c_status->setValue(paket, AW_LEN_STATUS);
+  /* Notify hanya kalau ada yang tersambung; nilainya tetap tersimpan sehingga
+   * pembacaan berikutnya sudah benar. */
+  if (s_terhubung) s_c_status->notify();
+}
+
+void aw_ble_set_baterai(uint8_t persen) {
+  if (!s_c_batt) return;
+  s_c_batt->setValue(&persen, 1);
+  if (s_terhubung) s_c_batt->notify();
+}
+
+/* ---------------- Keadaan ---------------- */
+bool aw_ble_terhubung(void) { return s_terhubung; }
+
+bool aw_ble_siap_notifikasi(void) {
+  return s_terhubung && s_langganan_sampel && s_langganan_peristiwa;
+}
+
+bool aw_ble_ambil_flag_siap_baru(void) {
+  bool f = s_siap_baru;
+  s_siap_baru = false;
+  return f;
+}
+
+void aw_ble_atur_interval(bool sesi_berjalan) {
+  if (!s_terhubung || s_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
+  /* Satuan 1,25 ms. Rapat saat sesi berjalan supaya sampel sampai tanpa
+   * tertahan; longgar saat idle supaya radio tidak menguras baterai. */
+  if (sesi_berjalan) s_server->updateConnParams(s_conn_handle,  24,  40, 0, 400);
+  else               s_server->updateConnParams(s_conn_handle, 160, 400, 0, 400);
+}
+
+const uint8_t *aw_ble_serial(void) { return s_serial; }
+const char    *aw_ble_nama(void)   { return s_nama; }

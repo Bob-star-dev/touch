@@ -53,6 +53,15 @@ static const unsigned long DC_SETTLE_MS = 8000;
 static const byte MIN_STABLE_BEATS = 3;
 static byte stableBeatCount = 0;
 
+/* Pencacah detak yang TIDAK dibatasi, berbeda dari stableBeatCount di atas.
+ * stableBeatCount berhenti di MIN_STABLE_BEATS karena tugasnya cuma satu:
+ * menjadi gerbang biner "sudah ada detak yang konsisten atau belum". Yang ini
+ * terus mencacah, karena pemakainya butuh tahu SUDAH BERAPA BANYAK -- rutin
+ * pengukuran AsaWatch menunggu sejumlah detak sebelum menganggap satu
+ * pengukuran layak diakhiri, dan tiga detak jelas terlalu sedikit untuk itu.
+ * Direset bersama detektornya setiap kali kontak kulit hilang. */
+static uint16_t beatCount = 0;
+
 /* ---------- Batas fisiologis untuk membuang window "noise" ----------
  * Formula Maxim AN6409 hanya valid di rentang sempit R~0.4-1.0 (SpO2 ~100%
  * turun ke ~85%). R sampai 1.15 dipertahankan sebagai toleransi bawah
@@ -214,6 +223,7 @@ static void reset_beat_detector(void) {
   currentBPM = 0;
   bpmValid = false;
   stableBeatCount = 0;
+  beatCount = 0;
   smoothCount = 0;
   smoothIndex = 0;
   readingsStable = false;
@@ -258,6 +268,7 @@ static void detect_beat(double acIR) {
       currentBPM = 60000.0 / avgIbi;
       bpmValid = true;
       if (stableBeatCount < MIN_STABLE_BEATS) stableBeatCount++;
+      if (beatCount < 0xFFFF) beatCount++;
     }
     lastBeatMs = nowMs;
   }
@@ -576,6 +587,8 @@ static void fill_live(ppg_data_t *out) {
 
   out->pi = currentPI;
   out->r  = currentR;
+
+  out->beats = beatCount;
 
   if (statN > 0) {
     out->stats_valid = true;

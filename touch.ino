@@ -30,6 +30,10 @@
  *   battery             - ADC1 + kurva Li-Po
  *   ppg                 - MAX30105/30102: BPM, SpO2, glukosa, tekanan darah
  *                         EKSPERIMENTAL
+ *   aw_proto/aw_store/  - AsaWatch: protokol BLE v1.1, ring buffer NVS, mesin
+ *   aw_ble/aw_jam         status sesi. Spesifikasinya ada di
+ *                         docs/asawatch-ble-untuk-jam-lvgl.md dan NORMATIF --
+ *                         sisi aplikasi Flutter sudah diuji terhadapnya.
  *
  * PERINGATAN: nilai glukosa dan tekanan darah tidak punya dasar fisiologis
  * tervalidasi dan tidak boleh dipakai untuk keputusan medis apa pun. Lihat
@@ -49,6 +53,7 @@
 #include "net.h"
 #include "battery.h"
 #include "ppg.h"
+#include "aw_jam.h"
 
 /* Subset digit-only dari montserrat_46/48 (cuma glyph 0-9 dan '-'), dipakai di
  * layar jam & glukosa yang tidak pernah menampilkan huruf. Font bawaan LVGL di
@@ -286,6 +291,7 @@ static void my_touch_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
 
 /* ================= Handle layar & widget ================= */
 static lv_obj_t *scr_home, *scr_menu, *scr_hr, *scr_spo2, *scr_glu, *scr_bp;
+static lv_obj_t *scr_meas;   /* layar "sedang mengukur", dokumen 14 */
 
 /* home */
 static lv_obj_t *lbl_hh, *lbl_mm, *lbl_wthr, *lbl_batt;
@@ -294,7 +300,13 @@ static lv_obj_t *lbl_hh, *lbl_mm, *lbl_wthr, *lbl_batt;
  * keduanya toh selalu berubah pada saat yang sama -- pergantian hari. */
 static lv_obj_t *lbl_date;
 static lv_obj_t *lbl_cond;   /* caption kondisi cuaca di header */
-static lv_obj_t *btn_pwr, *ic_pwr;   /* tombol daya sensor PPG */
+static lv_obj_t *lbl_ble;    /* ikon Bluetooth di header, tiga keadaan          */
+static lv_obj_t *lbl_pending;/* jumlah entri belum di-ack, sembunyi kalau nol   */
+static lv_obj_t *lbl_sesi;   /* pil status sesi tepat di atas tombol            */
+static lv_obj_t *btn_utama, *ic_utama;   /* satu tombol, dua peran (lihat di bawah) */
+/* layar sedang mengukur */
+static lv_obj_t *lbl_meas_judul, *lbl_meas_sub, *lbl_meas_waktu, *bar_meas;
+static lv_obj_t *dot_meas[4], *lbl_meas_metrik[4];
 /* menu */
 static lv_obj_t *lbl_card_hr, *lbl_card_sp, *lbl_card_gl, *lbl_card_bp;
 /* detail */
@@ -394,6 +406,117 @@ static lv_obj_t *mk_pill(lv_obj_t *parent, int x, int w, const char *txt,
   return p;
 }
 
+/* ================= Animasi tepi layar: indikator proses pengukuran =================
+ * Titik kecil yang berjalan pelan mengelilingi tepi layar, dipasang di keempat
+ * halaman detail (HR/SpO2/Glukosa/Tensi). Warnanya cuma memetakan ppg_state_t
+ * yang sudah dihitung ppg.cpp, tidak ada logika deteksi baru di sini:
+ *   PPG_NO_CONTACT             -> merah   (belum ada kulit menempel)
+ *   PPG_SETTLING/PPG_ACQUIRING -> kuning  (sinyal ada, detak belum konsisten)
+ *   PPG_STABLE                 -> hijau   (bacaan sudah valid)
+ * PPG_ABSENT/PPG_OFF menyembunyikan titiknya -- tidak ada proses untuk
+ * diperlihatkan.
+ *
+ * Timer terpisah dari refresh_cb (500 ms) dengan sengaja: refresh_cb jarang
+ * supaya label besar tidak digambar ulang tanpa alasan (lihat catatan di
+ * atasnya), tapi gerakan titik ini justru perlu banyak frame per detik supaya
+ * terlihat mulus, bukan meloncat.
+ */
+#define SCAN_DOT_SIZE   10       /* diameter titik, px */
+#define SCAN_INSET       3       /* jarak lintasan dari tepi layar, px */
+#define SCAN_CORNER_R   18       /* radius sudut lintasan, px */
+#define SCAN_STEP   0.0035f      /* kemajuan/frame -> satu putaran ~11 s @ 40 ms/frame */
+
+static lv_obj_t *scan_dot;
+static float scan_progress = 0;
+
+/* Titik pada lintasan persegi bersudut bulat di tepi layar, t di rentang
+ * [0,1). Jalan searah jarum jam mulai dari tengah sisi atas. */
+static lv_point_t scan_point_on_perimeter(float t) {
+  /* HALF_PI sudah didefinisikan Arduino.h (1.5707963267948966...), dipakai
+   * langsung supaya tidak bentrok nama. */
+  int x0 = SCAN_INSET, y0 = SCAN_INSET;
+  int x1 = SCREEN_W - SCAN_INSET, y1 = SCREEN_H - SCAN_INSET;
+  int r  = SCAN_CORNER_R;
+  float sw   = (float)((x1 - x0) - 2 * r);   /* panjang sisi atas/bawah */
+  float sh   = (float)((y1 - y0) - 2 * r);   /* panjang sisi kiri/kanan */
+  float arc  = r * HALF_PI;                  /* satu sudut, seperempat lingkaran */
+  float perim = 2 * sw + 2 * sh + 4 * arc;
+  float d = t * perim;
+
+  lv_point_t p;
+  if (d < sw) {                                        /* atas: kiri -> kanan */
+    p.x = x0 + r + (int)d;  p.y = y0;
+  } else if ((d -= sw) < arc) {                         /* sudut kanan-atas */
+    float th = -HALF_PI + (d / arc) * HALF_PI;
+    p.x = (x1 - r) + (int)(r * cosf(th));  p.y = (y0 + r) + (int)(r * sinf(th));
+  } else if ((d -= arc) < sh) {                         /* kanan: atas -> bawah */
+    p.x = x1;  p.y = y0 + r + (int)d;
+  } else if ((d -= sh) < arc) {                         /* sudut kanan-bawah */
+    float th = (d / arc) * HALF_PI;
+    p.x = (x1 - r) + (int)(r * cosf(th));  p.y = (y1 - r) + (int)(r * sinf(th));
+  } else if ((d -= arc) < sw) {                         /* bawah: kanan -> kiri */
+    p.x = x1 - r - (int)d;  p.y = y1;
+  } else if ((d -= sw) < arc) {                         /* sudut kiri-bawah */
+    float th = HALF_PI + (d / arc) * HALF_PI;
+    p.x = (x0 + r) + (int)(r * cosf(th));  p.y = (y1 - r) + (int)(r * sinf(th));
+  } else if ((d -= arc) < sh) {                         /* kiri: bawah -> atas */
+    p.x = x0;  p.y = y1 - r - (int)d;
+  } else {                                              /* sudut kiri-atas */
+    d -= sh;
+    float th = PI + (d / arc) * HALF_PI;
+    p.x = (x0 + r) + (int)(r * cosf(th));  p.y = (y0 + r) + (int)(r * sinf(th));
+  }
+  return p;
+}
+
+static lv_obj_t *mk_scan_dot(lv_obj_t *parent) {
+  lv_obj_t *o = lv_obj_create(parent);
+  lv_obj_remove_style_all(o);
+  lv_obj_set_size(o, SCAN_DOT_SIZE, SCAN_DOT_SIZE);
+  lv_obj_set_style_radius(o, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
+  lv_obj_set_style_bg_color(o, lv_color_hex(C_RED), 0);
+  lv_obj_clear_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(o, LV_OBJ_FLAG_CLICKABLE);   /* jangan pernah menelan sentuhan */
+  lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+  return o;
+}
+
+static void scan_anim_cb(lv_timer_t *tm) {
+  (void)tm;
+  lv_obj_t *act = lv_scr_act();
+  bool on_detail = (act == scr_hr || act == scr_spo2 || act == scr_glu ||
+                    act == scr_bp || act == scr_meas);
+  if (!on_detail) {
+    lv_obj_add_flag(scan_dot, LV_OBJ_FLAG_HIDDEN);
+    return;
+  }
+
+  ppg_data_t p;
+  ppg_get(&p);
+  if (p.state == PPG_ABSENT || p.state == PPG_OFF) {
+    lv_obj_add_flag(scan_dot, LV_OBJ_FLAG_HIDDEN);
+    return;
+  }
+
+  if (lv_obj_get_parent(scan_dot) != act) {
+    lv_obj_set_parent(scan_dot, act);
+    lv_obj_move_foreground(scan_dot);
+  }
+  lv_obj_clear_flag(scan_dot, LV_OBJ_FLAG_HIDDEN);
+
+  uint32_t color = C_RED;
+  if (p.state == PPG_SETTLING || p.state == PPG_ACQUIRING) color = C_YELLOW;
+  else if (p.state == PPG_STABLE)                          color = C_GREEN2;
+  lv_obj_set_style_bg_color(scan_dot, lv_color_hex(color), 0);
+
+  scan_progress += SCAN_STEP;
+  if (scan_progress >= 1.0f) scan_progress -= 1.0f;
+
+  lv_point_t pt = scan_point_on_perimeter(scan_progress);
+  lv_obj_set_pos(scan_dot, pt.x - SCAN_DOT_SIZE / 2, pt.y - SCAN_DOT_SIZE / 2);
+}
+
 /* ================= Navigasi ================= */
 /* Abaikan event yang datang saat animasi pindah layar masih jalan, supaya satu
  * ketukan tidak memicu dua transisi bertumpuk. */
@@ -420,6 +543,7 @@ static void go(lv_obj_t *target, bool forward, const char *name) {
 
 static const nav_target_t NAV_HOME = { &scr_home, false, "home" };
 static const nav_target_t NAV_MENU = { &scr_menu, false, "menu (back)" };
+static const nav_target_t NAV_MENU_DARI_HOME = { &scr_menu, true, "menu" };
 static const nav_target_t NAV_HR   = { &scr_hr,   true,  "heart rate" };
 static const nav_target_t NAV_SPO2 = { &scr_spo2, true,  "spo2" };
 static const nav_target_t NAV_GLU  = { &scr_glu,  true,  "glukosa" };
@@ -462,53 +586,78 @@ static lv_obj_t *mk_header(lv_obj_t *scr, const char *title, uint32_t btn_bg,
   return mk_label(scr, title, &lv_font_montserrat_16, 0xFFFFFF, 43, 12);
 }
 
-/* ================= Tombol daya sensor =================
- * Satu-satunya kendali di halaman home, dan sekarang juga satu-satunya jalan
- * menuju menu kesehatan. Dulu sentuhan di mana pun membuka menu; itu dilepas
- * karena pengukuran tidak boleh menyala hanya karena layar tersenggol -- LED
- * MAX30105 menyedot puluhan mA dan tidak ada yang mematikannya kembali.
+/* ================= Tombol utama: satu tombol, dua peran =================
+ * Satu-satunya kendali di halaman home, di tengah, dan artinya ditentukan oleh
+ * status sesi -- bukan oleh dua tombol terpisah.
  *
- * Warnanya yang membawa keadaan, bukan teks: hijau = sensor hidup, gelap =
- * mati. Ikonnya tetap LV_SYMBOL_POWER di kedua keadaan supaya arti tombolnya
- * ("daya") tidak ikut berubah -- yang berubah hanya jawaban atas "sekarang
- * sedang menyala atau tidak".
+ *   IDLE     "Cek manual". Menekannya mengukur sekali jalan, dan hasilnya
+ *            berhenti di layar jam: tidak ada entri sampel, tidak ada event,
+ *            tidak ada satu byte pun ke aplikasi.
+ *   ARMED    "Selesai Makan", hijau dan menonjol. Ini keadaan yang pengguna
+ *            tunggu, dan menekannya adalah SUMBER TUNGGAL t0.
+ *   RUNNING  ambar, tidak menerima tekanan lagi; pil di atasnya berubah jadi
+ *            hitung mundur ke pengukuran berikutnya.
+ *
+ * Menggabungkan keduanya justru memperkuat jaminan yang paling penting di
+ * dokumen 12: tidak ada sesi tanpa foto makanan. Di IDLE tombol ini memang
+ * menyala dan memang bisa ditekan, tetapi yang dijalankannya cek manual --
+ * BUKAN memulai sesi. Sesi tetap hanya bisa lahir setelah aplikasi mengirim
+ * ARM_SESI, persis seperti sebelumnya.
+ *
+ * Yang perlu dijaga saat menyentuh kode ini: peran tombol harus selalu terbaca
+ * dari layar, bukan dihafal. Itu tugas ikon + warna di sini dan pil status di
+ * atasnya -- keduanya harus berubah bersamaan, karena satu tombol yang
+ * mengerjakan dua hal berbeda tanpa penanda adalah cara termudah membuat
+ * pengguna mengira pengukuran manualnya terkirim ke aplikasi.
  */
-static void power_btn_refresh(void) {
-  /* Style hanya disentuh saat keadaan benar-benar berpindah. Fungsi ini juga
+static void utama_btn_refresh(void) {
+  /* Style hanya disentuh saat keadaan benar-benar berpindah. Fungsi ini
    * dipanggil dari refresh_cb tiap 500 ms, dan lv_obj_set_style_*() selalu
    * meng-invalidate objeknya -- tanpa penjaga ini tombolnya digambar ulang dua
    * kali per detik tanpa alasan. */
   static int last = -1;
-  int on = ppg_enabled() ? 1 : 0;
-  if (on == last) return;
-  last = on;
+  int st = jam_status();
+  if (st == last) return;
+  last = st;
 
-  lv_obj_set_style_bg_color(btn_pwr, lv_color_hex(on ? C_GREEN : C_S1_HDR), 0);
-  lv_obj_set_style_border_color(btn_pwr, lv_color_hex(on ? C_GREEN2 : C_S1_DIV), 0);
-  lv_obj_set_style_text_color(ic_pwr, lv_color_hex(on ? 0xFFFFFF : C_S1_LINE), 0);
+  uint32_t bg, border, fg;
+  const char *ikon;
+  if (st == AW_SESI_ARMED) {
+    bg = C_GREEN;  border = C_GREEN2; fg = 0xFFFFFF; ikon = LV_SYMBOL_OK;
+  } else if (st == AW_SESI_RUNNING) {
+    bg = C_S1_HDR; border = C_AMBER;  fg = C_AMBER;  ikon = LV_SYMBOL_REFRESH;
+  } else {
+    /* Peran cek manual. Ikonnya LV_SYMBOL_POWER seperti tombol daya lama,
+     * karena inilah yang menggantikan fungsinya: menyalakan sensor sekarang,
+     * atas kehendak pengguna. */
+    bg = C_S1_HDR; border = C_S1_DIV; fg = C_S1_LINE; ikon = LV_SYMBOL_POWER;
+  }
+  lv_obj_set_style_bg_color(btn_utama, lv_color_hex(bg), 0);
+  lv_obj_set_style_border_color(btn_utama, lv_color_hex(border), 0);
+  lv_obj_set_style_text_color(ic_utama, lv_color_hex(fg), 0);
+  lv_label_set_text(ic_utama, ikon);
 }
 
-/* Ketuk-saja, dengan pengukuran jarak yang sama seperti kartu menu: tombol ini
- * menyalakan perangkat keras, jadi geseran yang kebetulan berakhir di atasnya
- * jelas bukan maksud pengguna. */
-static void power_release_cb(lv_event_t *e) {
+/* Ketuk-saja, dengan pengukuran jarak yang sama seperti kartu menu: kedua peran
+ * tombol ini menyalakan perangkat keras dan salah satunya memulai sesi dua jam,
+ * jadi geseran yang kebetulan berakhir di atasnya jelas bukan maksud pengguna. */
+static void utama_release_cb(lv_event_t *e) {
   (void)e;
   int dx = last_touch_x - tap_x0;
   int dy = last_touch_y - tap_y0;
   if (dx * dx + dy * dy > TAP_SLOP * TAP_SLOP) {
-    Serial.printf("[nav] geseran %d px, tombol daya dibatalkan\n",
+    Serial.printf("[nav] geseran %d px, tombol utama dibatalkan\n",
                   (int)sqrtf((float)(dx * dx + dy * dy)));
     return;
   }
 
-  bool on = !ppg_enabled();
-  ppg_set_enabled(on);
-  power_btn_refresh();
-
-  /* ON langsung membuka menu: menyalakan sensor dan ingin melihat hasilnya itu
-   * satu maksud yang sama. OFF tetap di home -- tidak ada gunanya berpindah ke
-   * halaman yang seluruh angkanya baru saja jadi "--". */
-  if (on) go(scr_menu, true, "menu (sensor ON)");
+  /* Percabangan peran ada di sini, satu tempat. aw_jam tetap memeriksa
+   * syaratnya sendiri -- jam_cek_manual() menolak kalau ada sesi, dan
+   * jam_tekan_tombol() menolak kalau belum ARMED -- jadi baris ini soal maksud
+   * pengguna, bukan soal keamanan. */
+  if (jam_status() == AW_SESI_IDLE) jam_cek_manual();
+  else                              jam_tekan_tombol();
+  utama_btn_refresh();
 }
 
 /* ================= Halaman 1 : Home ================= */
@@ -534,6 +683,26 @@ static void build_home(void) {
 
   mk_box(hdr, 120, 7, 1, 18, C_S1_DIV, 0);                   /* pemisah */
 
+  /* Ikon Bluetooth, TIGA keadaan -- bukan dua (dokumen 14):
+   *   redup       tidak tersambung
+   *   biru pucat  tersambung, tapi aplikasi belum menulis CCCD
+   *   biru terang tersambung DAN dilanggani -- hanya ini yang berarti data
+   *               sedang benar-benar mengalir keluar
+   * Perbedaan kedua dan ketiga itu yang paling sering dikira sama; kalau
+   * digabung, jam yang tersambung tapi diam terlihat identik dengan jam yang
+   * bekerja normal.
+   *
+   * x=132 aman: persen baterai dirata-kanan ke x=190 dan string terlebar yang
+   * mungkin ("100%") mulai di ~159. */
+  lbl_ble = mk_label(hdr, LV_SYMBOL_BLUETOOTH, &lv_font_montserrat_12,
+                     C_S1_DIV, 132, 8);
+
+  /* Entri yang belum di-ack. Informasi yang menenangkan, bukan peringatan:
+   * buffer 64 entri setara ~16 sesi, jadi angka kecil di sini normal.
+   * Disembunyikan saat nol supaya header tidak ramai tanpa alasan. */
+  lbl_pending = mk_label(hdr, "", &lv_font_montserrat_10, C_S1_MUTED, 145, 9);
+  lv_obj_add_flag(lbl_pending, LV_OBJ_FLAG_HIDDEN);
+
   /* Kelompok baterai. Angkanya dirata-kanan ke x=190 supaya jarak 7 px ke ikon
    * tetap sama walau lebarnya berubah ("9%" vs "100%"). Ukuran font mengikuti
    * mockup: kapital 8 px / lebar 25 px = montserrat_12, sepasang dengan "29C". */
@@ -545,7 +714,7 @@ static void build_home(void) {
   mk_img(hdr, &img_battery, 197, 8);
 
   /* ================= Tata letak vertikal halaman home =================
-   * Urutan: ilustrasi -> tombol daya -> jam -> hari+tanggal.
+   * Urutan: ilustrasi -> pil status -> tombol sesi -> jam -> hari+tanggal.
    *
    * Ruang di bawah header hanya 248 px (y=32..279) dan sekarang harus memuat
    * satu elemen tambahan. Anggarannya, memakai tinggi kotak font sebenarnya:
@@ -566,20 +735,40 @@ static void build_home(void) {
    * selisih koordinatnya.
    */
 
-  /* --- ilustrasi pesawat + bulan (152x122) --- */
-  mk_img(scr_home, &img_plane, 44, 33);
+  /* --- ilustrasi pesawat + bulan (152x122) ---
+   * Sekaligus jalan menuju menu kesehatan. Tombol home sudah dipakai sesi, dan
+   * menambah tombol kelima ke layar 240x280 yang sudah padat akan lebih buruk
+   * daripada memakai gambar yang toh sudah ada di sana. Ketuk-saja, sehingga
+   * geseran tidak membukanya. */
+  lv_obj_t *img_ilus = mk_img(scr_home, &img_plane, 44, 33);
+  mk_tap_nav(img_ilus, 0, &NAV_MENU_DARI_HOME);
 
-  /* --- tombol daya sensor, tepat di bawah ilustrasi --- */
-  btn_pwr = mk_box(scr_home, 97, 159, 46, 46, C_S1_HDR, LV_RADIUS_CIRCLE);
-  lv_obj_set_style_border_width(btn_pwr, 2, 0);
-  lv_obj_set_style_border_color(btn_pwr, lv_color_hex(C_S1_DIV), 0);
-  lv_obj_set_style_border_opa(btn_pwr, LV_OPA_COVER, 0);
-  mk_touchable(btn_pwr, 14);          /* target sentuh efektif jadi ~74x74 */
-  lv_obj_add_event_cb(btn_pwr, tap_press_cb,     LV_EVENT_PRESSED,  NULL);
-  lv_obj_add_event_cb(btn_pwr, power_release_cb, LV_EVENT_RELEASED, NULL);
+  /* --- pil status sesi, menempel di atas tombol ---
+   * 19 px terakhir dari pita ilustrasi. Ia memang menutupi sedikit bagian bawah
+   * gambar, dan itu pilihan sadar: tanpa baris ini tombol di bawahnya tidak
+   * punya penjelasan sama sekali, dan pengguna yang menekan tombol redup lalu
+   * tidak terjadi apa-apa akan menyimpulkan jamnya rusak. */
+  lv_obj_t *pil = mk_box(scr_home, 25, 136, 190, 19, C_S1_HDR, 9);
+  lbl_sesi = mk_label(pil, "", &lv_font_montserrat_10, C_S1_MUTED, 0, 0);
+  lv_obj_set_width(lbl_sesi, 186);
+  lv_obj_set_style_text_align(lbl_sesi, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_center(lbl_sesi);
 
-  ic_pwr = mk_label(btn_pwr, LV_SYMBOL_POWER, &lv_font_montserrat_22, C_S1_LINE, 0, 0);
-  lv_obj_center(ic_pwr);
+  /* --- tombol utama, di tengah tepat di bawah ilustrasi ---
+   * Tetap 46x46 di x=97 seperti sebelumnya: ini satu-satunya kendali di layar
+   * ini, jadi ia memang milik sumbu tengah. Perannya yang berganti mengikuti
+   * status sesi, bukan posisinya. */
+  btn_utama = mk_box(scr_home, 97, 159, 46, 46, C_S1_HDR, LV_RADIUS_CIRCLE);
+  lv_obj_set_style_border_width(btn_utama, 2, 0);
+  lv_obj_set_style_border_color(btn_utama, lv_color_hex(C_S1_DIV), 0);
+  lv_obj_set_style_border_opa(btn_utama, LV_OPA_COVER, 0);
+  mk_touchable(btn_utama, 14);          /* target sentuh efektif jadi ~74x74 */
+  lv_obj_add_event_cb(btn_utama, tap_press_cb,     LV_EVENT_PRESSED,  NULL);
+  lv_obj_add_event_cb(btn_utama, utama_release_cb, LV_EVENT_RELEASED, NULL);
+
+  ic_utama = mk_label(btn_utama, LV_SYMBOL_POWER, &lv_font_montserrat_22,
+                      C_S1_LINE, 0, 0);
+  lv_obj_center(ic_utama);
 
   /* --- jam: "10" [kotak][kotak] "24" ---
    * Kotak titik dua tetap di +16 dan +32 dari y label: jarak relatifnya
@@ -612,7 +801,66 @@ static void build_home(void) {
   lv_obj_set_width(lbl_date, SCREEN_W);
   lv_obj_set_style_text_align(lbl_date, LV_TEXT_ALIGN_CENTER, 0);
 
-  power_btn_refresh();
+  utama_btn_refresh();
+}
+
+/* ================= Layar "sedang mengukur" =================
+ * Dokumen 14: dengan sensor sungguhan satu pengukuran makan puluhan detik dan
+ * pengguna harus diam, jadi ia perlu layarnya sendiri -- bukan sekadar ikon di
+ * pojok. Layar ini muncul sendiri saat pengukuran mulai dan menghilang sendiri
+ * saat selesai; tidak ada tombol batal, karena dokumen memang tidak memberi
+ * jam wewenang membatalkan pengukuran (itu milik opcode BATAL_SESI dari
+ * aplikasi), dan pengukuran toh berhenti sendiri dalam satu menit.
+ *
+ * Daftar keempat metrik bukan hiasan: ia menjawab pertanyaan yang paling wajar
+ * saat menunggu, yaitu "ini sedang jalan atau menggantung". Titik yang satu per
+ * satu berubah hijau memperlihatkan kemajuan yang sebenarnya, dan yang belum
+ * hijau saat waktu habis persis metrik yang nanti dikirim sebagai sentinel 0.
+ */
+static void build_meas(void) {
+  scr_meas = lv_obj_create(NULL);
+  lv_obj_remove_style_all(scr_meas);
+  lv_obj_set_style_bg_color(scr_meas, lv_color_hex(C_S1_BG), 0);
+  lv_obj_set_style_bg_opa(scr_meas, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(scr_meas, LV_OBJ_FLAG_SCROLLABLE);
+
+  mk_deco(scr_meas, 220, 40, 44, C_S1_HDR);
+  mk_deco(scr_meas, 18, 245, 40, C_S1_HDR);
+
+  lbl_meas_judul = mk_label(scr_meas, "Mengukur", &lv_font_montserrat_16,
+                            0xFFFFFF, 0, 26);
+  lv_obj_set_width(lbl_meas_judul, SCREEN_W);
+  lv_obj_set_style_text_align(lbl_meas_judul, LV_TEXT_ALIGN_CENTER, 0);
+
+  lbl_meas_sub = mk_label(scr_meas, "Tempelkan jari, jangan bergerak",
+                          &lv_font_montserrat_10, C_S1_MUTED, 0, 50);
+  lv_obj_set_width(lbl_meas_sub, SCREEN_W);
+  lv_obj_set_style_text_align(lbl_meas_sub, LV_TEXT_ALIGN_CENTER, 0);
+
+  /* Empat baris metrik. Urutannya mengikuti urutan matangnya di ppg.cpp --
+   * detak lebih dulu, glukosa dan tensi paling akhir -- supaya titik-titiknya
+   * menyala kira-kira dari atas ke bawah dan terbaca sebagai kemajuan. */
+  static const char *NAMA[4] = { "Detak jantung", "SpO2", "Glukosa", "Tekanan darah" };
+  for (int i = 0; i < 4; i++) {
+    int y = 78 + i * 30;
+    lv_obj_t *baris = mk_box(scr_meas, 20, y, 200, 24, C_S1_HDR, 8);
+    dot_meas[i] = mk_box(baris, 0, 0, 10, 10, C_S1_DIV, LV_RADIUS_CIRCLE);
+    lv_obj_align(dot_meas[i], LV_ALIGN_LEFT_MID, 10, 0);
+    lbl_meas_metrik[i] = mk_label(baris, NAMA[i], &lv_font_montserrat_12,
+                                  C_S1_MUTED, 0, 0);
+    lv_obj_align(lbl_meas_metrik[i], LV_ALIGN_LEFT_MID, 28, 0);
+  }
+
+  /* Bar kemajuan waktu. Dibuat dari dua kotak polos, bukan lv_bar: satu-satunya
+   * yang berubah adalah lebar kotak dalam, dan lv_bar membawa animasi + style
+   * indicator yang tidak dipakai di sini. */
+  mk_box(scr_meas, 20, 212, 200, 6, C_S1_HDR, 3);
+  bar_meas = mk_box(scr_meas, 20, 212, 0, 6, C_AMBER, 3);
+
+  lbl_meas_waktu = mk_label(scr_meas, "0s", &lv_font_montserrat_12,
+                            C_S1_MUTED, 0, 228);
+  lv_obj_set_width(lbl_meas_waktu, SCREEN_W);
+  lv_obj_set_style_text_align(lbl_meas_waktu, LV_TEXT_ALIGN_CENTER, 0);
 }
 
 /* ================= Halaman 2 : Menu kesehatan ================= */
@@ -1016,10 +1264,18 @@ static bool set_if_changed(lv_obj_t *lbl, const char *txt) {
   return true;
 }
 
-/* Perbarui seluruh tampilan kesehatan dari data PPG. */
+/* Perbarui seluruh tampilan kesehatan.
+ *
+ * Sumbernya jam_snapshot(), bukan ppg_get() langsung: sejak MAX30105 hanya
+ * menyala selama pengukuran, membaca sensor langsung berarti keempat halaman
+ * detail menampilkan "--" hampir sepanjang waktu. jam_snapshot() mengisinya
+ * dengan pengukuran yang sedang berjalan, atau hasil pengukuran terakhir kalau
+ * tidak ada yang berjalan -- sementara statistik sesi (chip min/avg/maks) tetap
+ * datang dari sensor apa adanya, karena angka itu hanya berarti selama sensor
+ * benar-benar mencacah. */
 static void update_health_ui(void) {
   ppg_data_t p;
-  ppg_get(&p);
+  jam_snapshot(&p);
   /* 48 byte, bukan 24: "Zona: rendah <bullet> 100% target" = 28 byte (bullet
    * UTF-8 3 byte) dan "Estimasi dalam rentang (70-140)" = 31 byte. */
   char b[48];
@@ -1170,6 +1426,164 @@ static void update_health_ui(void) {
     lv_obj_set_style_opa(dot_live, LV_OPA_20, 0);
 }
 
+/* ================= Tampilan sesi & koneksi =================
+ * Daftar keadaan yang wajib punya tampilan ada di dokumen 14. Yang TIDAK
+ * diikuti dari sana cuma satu, dan sengaja: dokumen meminta layar menandai
+ * "waktu tidak pasti" selama anchor belum terpasang, karena jam acuannya tidak
+ * punya RTC dan jam dindingnya memang tebakan. Jam INI punya PCF85063 + NTP,
+ * jadi angka jam di layar sudah benar tanpa anchor mana pun dan menandainya
+ * "tidak pasti" justru berbohong ke arah sebaliknya. Yang tetap diikuti persis:
+ * di KAWAT jam tidak pernah mengirim wall clock -- hanya uptime_s + boot_id --
+ * dan flag anchor tetap dilaporkan apa adanya di paket Info & Status.
+ */
+static void update_sesi_ui(void) {
+  /* ---- ikon Bluetooth: tiga keadaan ---- */
+  static int last_ble = -1;
+  int c = jam_siap_notifikasi() ? 2 : (jam_terhubung() ? 1 : 0);
+  if (c != last_ble) {
+    last_ble = c;
+    lv_obj_set_style_text_color(
+      lbl_ble, lv_color_hex(c == 2 ? C_BLUE : c == 1 ? C_S4_MUTE : C_S1_DIV), 0);
+  }
+
+  /* ---- entri tertunda ---- */
+  static int last_pending = -1;
+  int pend = jam_tertunda();
+  if (pend != last_pending) {
+    last_pending = pend;
+    if (pend > 0) {
+      lv_label_set_text_fmt(lbl_pending, "%d", pend);
+      lv_obj_clear_flag(lbl_pending, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(lbl_pending, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+
+  /* ---- pindah layar otomatis saat mengukur ----
+   * Sekali-jalan dengan percobaan ulang, bukan dipaksa tiap tick: go() menolak
+   * permintaan yang datang saat animasi pindah layar masih berjalan, jadi satu
+   * panggilan saja bisa hilang begitu saja. Setelah layarnya sampai, keinginan
+   * dilepas -- kalau tidak, pengguna yang membuka menu selagi mengukur akan
+   * ditarik kembali tiap setengah detik. */
+  static bool last_ukur = false;
+  static lv_obj_t *scr_sebelum = NULL;
+  static lv_obj_t *scr_ingin = NULL;
+  static bool punya_lalu[4] = { false, false, false, false };
+  bool ukur = jam_sedang_mengukur();
+  if (ukur != last_ukur) {
+    last_ukur = ukur;
+    if (ukur) {
+      /* Keempat titik dikembalikan abu-abu di AWAL tiap pengukuran. Tanpa ini
+       * titik hijau dari pengukuran sebelumnya terbawa: pengukuran baru mulai
+       * dengan tampilan "semua sudah dapat" padahal belum satu pun. */
+      for (int i = 0; i < 4; i++) {
+        punya_lalu[i] = false;
+        lv_obj_set_style_bg_color(dot_meas[i], lv_color_hex(C_S1_DIV), 0);
+        lv_obj_set_style_text_color(lbl_meas_metrik[i], lv_color_hex(C_S1_MUTED), 0);
+      }
+      scr_sebelum = lv_scr_act();
+      scr_ingin = scr_meas;
+    } else {
+      scr_ingin = (scr_sebelum && scr_sebelum != scr_meas) ? scr_sebelum : scr_home;
+    }
+  }
+  if (scr_ingin) {
+    if (lv_scr_act() == scr_ingin) scr_ingin = NULL;
+    else go(scr_ingin, ukur, ukur ? "sedang mengukur" : "selesai mengukur");
+  }
+
+  /* ---- isi layar pengukuran ---- */
+  if (ukur) {
+    char b[32];
+    /* Judulnya menyebut terus terang pengukuran mana ini. Kedua jenis memakai
+     * layar yang sama persis, jadi baris inilah satu-satunya yang memberi tahu
+     * pengguna apakah angkanya akan sampai ke aplikasi atau tidak. */
+    if (jam_ukur_lokal())           snprintf(b, sizeof(b), "Cek manual");
+    else if (jam_ukur_index() == 0) snprintf(b, sizeof(b), "Pengukuran awal");
+    else snprintf(b, sizeof(b), "Pengukuran ke-%u", (unsigned)jam_ukur_index());
+    set_if_changed(lbl_meas_judul, b);
+    set_if_changed(lbl_meas_sub, jam_ukur_lokal()
+                     ? "Hasil hanya tampil di jam, tidak dikirim"
+                     : "Tempelkan jari, jangan bergerak");
+
+    const bool punya[4] = { jam_ukur_punya_bpm(), jam_ukur_punya_spo2(),
+                            jam_ukur_punya_glukosa(), jam_ukur_punya_tensi() };
+    for (int i = 0; i < 4; i++) {
+      if (punya[i] == punya_lalu[i]) continue;
+      punya_lalu[i] = punya[i];
+      lv_obj_set_style_bg_color(dot_meas[i],
+                                lv_color_hex(punya[i] ? C_GREEN2 : C_S1_DIV), 0);
+      lv_obj_set_style_text_color(lbl_meas_metrik[i],
+                                  lv_color_hex(punya[i] ? C_WHITE : C_S1_MUTED), 0);
+    }
+
+    /* Baris detak jantung membawa cacahannya. Ini baris yang paling lama
+     * menunggu, jadi ia yang harus menjelaskan apa yang sedang ditunggu --
+     * tanpa angka ini, layar diam belasan detik tanpa alasan yang terlihat. */
+    uint16_t dtk = jam_ukur_detak(), perlu = jam_ukur_detak_perlu();
+    if (dtk >= perlu) snprintf(b, sizeof(b), "Detak jantung");
+    else snprintf(b, sizeof(b), "Detak jantung %u/%u", (unsigned)dtk, (unsigned)perlu);
+    set_if_changed(lbl_meas_metrik[0], b);
+
+    /* Bar mengikuti detak, bukan detik: sejak batas waktu dilepas, waktu
+     * berjalan tidak lagi mengukur kemajuan apa pun. */
+    lv_obj_set_width(bar_meas, perlu ? (200 * (int)(dtk > perlu ? perlu : dtk) / (int)perlu) : 0);
+
+    snprintf(b, sizeof(b), "%us", (unsigned)jam_ukur_detik());
+    set_if_changed(lbl_meas_waktu, b);
+  }
+
+  /* ---- pil status sesi di home ----
+   * Pesan penolakan harus menyebut alasannya. "Belum disiapkan aplikasi" untuk
+   * tombol cek manual yang terkunci karena sesi berjalan bukan cuma tidak
+   * membantu -- ia menyesatkan ke arah yang berlawanan. */
+  static uint32_t tolak_sampai_ms = 0;
+  static const char *tolak_teks = "";
+  uint8_t tolak = jam_umpan_balik_ditolak();
+  if (tolak != JAM_TOLAK_TIDAK_ADA) {
+    tolak_sampai_ms = millis() + 2500;
+    switch (tolak) {
+      case JAM_TOLAK_BELUM_ARM:    tolak_teks = "Belum disiapkan aplikasi"; break;
+      case JAM_TOLAK_SESI_AKTIF:   tolak_teks = "Cek manual terkunci saat sesi"; break;
+      case JAM_TOLAK_SESI_BERJALAN: tolak_teks = "Sesi sudah berjalan"; break;
+      case JAM_TOLAK_SEDANG_UKUR:  tolak_teks = "Masih mengukur"; break;
+      case JAM_TOLAK_BATERAI:      tolak_teks = "Baterai terlalu lemah"; break;
+      case JAM_TOLAK_SENSOR:       tolak_teks = "Sensor tidak terdeteksi"; break;
+      default:                     tolak_teks = ""; break;
+    }
+  }
+
+  char b[64];
+  uint32_t warna;
+  if ((int32_t)(millis() - tolak_sampai_ms) < 0) {
+    snprintf(b, sizeof(b), "%s", tolak_teks);
+    warna = C_AMBER;
+  } else if (jam_status() == AW_SESI_ARMED) {
+    snprintf(b, sizeof(b), "Siap " TXT_DOT " tekan setelah makan");
+    warna = C_GREEN2;
+  } else if (jam_status() == AW_SESI_RUNNING) {
+    uint32_t t0 = jam_t0_uptime(), skrg = jam_uptime();
+    uint32_t target = (skrg < t0 + AW_JADWAL_IDX2_S) ? t0 + AW_JADWAL_IDX2_S
+                                                     : t0 + AW_JADWAL_IDX3_S;
+    int ke = (skrg < t0 + AW_JADWAL_IDX2_S) ? 2 : 3;
+    /* Hitung mundur selalu dari uptime_s absolut, tidak pernah dari sisa waktu
+     * yang diakumulasikan sendiri (dokumen 12 & 14). */
+    long sisa = (long)target - (long)skrg;
+    if (sisa < 0) sisa = 0;
+    if (sisa >= 60) snprintf(b, sizeof(b), "Ukur ke-%d dalam %ld mnt", ke, sisa / 60);
+    else            snprintf(b, sizeof(b), "Ukur ke-%d dalam %ld dtk", ke, sisa);
+    warna = C_AMBER;
+  } else {
+    /* IDLE. Pil ini yang memberi tahu peran tombol sekarang -- tanpanya, satu
+     * tombol yang mengerjakan dua hal berbeda hanya bisa dihafal, dan pengguna
+     * yang salah hafal akan mengira cek manualnya terkirim ke aplikasi. */
+    snprintf(b, sizeof(b), "Tekan untuk cek manual");
+    warna = C_S1_MUTED;
+  }
+  if (set_if_changed(lbl_sesi, b))
+    lv_obj_set_style_text_color(lbl_sesi, lv_color_hex(warna), 0);
+}
+
 static void refresh_cb(lv_timer_t *tm) {
   (void)tm;
   /* Konteks loop: di sinilah RTC dibaca dan hasil NTP diterapkan. */
@@ -1227,13 +1641,14 @@ static void refresh_cb(lv_timer_t *tm) {
   }
 
   update_health_ui();
+  update_sesi_ui();
 
-  /* Tombol daya disamakan dengan keadaan sensor yang sebenarnya. Perlu karena
-   * keadaan itu bertahan saat pengguna pindah halaman: kembali ke home lewat
-   * tombol back harus memperlihatkan tombol hijau kalau sensor memang masih
-   * hidup. Fungsinya sendiri tidak melakukan apa-apa kalau tidak ada
-   * perubahan. */
-  power_btn_refresh();
+  /* Tombol disamakan dengan status sesi yang sebenarnya. Perlu karena status
+   * itu bertahan saat pengguna pindah halaman -- dan karena ia juga berubah
+   * tanpa jari: ARM datang dari aplikasi, dan kembali ke IDLE bisa terjadi
+   * karena timeout 4 jam. Fungsinya sendiri tidak melakukan apa-apa kalau
+   * tidak ada perubahan. */
+  utama_btn_refresh();
 
   /* Heartbeat tiap 5 s. Sengaja jarang: USB CDC board ini re-enumerate setelah
    * reset sehingga print di setup() hampir selalu hilang, jadi baris inilah
@@ -1254,11 +1669,14 @@ static void refresh_cb(lv_timer_t *tm) {
     }
 
     static const char *SRC[] = { "none", "rtc", "ntp" };
-    Serial.printf("[hb] %02d:%02d:%02d src=%s wifi=%d  cuaca=%s %dC  "
+    Serial.printf("[hb] %02d:%02d:%02d src=%s wifi=%d ble=%d sesi=%d tunda=%d  "
+                  "cuaca=%s %dC  "
                   "touch irq=%lu err=%lu evt=%lu  heap=%lu\n",
                   have_time ? t.tm_hour : 0, have_time ? t.tm_min : 0,
                   have_time ? t.tm_sec : 0,
                   SRC[tm_source()], net_connected() ? 1 : 0,
+                  jam_siap_notifikasi() ? 2 : (jam_terhubung() ? 1 : 0),
+                  (int)jam_status(), (int)jam_tertunda(),
                   w.valid ? w.cond : "--", w.temp_c,
                   (unsigned long)touch_irq_count, (unsigned long)touch_readerr,
                   (unsigned long)touch_events, (unsigned long)ESP.getFreeHeap());
@@ -1372,14 +1790,29 @@ void setup() {
   build_spo2();
   build_glu();
   build_bp();
+  build_meas();
   lv_scr_load(scr_home);
 
+  scan_dot = mk_scan_dot(scr_home);   /* dipindah antar-layar sendiri di scan_anim_cb */
+
   lv_timer_create(refresh_cb, 500, NULL);
+  lv_timer_create(scan_anim_cb, 40, NULL);
 
   lv_timer_handler();
   ledcWrite(LCD_BL, 204);   /* ~80% */
 
-  /* Paling akhir: UI sudah tampil sebelum Wi-Fi mulai menyita CPU. */
+  /* Paling akhir: UI sudah tampil sebelum radio mulai menyita CPU dan heap.
+   *
+   * AsaWatch dulu, baru Wi-Fi. Urutannya penting untuk heap: init NimBLE
+   * meminta blok yang relatif besar sekaligus, dan lebih mudah didapat sebelum
+   * stack Wi-Fi memfragmentasi heap dengan buffer-buffernya. Keduanya memang
+   * berbagi satu radio 2.4 GHz di C6, tapi itu diurus coexistence di lapisan
+   * bawah -- bukan urusan sketch.
+   *
+   * jam_mulai() sendiri punya urutan internal yang tidak boleh dibalik
+   * (NVS -> boot_id naik -> muat ring -> sesi dipaksa IDLE -> BLE -> event
+   * BOOT); lihat aw_jam.cpp. */
+  jam_mulai();
   net_begin();
 
   Serial.printf("[ok] setup selesai, free heap = %lu\n", (unsigned long)ESP.getFreeHeap());
@@ -1394,6 +1827,13 @@ void loop() {
    * Touch selalu menang; PPG cuma mundur satu iterasi (~2 ms) dan FIFO-nya
    * punya cadangan 320 ms, jadi tidak ada sampel yang hilang. */
   if (!touch_irq_flag) ppg_update();
+
+  /* Logika protokol berjalan di task yang SAMA dengan lv_timer_handler()
+   * (dokumen 13.2). Itu yang membuat callback tombol LVGL boleh memanggil
+   * jam_tekan_tombol() langsung dan pembaca status UI boleh membaca variabel
+   * sesi langsung -- tanpa mutex, tanpa antrean kedua. Yang menyeberang task
+   * tinggal satu: antrean perintah BLE di aw_ble. */
+  jam_putar();
 
   lv_timer_handler();
   delay(2);

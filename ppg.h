@@ -67,6 +67,15 @@ typedef struct {
   float pi;           /* perfusion index IR (%), fitur kalibrasi   */
   float r;            /* rasio R, fitur kalibrasi                  */
 
+  /* Jumlah detak yang sudah diterima sejak kulit menempel, tanpa batas atas.
+   * Berbeda dari gerbang internal MIN_STABLE_BEATS yang berhenti di 3: itu
+   * hanya menjawab "sudah ada detak konsisten?", sedangkan angka ini menjawab
+   * "sudah berapa banyak?". Dipakai rutin pengukuran untuk menentukan kapan
+   * sebuah pengukuran layak diakhiri -- BPM dari 3 detak masih sangat mudah
+   * bergeser puluhan bpm oleh satu detak yang salah dibaca. Kembali 0 setiap
+   * kali kontak hilang. */
+  uint16_t beats;
+
   /* Statistik sepanjang sesi kontak berjalan. Dipakai untuk chip di halaman
    * detail supaya angka di bawah tidak dikarang saat angka utamanya nyata. */
   int   bpm_min, bpm_avg, bpm_max;
