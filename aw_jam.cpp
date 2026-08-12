@@ -708,6 +708,32 @@ void jam_putar(void) {
   }
 }
 
+void jam_siap_mati(void) {
+  /* Pengukuran yang sedang berjalan dibatalkan tanpa jejak, BUKAN diselesaikan
+   * lewat ukur_selesai(false). Bedanya penting: kalau belum ada satu metrik pun
+   * yang sempat terbaca, ukur_selesai() mencatat UKUR_GAGAL -- dan itu
+   * berbohong. Sensornya tidak gagal; penggunanya yang menekan tombol mati.
+   *
+   * Sesi yang terpotong tidak perlu ditandai apa pun di sini: dokumen 12 sudah
+   * menetapkan bahwa reboot saat RUNNING mengakhiri sesi, dan sampel yang
+   * terlanjur ada tetap di buffer dengan boot_id lamanya untuk ditutup aplikasi
+   * sebagai sesi tidak lengkap. */
+  if (s_ukur_aktif) {
+    s_ukur_aktif = false;
+    s_ukur_lokal = false;
+    Serial.println("[ukur] dibatalkan: jam dimatikan pengguna");
+  }
+
+  /* Tanpa syarat, bukan hanya saat sedang mengukur: fungsinya sendiri sudah
+   * keluar lebih awal kalau sensor memang sudah mati, jadi ini menutup setiap
+   * jalur yang mungkin meninggalkan LED menyala tanpa perlu tahu jalurnya. */
+  ppg_set_enabled(false);
+
+  /* Inilah alasan sebenarnya fungsi ini ada -- lihat aw_ring_simpan_sekarang()
+   * di aw_store.h untuk apa yang hilang tanpa baris ini. */
+  aw_ring_simpan_sekarang();
+}
+
 uint8_t  jam_status(void)            { return s_status; }
 bool     jam_sedang_mengukur(void)   { return s_ukur_aktif; }
 uint32_t jam_t0_uptime(void)         { return s_t0_uptime; }

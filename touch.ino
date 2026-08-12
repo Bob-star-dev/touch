@@ -85,6 +85,27 @@ typedef struct {
 #define I2C_SDA    8
 #define TOUCH_IRQ 11
 
+/* ---- Daya baterai: latch + tombol PWR ----
+ * Kedua nomor ini dari BSP resmi Waveshare untuk board ini
+ * (Examples/ESP-IDF/01_factory/components/esp_bsp/bsp_pwr.h di repo
+ * waveshareteam/ESP32-C6-Touch-LCD-1.69), dan dikonfirmasi ulang oleh contoh
+ * Arduino-nya 03_battery_example.ino yang peta pin LCD + ADC baterainya sama
+ * persis dengan berkas ini.
+ *
+ * BAT_EN adalah gerbang jalur baterai. Tombol PWR hanya menyambungkan baterai
+ * SELAMA ditekan; supaya board tetap hidup setelah jari diangkat, firmware
+ * harus menahan pin ini HIGH -- itulah "latch"-nya. Tanpa itu board mati
+ * seketika saat tombol dilepas, dan gejalanya persis seperti board rusak.
+ *
+ * Kenapa baru sekarang perlu: memberi daya lewat pin 3V3/5V menyuap rail
+ * SETELAH gerbang ini, jadi latch-nya tidak pernah relevan. Begitu daya masuk
+ * lewat soket baterai MX1.25 resmi, seluruh arus lewat gerbang ini.
+ *
+ * PWR_KEY aktif LOW (ditekan = 0). Ia juga dibawa keluar ke header board, jadi
+ * jangan pakai pad GPIO18 untuk hal lain -- ia berbagi jalur dengan tombol. */
+#define BAT_EN    15
+#define PWR_KEY   18
+
 #define SCREEN_W 240
 #define SCREEN_H 280
 
@@ -1711,8 +1732,108 @@ static void refresh_cb(lv_timer_t *tm) {
   }
 }
 
+/* ================= Tombol PWR: tekan sekali hidup, tekan lagi mati =========
+ * Menyalakan board BUKAN pekerjaan firmware dan tidak akan pernah bisa jadi:
+ * saat board mati, tidak ada yang berjalan untuk mendengarkan tombol. Itu
+ * murni kerja rangkaian -- menekan PWR menyambungkan baterai, board boot, lalu
+ * setup() mengunci BAT_EN sehingga jalurnya tidak lagi bergantung pada jari.
+ *
+ * Yang dikerjakan di sini cuma separuh keduanya: mendengarkan tekanan
+ * BERIKUTNYA, lalu melepas latch itu.
+ *
+ * TEKANAN PERTAMA HARUS DIABAIKAN, dan ini jebakan yang tidak kelihatan sampai
+ * dicoba: tekanan yang menyalakan board masih berlangsung saat loop() mulai
+ * jalan. Kalau tombol langsung didengarkan, tekanan itu terbaca sebagai
+ * "tekan lagi" dan board mematikan dirinya sendiri sepersekian detik setelah
+ * menyala -- terlihat persis seperti board yang gagal boot. Karena itu tombol
+ * baru aktif setelah pernah terlihat DILEPAS. BSP Waveshare menyelesaikan ini
+ * dengan cara yang sama (menunggu di while sebelum memasang handler).
+ */
+#define PWR_DEBOUNCE_MS  50   /* level harus stabil selama ini sebelum dipercaya */
+
+static bool     pwr_siap = false;      /* tombol sudah pernah dilepas sejak boot */
+static int      pwr_level_lalu = HIGH;
+static uint32_t pwr_stabil_ms = 0;
+
+static void pwr_matikan(void) {
+  Serial.println("[pwr] tombol PWR ditekan -- mematikan");
+
+  /* Layar dipadamkan lebih dulu: jari pengguna umumnya masih menempel di
+   * tombol pada titik ini, dan layar yang langsung gelap adalah umpan balik
+   * bahwa tekanannya diterima. */
+  ledcWrite(LCD_BL, 0);
+
+  /* Sensor padam + ring buffer dipaksa tersimpan. Harus SEBELUM latch dilepas:
+   * aw_store menunda tulis flash 3 detik, jadi tanpa ini setiap entri dari 3
+   * detik terakhir -- termasuk sampel yang baru saja selesai diukur -- ikut
+   * hilang bersama dayanya. */
+  jam_siap_mati();
+
+  /* Lepas latch. Board TIDAK langsung padam kalau jari masih menekan: selama
+   * itu tombolnya sendiri yang menyambungkan baterai. Padamnya terjadi saat
+   * jari diangkat, dan itu memang perilaku yang benar -- bukan keterlambatan
+   * yang perlu diakali. */
+  digitalWrite(BAT_EN, LOW);
+
+  /* Tidak ada jalan kembali dari sini, jadi jangan biarkan loop() melanjutkan
+   * seolah tidak terjadi apa-apa. */
+  uint32_t t0 = millis();
+  bool dicatat = false;
+  for (;;) {
+    if (!dicatat && (uint32_t)(millis() - t0) >= 2000) {
+      dicatat = true;
+      /* Masih hidup 2 detik setelah latch dilepas berarti dayanya datang dari
+       * USB, bukan baterai -- melepas BAT_EN tidak memutus jalur itu. Board
+       * sengaja dibiarkan gelap dan diam: itu keadaan "mati" paling jujur yang
+       * bisa dicapai selama USB tertancap. Karena itu pengujian tombol ini
+       * HARUS dilakukan dengan USB tercabut. */
+      Serial.println("[pwr] masih hidup setelah latch dilepas -- board dicatu USB, "
+                     "bukan baterai. Cabut USB atau tekan RST.");
+    }
+    delay(100);
+  }
+}
+
+static void pwr_poll(void) {
+  int level = digitalRead(PWR_KEY);      /* LOW = sedang ditekan */
+
+  /* Setiap perubahan level memulai ulang jendela debounce; hanya level yang
+   * sudah diam selama PWR_DEBOUNCE_MS yang dipercaya. */
+  if (level != pwr_level_lalu) {
+    pwr_level_lalu = level;
+    pwr_stabil_ms  = millis();
+    return;
+  }
+  if ((uint32_t)(millis() - pwr_stabil_ms) < PWR_DEBOUNCE_MS) return;
+
+  if (!pwr_siap) {
+    if (level == HIGH) {
+      pwr_siap = true;
+      Serial.println("[pwr] tombol dilepas -- tekan sekali lagi untuk mematikan");
+    }
+    return;
+  }
+
+  if (level == LOW) pwr_matikan();       /* tidak pernah kembali */
+}
+
 /* ---------------- Setup / Loop ---------------- */
 void setup() {
+  /* ================= PALING AWAL, sebelum apa pun =================
+   * Selama baris ini belum jalan, board hidup HANYA karena jari pengguna masih
+   * menekan tombol PWR. Semua yang ditaruh di atasnya -- termasuk Serial.begin()
+   * dan delay(200) di bawah -- adalah waktu tambahan yang harus dihabiskan
+   * pengguna sambil menahan tombol. Contoh resmi Waveshare menaruhnya di posisi
+   * yang sama persis, sebagai dua baris pertama setup(). */
+  pinMode(BAT_EN, OUTPUT);
+  digitalWrite(BAT_EN, HIGH);
+
+  /* INPUT_PULLUP, bukan INPUT: tombol menarik pin ke GND saat ditekan, jadi
+   * keadaan lepasnya butuh pull-up. Board ini punya pull-up eksternal, tetapi
+   * meminta yang internal juga tidak merugikan dan membuat pin ini tidak pernah
+   * mengambang seandainya rakitannya berbeda. */
+  pinMode(PWR_KEY, INPUT_PULLUP);
+
   Serial.begin(115200);
   delay(200);
   Serial.println("\n[boot] ESP32-C6 LVGL dashboard");
@@ -1820,6 +1941,7 @@ void setup() {
 
 void loop() {
   touch_poll();          /* tangkap IRQ secepat mungkin, jangan tunggu LVGL */
+  pwr_poll();            /* satu digitalRead; tombol mati harus selalu responsif */
 
   /* PPG ditunda selama masih ada IRQ touch yang belum diproses. Keduanya berbagi
    * bus I2C, dan satu transaksi FIFO MAX30105 (~1 ms di 100 kHz) cukup untuk

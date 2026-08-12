@@ -27,6 +27,16 @@ void jam_mulai(void);
 /* Dipanggil tiap iterasi loop, sebelum lv_timer_handler(). */
 void jam_putar(void);
 
+/* Dipanggil beberapa milidetik sebelum daya sengaja diputus (tombol PWR).
+ * Memadamkan sensor dan memaksa ring buffer tersimpan ke NVS.
+ *
+ * Ia TIDAK mengirim apa pun lewat BLE dan TIDAK mencatat event apa pun:
+ * protokol v1.1 tidak punya jenis peristiwa "dimatikan" (dokumen 18), dan
+ * mengarang satu di sini akan membuat firmware menyimpang dari dokumen yang
+ * sisi Flutter-nya sudah diuji. Aplikasi mengetahui jam mati dengan cara yang
+ * memang sudah dirancang: boot_id yang naik pada koneksi berikutnya. */
+void jam_siap_mati(void);
+
 /* Dari lv_event_cb tombol "Selesai Makan". Di IDLE ia sengaja tidak
  * menghasilkan apa-apa selain umpan balik -- lihat jam_umpan_balik_ditolak(). */
 void jam_tekan_tombol(void);

@@ -104,3 +104,16 @@ bool aw_ring_ambil_flag_penuh(void);
 /* Tulis flash yang ditunda: dipanggil tiap iterasi, benar-benar menulis hanya
  * setelah ~3 detik tanpa perubahan baru (dokumen 11). */
 void aw_ring_simpan_jika_perlu(void);
+
+/* Tulis SEKARANG, melewati jeda tunda di atas. Hanya untuk satu keadaan:
+ * beberapa milidetik sebelum daya sengaja diputus (tombol PWR ditekan).
+ *
+ * Jeda 3 detik itu ada supaya satu sesi tidak menghasilkan belasan penulisan
+ * flash, dan itu benar untuk operasi normal. Tetapi ia juga berarti setiap
+ * entri yang lahir dalam 3 detik terakhir masih hanya ada di RAM -- termasuk,
+ * pada waktu yang paling buruk, sampel yang baru saja selesai diukur. Memutus
+ * daya tanpa memanggil ini membuang entri itu tanpa jejak.
+ *
+ * Jangan dipakai di jalur normal: memanggilnya tiap perubahan akan
+ * mengembalikan persis pola penulisan yang JEDA_SIMPAN_MS hindari. */
+void aw_ring_simpan_sekarang(void);

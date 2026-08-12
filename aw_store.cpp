@@ -309,10 +309,23 @@ bool aw_ring_ambil_flag_penuh(void) {
   return f;
 }
 
-void aw_ring_simpan_jika_perlu(void) {
-  if (!s_kotor) return;
-  if ((uint32_t)(millis() - s_kotor_ms) < JEDA_SIMPAN_MS) return;
+/* Penulisan sebenarnya. Dipisah supaya jalur bertunda dan jalur paksa tidak
+ * pernah bisa menyimpang isinya -- keduanya menulis blob yang sama persis dan
+ * sama-sama membersihkan penanda kotor. */
+static void tulis_ring(void) {
   s_kotor = false;
   if (!s_nvs_ok) return;
   s_nvs.putBytes(K_RING, &s_ring, sizeof(s_ring));
+}
+
+void aw_ring_simpan_jika_perlu(void) {
+  if (!s_kotor) return;
+  if ((uint32_t)(millis() - s_kotor_ms) < JEDA_SIMPAN_MS) return;
+  tulis_ring();
+}
+
+void aw_ring_simpan_sekarang(void) {
+  if (!s_kotor) return;
+  tulis_ring();
+  Serial.println("[store] ring disimpan paksa sebelum daya diputus");
 }
