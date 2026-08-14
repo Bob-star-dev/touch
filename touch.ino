@@ -427,80 +427,148 @@ static lv_obj_t *mk_pill(lv_obj_t *parent, int x, int w, const char *txt,
   return p;
 }
 
-/* ================= Animasi tepi layar: indikator proses pengukuran =================
- * Titik kecil yang berjalan pelan mengelilingi tepi layar, dipasang di keempat
- * halaman detail (HR/SpO2/Glukosa/Tensi). Warnanya cuma memetakan ppg_state_t
- * yang sudah dihitung ppg.cpp, tidak ada logika deteksi baru di sini:
+/* ================= Garis tepi layar: indikator kemajuan pengukuran =================
+ * Garis bercahaya yang tumbuh menyusuri tepi layar, dipasang di keempat halaman
+ * detail (HR/SpO2/Glukosa/Tensi) dan di layar "sedang mengukur".
+ *
+ * BUKAN animasi berputar. Panjang garis = kemajuan pengukuran, satu putaran
+ * penuh untuk satu pengukuran: berangkat dari tengah sisi atas, searah jarum
+ * jam, dan ujungnya baru kembali menyentuh titik berangkat kalau pengukurannya
+ * benar-benar selesai. Titik berjalan yang lama justru menipu -- ia terus
+ * berputar dengan kecepatan tetap entah sensornya menangkap sesuatu atau tidak,
+ * jadi pengguna tidak punya cara membedakan "hampir selesai" dari "belum mulai".
+ *
+ * Kemajuannya = min(detak/detak_perlu, metrik_didapat/4), persis dua syarat
+ * yang dipakai ukur_putar() di aw_jam.cpp untuk menyatakan satu pengukuran
+ * selesai. Karena diambil yang terkecil, lingkaran menutup TEPAT saat kedua
+ * syarat terpenuhi -- tidak ada 100% palsu yang menggantung menunggu syarat
+ * satunya. Kontak lepas berarti detaknya balik nol, dan garisnya ikut surut:
+ * itu memang keadaan sebenarnya, pengukuran harus diulang dari awal.
+ *
+ * Warna memetakan ppg_state_t yang sudah dihitung ppg.cpp, tidak ada logika
+ * deteksi baru di sini:
  *   PPG_NO_CONTACT             -> merah   (belum ada kulit menempel)
  *   PPG_SETTLING/PPG_ACQUIRING -> kuning  (sinyal ada, detak belum konsisten)
  *   PPG_STABLE                 -> hijau   (bacaan sudah valid)
- * PPG_ABSENT/PPG_OFF menyembunyikan titiknya -- tidak ada proses untuk
+ * PPG_ABSENT/PPG_OFF menyembunyikan garisnya -- tidak ada proses untuk
  * diperlihatkan.
+ *
+ * Lintasannya dipecah jadi lima ruas persegi panjang, bukan satu lv_line satu
+ * layar penuh: sebuah objek selebar layar akan membatalkan (invalidate) seluruh
+ * 240x280 px tiap kali panjangnya berubah, dan ST7789 di SPI ini harus mengirim
+ * ulang 134 KB untuk itu. Dengan ruas terpisah yang digambar ulang cuma bilah
+ * setebal ~24 px (garis + bayangannya). Bayangan lv_obj hanya ada untuk
+ * persegi panjang, jadi bentuk ini sekaligus yang memungkinkan efek cahayanya.
  *
  * Timer terpisah dari refresh_cb (500 ms) dengan sengaja: refresh_cb jarang
  * supaya label besar tidak digambar ulang tanpa alasan (lihat catatan di
- * atasnya), tapi gerakan titik ini justru perlu banyak frame per detik supaya
- * terlihat mulus, bukan meloncat.
+ * atasnya), sedangkan garis ini perlu banyak frame per detik supaya
+ * pertumbuhannya terlihat mengalir, bukan meloncat 1/15 lintasan tiap detak.
  */
-#define SCAN_DOT_SIZE   10       /* diameter titik, px */
 #define SCAN_INSET       3       /* jarak lintasan dari tepi layar, px */
-#define SCAN_CORNER_R   18       /* radius sudut lintasan, px */
-#define SCAN_STEP   0.0035f      /* kemajuan/frame -> satu putaran ~11 s @ 40 ms/frame */
+#define SCAN_THICK       4       /* tebal garis, px */
+#define SCAN_GLOW       10       /* lebar bayangan/cahaya di sekeliling garis */
+#define SCAN_EASE    0.14f       /* pengejaran per frame menuju kemajuan asli */
 
-static lv_obj_t *scan_dot;
-static float scan_progress = 0;
+/* Lintasan: persegi panjang di tepi layar, mulai/berakhir di tengah sisi atas.
+ * Ruas 0..4 searah jarum jam -- sisi atas terbelah dua supaya titik berangkat
+ * dan titik akhirnya sama-sama di tengah atas. */
+#define SCAN_X0  SCAN_INSET
+#define SCAN_Y0  SCAN_INSET
+#define SCAN_X1  (SCREEN_W - SCAN_INSET)
+#define SCAN_Y1  (SCREEN_H - SCAN_INSET)
+#define SCAN_XC  (SCREEN_W / 2)
 
-/* Titik pada lintasan persegi bersudut bulat di tepi layar, t di rentang
- * [0,1). Jalan searah jarum jam mulai dari tengah sisi atas. */
-static lv_point_t scan_point_on_perimeter(float t) {
-  /* HALF_PI sudah didefinisikan Arduino.h (1.5707963267948966...), dipakai
-   * langsung supaya tidak bentrok nama. */
-  int x0 = SCAN_INSET, y0 = SCAN_INSET;
-  int x1 = SCREEN_W - SCAN_INSET, y1 = SCREEN_H - SCAN_INSET;
-  int r  = SCAN_CORNER_R;
-  float sw   = (float)((x1 - x0) - 2 * r);   /* panjang sisi atas/bawah */
-  float sh   = (float)((y1 - y0) - 2 * r);   /* panjang sisi kiri/kanan */
-  float arc  = r * HALF_PI;                  /* satu sudut, seperempat lingkaran */
-  float perim = 2 * sw + 2 * sh + 4 * arc;
-  float d = t * perim;
+#define SCAN_SEG_N 5
+static const int SCAN_SEG_LEN[SCAN_SEG_N] = {
+  SCAN_X1 - SCAN_XC,   /* 0: atas, tengah -> kanan */
+  SCAN_Y1 - SCAN_Y0,   /* 1: kanan, atas -> bawah  */
+  SCAN_X1 - SCAN_X0,   /* 2: bawah, kanan -> kiri  */
+  SCAN_Y1 - SCAN_Y0,   /* 3: kiri, bawah -> atas   */
+  SCAN_XC - SCAN_X0,   /* 4: atas, kiri -> tengah  */
+};
+#define SCAN_PERIM ((SCAN_X1 - SCAN_XC) + (SCAN_Y1 - SCAN_Y0) + \
+                    (SCAN_X1 - SCAN_X0) + (SCAN_Y1 - SCAN_Y0) + (SCAN_XC - SCAN_X0))
 
-  lv_point_t p;
-  if (d < sw) {                                        /* atas: kiri -> kanan */
-    p.x = x0 + r + (int)d;  p.y = y0;
-  } else if ((d -= sw) < arc) {                         /* sudut kanan-atas */
-    float th = -HALF_PI + (d / arc) * HALF_PI;
-    p.x = (x1 - r) + (int)(r * cosf(th));  p.y = (y0 + r) + (int)(r * sinf(th));
-  } else if ((d -= arc) < sh) {                         /* kanan: atas -> bawah */
-    p.x = x1;  p.y = y0 + r + (int)d;
-  } else if ((d -= sh) < arc) {                         /* sudut kanan-bawah */
-    float th = (d / arc) * HALF_PI;
-    p.x = (x1 - r) + (int)(r * cosf(th));  p.y = (y1 - r) + (int)(r * sinf(th));
-  } else if ((d -= arc) < sw) {                         /* bawah: kanan -> kiri */
-    p.x = x1 - r - (int)d;  p.y = y1;
-  } else if ((d -= sw) < arc) {                         /* sudut kiri-bawah */
-    float th = HALF_PI + (d / arc) * HALF_PI;
-    p.x = (x0 + r) + (int)(r * cosf(th));  p.y = (y1 - r) + (int)(r * sinf(th));
-  } else if ((d -= arc) < sh) {                         /* kiri: bawah -> atas */
-    p.x = x0;  p.y = y1 - r - (int)d;
-  } else {                                              /* sudut kiri-atas */
-    d -= sh;
-    float th = PI + (d / arc) * HALF_PI;
-    p.x = (x0 + r) + (int)(r * cosf(th));  p.y = (y0 + r) + (int)(r * sinf(th));
-  }
-  return p;
-}
+static lv_obj_t *scan_seg[SCAN_SEG_N];
+static float scan_progress = 0;   /* nilai yang digambar, mengejar kemajuan asli */
+static int   scan_last_d = -1;    /* panjang yang terakhir digambar, px */
 
-static lv_obj_t *mk_scan_dot(lv_obj_t *parent) {
+static lv_obj_t *mk_scan_seg(lv_obj_t *parent) {
   lv_obj_t *o = lv_obj_create(parent);
   lv_obj_remove_style_all(o);
-  lv_obj_set_size(o, SCAN_DOT_SIZE, SCAN_DOT_SIZE);
-  lv_obj_set_style_radius(o, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_size(o, 0, 0);
+  lv_obj_set_style_radius(o, 2, 0);
   lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
   lv_obj_set_style_bg_color(o, lv_color_hex(C_RED), 0);
+  /* Bayangan sewarna garisnya: yang diinginkan cahaya yang meluber ke dalam
+   * layar, bukan bayangan gelap yang membuat tepi terlihat kotor. */
+  lv_obj_set_style_shadow_width(o, SCAN_GLOW, 0);
+  lv_obj_set_style_shadow_spread(o, 1, 0);
+  lv_obj_set_style_shadow_ofs_x(o, 0, 0);
+  lv_obj_set_style_shadow_ofs_y(o, 0, 0);
+  lv_obj_set_style_shadow_color(o, lv_color_hex(C_RED), 0);
+  lv_obj_set_style_shadow_opa(o, LV_OPA_50, 0);
   lv_obj_clear_flag(o, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_clear_flag(o, LV_OBJ_FLAG_CLICKABLE);   /* jangan pernah menelan sentuhan */
   lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
   return o;
+}
+
+static void scan_build(lv_obj_t *parent) {
+  for (int i = 0; i < SCAN_SEG_N; i++) scan_seg[i] = mk_scan_seg(parent);
+}
+
+static void scan_hide(void) {
+  for (int i = 0; i < SCAN_SEG_N; i++) lv_obj_add_flag(scan_seg[i], LV_OBJ_FLAG_HIDDEN);
+  scan_last_d = -1;   /* sembunyi menghapus bentuk terakhir; paksa gambar lagi nanti */
+}
+
+/* Panjang satu ruas dalam px; ujung yang tumbuh selalu ujung yang searah jarum
+ * jam, jadi ruas bawah dan kiri ditambatkan di sisi jauhnya. */
+static void scan_seg_set(int i, int len) {
+  lv_obj_t *o = scan_seg[i];
+  if (len <= 0) { lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN); return; }
+  switch (i) {
+    case 0: lv_obj_set_pos(o, SCAN_XC, SCAN_Y0);
+            lv_obj_set_size(o, len, SCAN_THICK); break;
+    case 1: lv_obj_set_pos(o, SCAN_X1 - SCAN_THICK, SCAN_Y0);
+            lv_obj_set_size(o, SCAN_THICK, len); break;
+    case 2: lv_obj_set_pos(o, SCAN_X1 - len, SCAN_Y1 - SCAN_THICK);
+            lv_obj_set_size(o, len, SCAN_THICK); break;
+    case 3: lv_obj_set_pos(o, SCAN_X0, SCAN_Y1 - len);
+            lv_obj_set_size(o, SCAN_THICK, len); break;
+    default: lv_obj_set_pos(o, SCAN_X0, SCAN_Y0);
+             lv_obj_set_size(o, len, SCAN_THICK); break;
+  }
+  lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* Kemajuan asli pengukuran, 0..1. Saat ada sesi pengukuran resmi angkanya
+ * diambil dari aw_jam (itu yang menentukan kapan pengukuran berhenti); di luar
+ * itu -- pengguna cuma membuka halaman detail sambil menempelkan jari --
+ * dipakai bacaan langsung ppg dengan syarat yang sama. */
+static float scan_target(const ppg_data_t *p) {
+  /* Kontak lepas atau angka yang tampil cuma salinan hasil terakhir berarti
+   * tidak ada yang sedang berjalan: lintasan balik ke titik berangkat. */
+  if (p->state == PPG_NO_CONTACT || p->held) return 0;
+
+  uint16_t detak, perlu = jam_ukur_detak_perlu();
+  int punya;
+  if (jam_sedang_mengukur()) {
+    detak = jam_ukur_detak();
+    punya = (jam_ukur_punya_bpm() ? 1 : 0) + (jam_ukur_punya_spo2() ? 1 : 0) +
+            (jam_ukur_punya_glukosa() ? 1 : 0) + (jam_ukur_punya_tensi() ? 1 : 0);
+  } else {
+    detak = p->beats;
+    punya = (p->bpm_valid ? 1 : 0) + (p->spo2_valid ? 1 : 0) +
+            (p->glu_valid ? 1 : 0) + (p->bp_valid ? 1 : 0);
+  }
+  if (perlu == 0) perlu = 1;
+
+  float a = (float)detak / (float)perlu;   if (a > 1.0f) a = 1.0f;
+  float b = (float)punya / 4.0f;
+  return a < b ? a : b;
 }
 
 static void scan_anim_cb(lv_timer_t *tm) {
@@ -508,34 +576,57 @@ static void scan_anim_cb(lv_timer_t *tm) {
   lv_obj_t *act = lv_scr_act();
   bool on_detail = (act == scr_hr || act == scr_spo2 || act == scr_glu ||
                     act == scr_bp || act == scr_meas);
-  if (!on_detail) {
-    lv_obj_add_flag(scan_dot, LV_OBJ_FLAG_HIDDEN);
-    return;
-  }
+  if (!on_detail) { scan_hide(); return; }
 
   ppg_data_t p;
   ppg_get(&p);
   if (p.state == PPG_ABSENT || p.state == PPG_OFF) {
-    lv_obj_add_flag(scan_dot, LV_OBJ_FLAG_HIDDEN);
+    scan_progress = 0;
+    scan_hide();
     return;
   }
 
-  if (lv_obj_get_parent(scan_dot) != act) {
-    lv_obj_set_parent(scan_dot, act);
-    lv_obj_move_foreground(scan_dot);
+  if (lv_obj_get_parent(scan_seg[0]) != act) {
+    for (int i = 0; i < SCAN_SEG_N; i++) {
+      lv_obj_set_parent(scan_seg[i], act);
+      lv_obj_move_foreground(scan_seg[i]);
+    }
   }
-  lv_obj_clear_flag(scan_dot, LV_OBJ_FLAG_HIDDEN);
 
+  static uint32_t last_color = 0;
   uint32_t color = C_RED;
   if (p.state == PPG_SETTLING || p.state == PPG_ACQUIRING) color = C_YELLOW;
   else if (p.state == PPG_STABLE)                          color = C_GREEN2;
-  lv_obj_set_style_bg_color(scan_dot, lv_color_hex(color), 0);
+  if (color != last_color) {
+    last_color = color;
+    for (int i = 0; i < SCAN_SEG_N; i++) {
+      lv_obj_set_style_bg_color(scan_seg[i], lv_color_hex(color), 0);
+      lv_obj_set_style_shadow_color(scan_seg[i], lv_color_hex(color), 0);
+    }
+  }
 
-  scan_progress += SCAN_STEP;
-  if (scan_progress >= 1.0f) scan_progress -= 1.0f;
+  /* Detak datang satu-satu, jadi kemajuan aslinya meloncat 1/15 lintasan (~68
+   * px) sekaligus. Nilai yang digambar mengejarnya pelan supaya perpindahan itu
+   * terlihat mengalir; selisih yang tinggal sedikit langsung dikunci, kalau
+   * tidak ujung garis akan merayap satu piksel selamanya dan memaksa gambar
+   * ulang terus-menerus. */
+  float target = scan_target(&p);
+  scan_progress += (target - scan_progress) * SCAN_EASE;
+  if (fabsf(target - scan_progress) < 0.002f) scan_progress = target;
 
-  lv_point_t pt = scan_point_on_perimeter(scan_progress);
-  lv_obj_set_pos(scan_dot, pt.x - SCAN_DOT_SIZE / 2, pt.y - SCAN_DOT_SIZE / 2);
+  /* Gambar ulang hanya kalau ujungnya benar-benar pindah piksel. */
+  int d = (int)(scan_progress * SCAN_PERIM + 0.5f);
+  if (d == scan_last_d) return;
+  scan_last_d = d;
+
+  int sisa = d;
+  for (int i = 0; i < SCAN_SEG_N; i++) {
+    int len = sisa;
+    if (len > SCAN_SEG_LEN[i]) len = SCAN_SEG_LEN[i];
+    if (len < 0) len = 0;
+    scan_seg_set(i, len);
+    sisa -= len;
+  }
 }
 
 /* ================= Navigasi ================= */
@@ -1914,7 +2005,7 @@ void setup() {
   build_meas();
   lv_scr_load(scr_home);
 
-  scan_dot = mk_scan_dot(scr_home);   /* dipindah antar-layar sendiri di scan_anim_cb */
+  scan_build(scr_home);   /* dipindah antar-layar sendiri di scan_anim_cb */
 
   lv_timer_create(refresh_cb, 500, NULL);
   lv_timer_create(scan_anim_cb, 40, NULL);
