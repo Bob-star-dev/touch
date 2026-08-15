@@ -145,6 +145,11 @@ static bool    s_status_pernah = false;
 
 static const uint8_t SESI_NOL[16] = { 0 };
 
+/* Definisinya di dekat pengirim buffer, jauh di bawah; dideklarasikan di sini
+ * karena jalankan_perintah() memanggilnya lebih dulu dan berkas .cpp tidak
+ * mendapat prototipe otomatis seperti .ino. */
+static void jam_catat_ack(void);
+
 /* ================= Utilitas ================= */
 static bool baterai_kritis(void) {
   return battery_valid() && battery_percent() < AW_BATERAI_KRITIS_PCT;
@@ -316,7 +321,6 @@ static void ukur_selesai(bool lengkap) {
     s_t0_uptime = 0;
     s_index_selesai = 0;
     s_index_menunggu = 0;
-    aw_ble_atur_interval(false);
   }
   kirim_status();
 }
@@ -400,7 +404,6 @@ static void ke_idle(void) {
   s_arm_uptime = 0;
   s_index_selesai = 0;
   s_index_menunggu = 0;
-  aw_ble_atur_interval(false);
   kirim_status();
 }
 
@@ -440,7 +443,6 @@ static void lewatkan_index(uint8_t index) {
     memset(s_sesi_id, 0, 16);
     s_t0_uptime = 0;
     s_index_selesai = 0;
-    aw_ble_atur_interval(false);
   }
   kirim_status();
 }
@@ -490,7 +492,6 @@ void jam_tekan_tombol(void) {
    * sumber tunggal t0 (dokumen 7). */
   aw_ring_tambah_event(AW_EV_TOMBOL_SELESAI_MAKAN, s_sesi_id, 0, s_t0_uptime);
 
-  aw_ble_atur_interval(true);
   s_index_selesai |= (1 << 1);
   ukur_mulai(1, s_sesi_id, false);
 }
@@ -707,6 +708,7 @@ static void jalankan_perintah(const aw_perintah_t *p) {
     case AW_OP_ACK_EVENT: {
       if (narg < 1) return;    /* tanpa balasan, termasuk saat payloadnya rusak */
       aw_ring_ack(arg[0]);
+      jam_catat_ack();         /* aplikasi terbukti mendengarkan */
       /* SENGAJA tanpa ACK. Meng-ack sebuah ack adalah regresi tak berujung, dan
        * menunggu balasannya menambah satu perjalanan pulang-pergi untuk SETIAP
        * entri -- pada buffer 64 entri yang baru tersinkronisasi itu 64
@@ -730,6 +732,28 @@ static void putar_perintah_ble(void) {
 /* Satu entri per giliran, berjeda. Mengosongkan 64 entri sekaligus akan
  * memenuhi antrean notifikasi NimBLE (dokumen 11). */
 #define JEDA_KIRIM_MS 60
+
+/* ---- Kirim ulang entri yang tidak kunjung di-ACK ----
+ * Dokumen 11 menempatkan SINKRON sebagai jalan aplikasi meminta ulang isi
+ * buffer, dan itu tetap berlaku. Yang ditambahkan di sini adalah jaring
+ * pengaman untuk satu kejadian nyata yang tidak bisa dicegah dari sisi jam:
+ * sistem operasi HP memulihkan sendiri langganan CCCD milik perangkat yang
+ * sudah di-bonding, kadang beberapa ratus milidetik SEBELUM aplikasi sempat
+ * memasang penanganan notifikasinya. Notifikasi yang lahir di sela itu terkirim
+ * ke ruang hampa: jam menganggapnya sudah dikirim, aplikasi tidak pernah
+ * melihatnya, dan tanpa SINKRON entri itu diam di buffer sampai koneksi
+ * berikutnya. Terukur langsung di meja: tiga entri, nol diterima.
+ *
+ * Karena itu, selama masih ada entri yang belum di-ACK dan tautan sudah sunyi
+ * beberapa detik, seluruh entri diantrekan ulang. Ini AMAN menurut protokolnya
+ * sendiri: entri hanya keluar dari buffer lewat ACK_EVENT, dan dokumen 1 & 11
+ * sudah menetapkan duplikat sebagai hal normal yang wajib ditangani aplikasi --
+ * justru firmware dilarang menambahkan anti-duplikat.
+ *
+ * Dibatasi tiga kali per koneksi supaya aplikasi yang macet (tersambung, tetapi
+ * tidak pernah meng-ACK) tidak membuat jam mengulang isi buffernya selamanya. */
+#define ULANG_DIAM_MS   8000UL
+#define ULANG_MAKS      3
 
 static void susun_flag(const aw_entri_t *e, uint8_t *flag) {
   /* Flag disusun SAAT KIRIM, bukan saat entri dibuat: keduanya bisa berubah
@@ -773,14 +797,38 @@ static bool kirim_entri(aw_entri_t *e) {
   return aw_ble_kirim_peristiwa(b);
 }
 
+/* Saat terakhir ada tanda kehidupan pada jalur data: entri terkirim atau ACK
+ * diterima. Dipakai penjaga kirim-ulang di bawah. */
+static uint32_t s_aktivitas_ms = 0;
+static uint8_t  s_ulang_terpakai = 0;
+
+static void jam_catat_ack(void) {
+  s_aktivitas_ms = millis();
+  s_ulang_terpakai = 0;       /* aplikasi jelas mendengarkan; jatah dipulihkan */
+}
+
 static void putar_pengirim(void) {
   static uint32_t terakhir_ms = 0;
   if (!aw_ble_siap_notifikasi()) return;
+
+  /* Jaring pengaman: entri masih menunggu, tetapi jalur data sudah sunyi. */
+  if (aw_ring_tertunda() > 0 && s_ulang_terpakai < ULANG_MAKS &&
+      (uint32_t)(millis() - s_aktivitas_ms) >= ULANG_DIAM_MS) {
+    s_ulang_terpakai++;
+    s_aktivitas_ms = millis();
+    Serial.printf("[kirim] %u entri belum di-ACK dan jalur sunyi -- diantrekan "
+                  "ulang (percobaan %u/%u)\n",
+                  (unsigned)aw_ring_tertunda(), (unsigned)s_ulang_terpakai,
+                  (unsigned)ULANG_MAKS);
+    aw_ring_antre_ulang_semua();
+  }
+
   if ((uint32_t)(millis() - terakhir_ms) < JEDA_KIRIM_MS) return;
 
   aw_entri_t *e = aw_ring_berikutnya();
   if (!e) return;
   if (!kirim_entri(e)) return;         /* gagal -> coba lagi giliran berikutnya */
+  s_aktivitas_ms = millis();
 
   /* Entri TIDAK dihapus saat dikirim, hanya saat di-ACK_EVENT: aplikasi baru
    * meng-ack setelah entrinya tersimpan permanen di basis datanya. Duplikat
@@ -820,12 +868,43 @@ void jam_putar(void) {
   putar_sesi();              /* timeout ARM, jadwal index 2 dan 3   */
   ukur_putar();              /* panen metrik, padamkan LED bila cukup */
 
+  /* Jumlah entri tertunda dititipkan SEBELUM aw_ble_putar(), supaya keputusan
+   * interval iklan di putaran ini memakai angka putaran ini juga. */
+  uint8_t tertunda = aw_ring_tertunda();
+  aw_ble_tertunda(tertunda);
   aw_ble_putar();            /* interval iklan cepat -> lambat        */
+
+  /* ---- Interval koneksi: satu keputusan, di satu tempat ----
+   * Dulu tersebar di lima tempat dan masing-masing hanya melihat status sesi,
+   * dan itu keliru pada keadaan yang justru paling penting: begitu aplikasi
+   * selesai berlangganan, jam meminta interval IDLE (200-500 ms) -- tepat pada
+   * detik ketika buffer mulai dikuras. Pada 500 ms, satu notifikasi per selang
+   * berarti 64 entri butuh setengah menit, dan penelusuran GATT sebelumnya
+   * belasan detik. Terukur: satu pembacaan karakteristik 3,5 detik pada 495 ms,
+   * 0,2 detik pada 15-30 ms.
+   *
+   * Sekarang yang menentukan bukan status sesi melainkan apakah jam masih punya
+   * PEKERJAAN: sesi berjalan, atau masih ada entri yang belum sampai ke
+   * aplikasi. Longgar hanya ketika benar-benar tidak ada apa-apa lagi. */
+  static int sibuk_lalu = -1;
+  if (!aw_ble_terhubung()) {
+    sibuk_lalu = -1;         /* koneksi berikutnya dipasangi lagi dari nol */
+    /* Jatah kirim-ulang milik SATU koneksi. Tanpa penyetelan ulang di sini,
+     * koneksi kedua mewarisi jatah yang sudah habis dan jaring pengamannya
+     * tidak pernah menyala lagi. */
+    s_ulang_terpakai = 0;
+    s_aktivitas_ms = millis();
+  } else {
+    int sibuk = (s_status == AW_SESI_RUNNING || tertunda > 0) ? 1 : 0;
+    if (sibuk != sibuk_lalu) {
+      sibuk_lalu = sibuk;
+      aw_ble_atur_interval(sibuk != 0);
+    }
+  }
 
   if (aw_ble_ambil_flag_siap_baru()) {
     /* CCCD baru ditulis: BARU sekarang aman mulai menguras buffer. */
     aw_ring_antre_ulang_semua();
-    aw_ble_atur_interval(s_status == AW_SESI_RUNNING);
     s_status_pernah = false;              /* paksa Status terkirim sekali */
     kirim_status();
   }

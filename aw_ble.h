@@ -32,8 +32,17 @@ typedef struct {
 void aw_ble_begin(void);
 
 /* Urusan berkala yang harus di konteks loop: mengganti interval iklan dari
- * cepat ke lambat setelah 60 detik pertama. Panggil dari jam_putar(). */
+ * cepat ke lambat setelah 60 detik pertama, dan memastikan iklannya benar-benar
+ * menyala selama tidak ada yang tersambung. Panggil dari jam_putar(). */
 void aw_ble_putar(void);
+
+/* Titipkan jumlah entri yang belum di-ACK aplikasi, tiap putaran.
+ *
+ * Dipakai untuk satu hal: selama masih ada hasil yang menunggu, jam mengiklan
+ * 100 ms alih-alih 1000 ms supaya HP menemukannya lebih cepat. Angkanya, bukan
+ * sekadar "ada atau tidak", karena entri BARU-lah yang menyalakan ulang jendela
+ * gesit itu -- lihat ADV_GESIT_MS di aw_ble.cpp. */
+void aw_ble_tertunda(uint8_t jumlah);
 
 /* ---- Perintah masuk ----
  * Ambil satu perintah dari antrean. false = antrean kosong. */
@@ -59,8 +68,14 @@ bool aw_ble_siap_notifikasi(void);   /* terhubung DAN dilanggani keduanya */
  * buffer (dokumen 11). */
 bool aw_ble_ambil_flag_siap_baru(void);
 
-/* Interval koneksi: rapat saat sesi berjalan, longgar saat idle (dokumen 10). */
-void aw_ble_atur_interval(bool sesi_berjalan);
+/* Interval koneksi: rapat selama jam masih punya pekerjaan (sesi berjalan atau
+ * masih ada entri yang belum sampai ke aplikasi), longgar hanya ketika benar-
+ * benar tidak ada apa-apa lagi (dokumen 10).
+ *
+ * Yang menentukan BUKAN status sesi. Pengurasan buffer terjadi justru di luar
+ * sesi -- saat HP baru tersambung kembali membawa hasil yang menumpuk -- dan
+ * pada interval longgar 500 ms, 64 entri butuh setengah menit. */
+void aw_ble_atur_interval(bool sibuk);
 
 /* Serial 6 byte dari MAC efuse dan nama yang diiklankan ("AsaWatch 3F1A"). */
 const uint8_t *aw_ble_serial(void);

@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AsaWatch — Penguji BLE</title>
+<style>
+:root{
+  --bg:#0B0C10; --bg2:#12141A; --kartu:#171A21; --garis:#23262D;
+  --ink:#E7EAF0; --redup:#8E96A6; --tang:#B9C1D0;
+  --hijau:#A2E32B; --merah:#FF3B5C; --biru:#22D3EE; --kuning:#FFC94D; --ungu:#C77DFF;
+  --mono:ui-monospace,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif}
+header{position:sticky;top:0;z-index:9;background:rgba(11,12,16,.94);
+  border-bottom:1px solid var(--garis);backdrop-filter:blur(8px)}
+.bar{max-width:1080px;margin:0 auto;padding:12px 16px;display:flex;gap:12px;
+  align-items:center;flex-wrap:wrap}
+h1{font-size:15px;margin:0;font-weight:650;letter-spacing:.2px}
+h1 span{color:var(--redup);font-weight:400}
+main{max-width:1080px;margin:0 auto;padding:16px}
+button{font:inherit;font-weight:600;color:#0B0C10;background:var(--hijau);border:0;
+  border-radius:8px;padding:8px 14px;cursor:pointer}
+button:hover{filter:brightness(1.08)}
+button:disabled{opacity:.38;cursor:not-allowed;filter:none}
+button.sekunder{background:var(--kartu);color:var(--ink);border:1px solid var(--garis)}
+button.bahaya{background:var(--merah);color:#fff}
+.pil{display:inline-flex;align-items:center;gap:7px;padding:5px 11px;border-radius:999px;
+  background:var(--kartu);border:1px solid var(--garis);font-size:12.5px;color:var(--tang)}
+.titik{width:8px;height:8px;border-radius:50%;background:var(--redup);flex:none}
+.titik.on{background:var(--hijau);box-shadow:0 0 8px var(--hijau)}
+.titik.tunggu{background:var(--kuning)}
+.kisi{display:grid;grid-template-columns:repeat(auto-fit,minmax(248px,1fr));gap:12px;margin-bottom:16px}
+.kartu{background:var(--kartu);border:1px solid var(--garis);border-radius:12px;padding:14px}
+.kartu h2{margin:0 0 10px;font-size:11px;font-weight:700;letter-spacing:1.2px;
+  text-transform:uppercase;color:var(--redup)}
+.baris{display:flex;justify-content:space-between;gap:12px;padding:4px 0;
+  border-bottom:1px dashed rgba(255,255,255,.05);font-size:13px}
+.baris:last-child{border-bottom:0}
+.baris .k{color:var(--redup)}
+.baris .v{font-family:var(--mono);font-size:12.5px;text-align:right;word-break:break-all}
+.metrik{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+.metrik div{text-align:center;background:var(--bg2);border-radius:10px;padding:10px 6px}
+.metrik b{display:block;font-size:24px;font-weight:750;letter-spacing:-.5px;font-family:var(--mono)}
+.metrik small{display:block;color:var(--redup);font-size:10.5px;letter-spacing:.6px;
+  text-transform:uppercase;margin-top:2px}
+.hr b{color:var(--merah)} .sp b{color:var(--hijau)} .gl b{color:var(--biru)} .bp b{color:var(--ungu)}
+.alat{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.alat input{font:inherit;width:76px;background:var(--bg2);color:var(--ink);
+  border:1px solid var(--garis);border-radius:8px;padding:7px 9px;font-family:var(--mono)}
+label.sw{display:inline-flex;align-items:center;gap:7px;color:var(--tang);font-size:13px;cursor:pointer}
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th{text-align:left;font-size:10.5px;letter-spacing:.9px;text-transform:uppercase;
+  color:var(--redup);font-weight:600;padding:7px 8px;border-bottom:1px solid var(--garis);
+  position:sticky;top:0;background:var(--kartu)}
+td{padding:7px 8px;border-bottom:1px solid rgba(255,255,255,.05);vertical-align:top}
+td.mono,.hex{font-family:var(--mono);font-size:11.5px;color:var(--tang)}
+tr.sampel td:first-child{border-left:3px solid var(--hijau)}
+tr.peristiwa td:first-child{border-left:3px solid var(--biru)}
+tr.nak td:first-child{border-left:3px solid var(--merah)}
+tr.keluar td:first-child{border-left:3px solid var(--ungu)}
+.gulir{max-height:min(56vh,520px);overflow:auto;border:1px solid var(--garis);border-radius:12px}
+.catatan{color:var(--redup);font-size:12.5px;line-height:1.65;margin:10px 0 0}
+.catatan code{font-family:var(--mono);color:var(--tang)}
+.peringatan{background:#2A1B10;border:1px solid #5B3A1A;color:#F0C48A;
+  border-radius:12px;padding:12px 14px;margin-bottom:16px;font-size:13px;line-height:1.6}
+.peringatan b{color:#FFD9A8}
+.sembunyi{display:none}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="bar">
+    <h1>AsaWatch <span>— penguji BLE v1.1</span></h1>
+    <span class="pil"><i class="titik" id="tTitik"></i><span id="tStatus">terputus</span></span>
+    <span class="pil" id="pNama" hidden></span>
+    <span style="flex:1"></span>
+    <button id="bSambung">Sambungkan</button>
+    <button id="bPutus" class="sekunder" disabled>Putuskan</button>
+  </div>
+</header>
+
+<main>
+  <div class="peringatan" id="wajibHttps" hidden>
+    <b>Web Bluetooth tidak tersedia di halaman ini.</b>
+    <span id="alasanHttps"></span>
+  </div>
+
+  <div class="kisi">
+    <div class="kartu">
+      <h2>Perangkat (paket Info)</h2>
+      <div class="baris"><span class="k">Versi protokol</span><span class="v" id="iVersi">—</span></div>
+      <div class="baris"><span class="k">Serial</span><span class="v" id="iSerial">—</span></div>
+      <div class="baris"><span class="k">Firmware build</span><span class="v" id="iBuild">—</span></div>
+      <div class="baris"><span class="k">Kapasitas buffer</span><span class="v" id="iKap">—</span></div>
+      <div class="baris"><span class="k">Kemampuan</span><span class="v" id="iMampu">—</span></div>
+      <div class="baris"><span class="k">boot_id</span><span class="v" id="iBoot">—</span></div>
+      <div class="baris"><span class="k">Uptime saat dibaca</span><span class="v" id="iUp">—</span></div>
+    </div>
+
+    <div class="kartu">
+      <h2>Status (notifikasi)</h2>
+      <div class="baris"><span class="k">Sesi</span><span class="v" id="sSesi">—</span></div>
+      <div class="baris"><span class="k">Entri tertunda</span><span class="v" id="sTunda">—</span></div>
+      <div class="baris"><span class="k">Baterai</span><span class="v" id="sBatt">—</span></div>
+      <div class="baris"><span class="k">Sedang mengukur</span><span class="v" id="sUkur">—</span></div>
+      <div class="baris"><span class="k">Kalibrasi tersimpan</span><span class="v" id="sKal">—</span></div>
+      <div class="baris"><span class="k">Baterai kritis</span><span class="v" id="sKritis">—</span></div>
+      <div class="baris"><span class="k">Anchor terpasang</span><span class="v" id="sAnchor">—</span></div>
+      <div class="baris"><span class="k">Uptime</span><span class="v" id="sUp">—</span></div>
+    </div>
+
+    <div class="kartu">
+      <h2>Waktu &amp; sesi</h2>
+      <div class="baris"><span class="k">Anchor dikirim</span><span class="v" id="aKirim">—</span></div>
+      <div class="baris"><span class="k">epoch → uptime</span><span class="v" id="aPeta">—</span></div>
+      <div class="baris"><span class="k">sesiId aktif</span><span class="v" id="aSesi">—</span></div>
+      <div class="baris"><span class="k">Sampel diterima</span><span class="v" id="aSampel">0</span></div>
+      <div class="baris"><span class="k">Peristiwa diterima</span><span class="v" id="aEvent">0</span></div>
+      <div class="baris"><span class="k">Baterai (0x2A19)</span><span class="v" id="aBatt">—</span></div>
+    </div>
+
+    <div class="kartu">
+      <h2>Sampel terakhir</h2>
+      <div class="metrik">
+        <div class="hr"><b id="mHr">—</b><small>bpm</small></div>
+        <div class="sp"><b id="mSp">—</b><small>SpO₂ %</small></div>
+        <div class="gl"><b id="mGl">—</b><small>mg/dL</small></div>
+        <div class="bp"><b id="mBp">—</b><small>mmHg</small></div>
+      </div>
+      <div class="baris" style="margin-top:10px"><span class="k">Index</span><span class="v" id="mIndex">—</span></div>
+      <div class="baris"><span class="k">Waktu entri</span><span class="v" id="mWaktu">—</span></div>
+      <div class="baris"><span class="k">Flag</span><span class="v" id="mFlag">—</span></div>
+    </div>
+  </div>
+
+  <div class="kartu" style="margin-bottom:16px">
+    <h2>Perintah</h2>
+    <div class="alat">
+      <button id="cArm" disabled>ARM sesi</button>
+      <button id="cBatal" class="sekunder" disabled>Batal sesi</button>
+      <button id="cUkurSekarang" class="sekunder" disabled>Ukur sekarang (kalibrasi)</button>
+      <span class="pil">UKUR index
+        <input id="cIndex" type="number" min="0" max="3" value="0" style="width:56px">
+      </span>
+      <button id="cUkur" class="sekunder" disabled>Kirim UKUR</button>
+      <button id="cSinkron" class="sekunder" disabled>SINKRON</button>
+      <button id="cAnchor" class="sekunder" disabled>Anchor ulang</button>
+      <span class="pil">Kalibrasi tensi
+        <input id="cSis" type="number" value="0" title="offset sistolik (mmHg)">
+        <input id="cDia" type="number" value="0" title="offset diastolik (mmHg)">
+      </span>
+      <button id="cKal" class="sekunder" disabled>SET KALIBRASI</button>
+    </div>
+    <p class="catatan">
+      Tombol <b>“Selesai Makan”</b> sengaja tidak ada di sini: dokumen protokol bagian 3 menetapkan jam
+      sebagai <b>satu-satunya sumber t0</b>, dan aplikasi tidak boleh punya tombol yang setara. Setelah
+      menekan <em>ARM sesi</em>, tekan tombol BOOT di jamnya — peristiwa <code>TOMBOL_SELESAI_MAKAN</code>
+      akan muncul di log di bawah.
+    </p>
+  </div>
+
+  <div class="kartu">
+    <h2>Log</h2>
+    <div class="alat" style="margin-bottom:10px">
+      <label class="sw"><input type="checkbox" id="oAck" checked> Auto-ACK entri (seperti aplikasi asli)</label>
+      <label class="sw"><input type="checkbox" id="oHex" checked> Tampilkan byte mentah</label>
+      <span style="flex:1"></span>
+      <button class="sekunder" id="bSalin">Salin log</button>
+      <button class="sekunder" id="bBersih">Bersihkan</button>
+    </div>
+    <div class="gulir">
+      <table>
+        <thead><tr><th style="width:78px">Waktu</th><th style="width:92px">Jenis</th>
+          <th style="width:46px">seq</th><th>Isi</th></tr></thead>
+        <tbody id="log"></tbody>
+      </table>
+    </div>
+    <p class="catatan">
+      <b>Auto-ACK menghapus entri dari buffer jam</b> (opcode <code>0x08</code>), persis seperti aplikasi
+      sungguhan setelah menyimpan entri ke basis datanya. Matikan kalau Anda ingin entri yang sama tetap
+      ada di jam untuk diuji ulang — tetapi ingat buffernya cuma 64 entri, dan yang tertua akan dibuang
+      begitu penuh.
+    </p>
+  </div>
+</main>
+
+<script>
+/* ============================================================================
+ * AsaWatch — penguji BLE, protokol v1.1
+ *
+ * Berkas ini terjemahan langsung dari docs/asawatch-ble-untuk-jam-lvgl.md dan
+ * aw_proto.h. Semua field multi-byte LITTLE-ENDIAN.
+ *
+ * Web Bluetooth hanya jalan di konteks aman: https:// atau http://localhost.
+ * Membuka berkas ini lewat file:// TIDAK akan bisa menyambung.
+ * ========================================================================== */
+
+const UUID = {
+  service  : 'a5a70001-6b4c-4e2a-9d31-0f8c2e5a7b10',
+  info     : 'a5a70002-6b4c-4e2a-9d31-0f8c2e5a7b10',
+  kontrol  : 'a5a70003-6b4c-4e2a-9d31-0f8c2e5a7b10',
+  peristiwa: 'a5a70004-6b4c-4e2a-9d31-0f8c2e5a7b10',
+  sampel   : 'a5a70005-6b4c-4e2a-9d31-0f8c2e5a7b10',
+  status   : 'a5a70006-6b4c-4e2a-9d31-0f8c2e5a7b10',
+  svcBatt  : 0x180f,
+  chrBatt  : 0x2a19,
+};
+
+const OP = { ANCHOR:0x01, ARM:0x02, BATAL:0x03, UKUR:0x04, UKUR_SEKARANG:0x05,
+             KALIBRASI:0x06, SINKRON:0x07, ACK:0x08 };
+
+const NAMA_EVENT = {
+  0x01:'TOMBOL_SELESAI_MAKAN', 0x02:'SESI_KEDALUWARSA', 0x03:'SESI_DIBATALKAN_JAM',
+  0x04:'UKUR_GAGAL', 0x05:'ACK', 0x06:'NAK', 0x07:'BUFFER_PENUH', 0x08:'BOOT',
+};
+const NAMA_NAK = {
+  0x01:'opcode tak dikenal', 0x02:'payload invalid', 0x03:'belum ARM',
+  0x04:'sesi tak dikenal', 0x05:'sedang mengukur', 0x06:'baterai rendah',
+  0x07:'sensor gagal', 0x08:'kalibrasi kosong', 0x09:'boot_id tidak cocok',
+};
+const NAMA_OP = Object.fromEntries(Object.entries(OP).map(([k,v]) => [v,k]));
+const NAMA_SESI = { 0:'IDLE', 1:'ARMED', 2:'RUNNING' };
+
+const $ = id => document.getElementById(id);
+const hex = (b,sep=' ') => Array.from(b, x => x.toString(16).padStart(2,'0')).join(sep);
+const jam = d => d.toTimeString().slice(0,8);
+const durasi = s => {
+  s = Math.floor(s);
+  const j = Math.floor(s/3600), m = Math.floor(s%3600/60);
+  return j ? `${j} j ${m} m` : (m ? `${m} m ${s%60} d` : `${s} d`);
+};
+
+/* ---------------- keadaan ---------------- */
+const S = {
+  perangkat:null, server:null, kontrol:null,
+  bootId:0, sesiId:null,
+  anchorEpoch:0, anchorUptime:0,     /* peta uptime_s -> epoch, rumus dokumen 2.2 */
+  nSampel:0, nEvent:0,
+};
+
+/* ---------------- log ---------------- */
+function tulis(jenis, seq, isi, mentah, kelas) {
+  const tr = document.createElement('tr');
+  tr.className = kelas || '';
+  const raw = ($('oHex').checked && mentah)
+    ? `<div class="hex" style="margin-top:3px;opacity:.72">${hex(mentah)}</div>` : '';
+  tr.innerHTML = `<td class="mono">${jam(new Date())}</td><td>${jenis}</td>
+                  <td class="mono">${seq ?? ''}</td><td>${isi}${raw}</td>`;
+  const log = $('log');
+  log.prepend(tr);
+  while (log.children.length > 400) log.lastChild.remove();
+}
+const info  = (t,m) => tulis('info', '', t, m, '');
+const salah = t => tulis('galat', '', `<b style="color:var(--merah)">${t}</b>`, null, 'nak');
+
+/* ---------------- waktu entri ----------------
+ * epoch_entri = anchor.epoch + (entri.uptime - anchor.uptime). Berlaku juga untuk
+ * entri yang terjadi SEBELUM anchor dipasang -- selisihnya boleh negatif, dan
+ * itulah yang menyelamatkan entri yang menumpuk saat HP tidak tersambung. */
+function waktuEntri(uptime) {
+  if (!S.anchorEpoch) return `uptime ${uptime}s (belum ada anchor)`;
+  const d = new Date((S.anchorEpoch + (uptime - S.anchorUptime)) * 1000);
+  return `${d.toLocaleString('id-ID')} · uptime ${uptime}s`;
+}
+
+/* ---------------- pengurai paket ---------------- */
+function bacaInfo(dv, b) {
+  $('iVersi').textContent = `${dv.getUint8(0)}.${dv.getUint8(1)}`;
+  $('iSerial').textContent = hex(b.slice(2,8), ':').toUpperCase();
+  $('iBuild').textContent = dv.getUint16(8, true);
+  $('iKap').textContent = `${dv.getUint8(10)} entri`;
+  const k = dv.getUint8(11);
+  $('iMampu').textContent = [
+    k & 1 ? 'gula' : null, k & 2 ? 'tensi' : null,
+    k & 4 ? 'SpO₂' : null, k & 8 ? 'OTA' : null,
+  ].filter(Boolean).join(' + ') || '—';
+  S.bootId = dv.getUint16(12, true);
+  $('iBoot').textContent = S.bootId;
+  $('iUp').textContent = `${dv.getUint32(14, true)} s`;
+  $('sAnchor').textContent = (dv.getUint8(18) & 1) ? 'ya' : 'belum';
+  tulis('Info', '', `versi ${dv.getUint8(0)}.${dv.getUint8(1)} · boot_id ${S.bootId} · ` +
+        `buffer ${dv.getUint8(10)} · uptime ${dv.getUint32(14,true)}s`, b, '');
+}
+
+function bacaStatus(dv, b) {
+  const f = dv.getUint8(3);
+  $('sSesi').textContent   = NAMA_SESI[dv.getUint8(0)] ?? dv.getUint8(0);
+  $('sTunda').textContent  = dv.getUint8(1);
+  $('sBatt').textContent   = `${dv.getUint8(2)} %`;
+  $('sUkur').textContent   = (f & 0x01) ? 'ya' : 'tidak';
+  $('sKal').textContent    = (f & 0x02) ? 'ya' : 'tidak';
+  $('sKritis').textContent = (f & 0x04) ? 'YA' : 'tidak';
+  $('sAnchor').textContent = (f & 0x08) ? 'ya' : 'belum';
+  $('sUp').textContent     = `${dv.getUint32(4, true)} s (${durasi(dv.getUint32(4,true))})`;
+  tulis('Status', '', `sesi ${NAMA_SESI[dv.getUint8(0)]} · tertunda ${dv.getUint8(1)} · ` +
+        `baterai ${dv.getUint8(2)}% · flag 0x${f.toString(16).padStart(2,'0')}`, b, '');
+}
+
+function bacaSampel(dv, b) {
+  const seq = dv.getUint8(0);
+  const sesi = hex(b.slice(1,17), '');
+  const index = dv.getUint8(17), flag = dv.getUint8(18);
+  const bootId = dv.getUint16(19, true), uptime = dv.getUint32(21, true);
+  const gula = dv.getUint16(25, true);
+  const bpm = dv.getUint8(27), sis = dv.getUint8(28), dia = dv.getUint8(29), spo2 = dv.getUint8(30);
+
+  /* 0 = GAGAL DIUKUR, bukan nol beneran (sentinel dokumen 6). */
+  const n = v => v ? v : '—';
+  $('mHr').textContent = n(bpm);
+  $('mSp').textContent = n(spo2);
+  $('mGl').textContent = n(gula);
+  $('mBp').textContent = sis ? `${sis}/${dia}` : '—';
+  $('mIndex').textContent = index;
+  $('mWaktu').textContent = waktuEntri(uptime);
+  $('mFlag').textContent = [
+    flag & 1 ? 'dari buffer' : 'langsung',
+    flag & 2 ? 'waktu tidak pasti' : 'waktu pasti',
+  ].join(' · ');
+  $('aSampel').textContent = ++S.nSampel;
+
+  tulis('Sampel', seq,
+    `index <b>${index}</b> · bpm ${n(bpm)} · SpO₂ ${n(spo2)} · gula ${n(gula)} · ` +
+    `tensi ${sis ? sis+'/'+dia : '—'}<br>` +
+    `<span class="hex">sesi ${sesi.slice(0,8)}… · boot ${bootId} · ${waktuEntri(uptime)}` +
+    `${flag & 1 ? ' · dari buffer' : ''}${flag & 2 ? ' · waktu tidak pasti' : ''}</span>`,
+    b, 'sampel');
+  if ($('oAck').checked && seq) kirimAck(seq);
+}
+
+function bacaPeristiwa(dv, b) {
+  const seq = dv.getUint8(0), jenis = dv.getUint8(1);
+  const bootId = dv.getUint16(18, true), uptime = dv.getUint32(20, true);
+  const flag = dv.getUint8(24), muatan = dv.getUint8(25);
+  const nama = NAMA_EVENT[jenis] ?? `0x${jenis.toString(16)}`;
+
+  let ket = '';
+  if (jenis === 0x05) ket = `opcode ${NAMA_OP[muatan] ?? '0x'+muatan.toString(16)}`;
+  else if (jenis === 0x06) ket = `<b style="color:var(--merah)">${NAMA_NAK[muatan] ?? '0x'+muatan.toString(16)}</b>`;
+  else if (jenis === 0x04) ket = `index ${muatan} — pengukuran itu tidak menghasilkan sampel`;
+
+  $('aEvent').textContent = ++S.nEvent;
+  tulis('Peristiwa', seq || '', `<b>${nama}</b>${ket ? ' · ' + ket : ''}<br>` +
+    `<span class="hex">boot ${bootId} · ${waktuEntri(uptime)}` +
+    `${flag & 1 ? ' · dari buffer' : ''}${flag & 2 ? ' · waktu tidak pasti' : ''}</span>`,
+    b, jenis === 0x06 ? 'nak' : 'peristiwa');
+
+  /* seq 0 = balasan langsung (ACK/NAK), bukan entri buffer -- jangan pernah
+   * di-ACK balik; itu regresi tak berujung dan jam memang tidak menunggunya. */
+  if ($('oAck').checked && seq) kirimAck(seq);
+}
+
+/* ---------------- pengirim perintah ---------------- */
+async function kirim(bytes, nama) {
+  if (!S.kontrol) return salah('belum tersambung');
+  const buf = Uint8Array.from(bytes);
+  try {
+    if (S.kontrol.writeValueWithResponse) await S.kontrol.writeValueWithResponse(buf);
+    else await S.kontrol.writeValue(buf);
+    tulis('→ kirim', '', `<b>${nama}</b>`, buf, 'keluar');
+  } catch (e) { salah(`gagal mengirim ${nama}: ${e.message}`); }
+}
+const u16 = v => [v & 0xff, (v >> 8) & 0xff];
+const u32 = v => [v & 0xff, (v>>>8) & 0xff, (v>>>16) & 0xff, (v>>>24) & 0xff];
+
+function kirimAck(seq) { kirim([OP.ACK, seq], `ACK_EVENT seq ${seq}`); }
+
+/* Anchor = PASANGAN (epoch, uptime_s) pada saat yang sama. Uptime-nya diambil
+ * dengan membaca Status TEPAT SETELAH perintahnya terkirim -- jam menyegarkan
+ * field itu saat dibaca -- bukan dari nilai yang kebetulan tersimpan sebelumnya.
+ * Memasangkan epoch sekarang dengan uptime dari beberapa detik lalu menggeser
+ * SELURUH terjemahan waktu entri sebesar selisih itu. */
+async function kirimAnchor() {
+  const epoch = Math.floor(Date.now() / 1000);          /* epoch UTC */
+  await kirim([OP.ANCHOR, ...u32(epoch), ...u16(S.bootId)], 'ANCHOR_WAKTU');
+  S.anchorEpoch = epoch;
+  if (S.cStatus) {
+    try {
+      const st = await S.cStatus.readValue();
+      S.anchorUptime = st.getUint32(4, true);
+    } catch (e) { info(`uptime anchor tidak terbaca: ${e.message}`); }
+  }
+  $('aKirim').textContent = new Date(epoch * 1000).toLocaleString('id-ID');
+  $('aPeta').textContent  = `uptime ${S.anchorUptime}s = ` +
+                            new Date(S.anchorEpoch * 1000).toLocaleTimeString('id-ID');
+}
+
+/* ---------------- sambung ---------------- */
+async function sambung() {
+  try {
+    const perangkat = await navigator.bluetooth.requestDevice({
+      /* Filter service UUID: jam menaruh UUID-nya di paket IKLAN (bukan scan
+       * response) justru supaya filter ini bekerja. */
+      filters: [{ services: [UUID.service] }],
+      optionalServices: [UUID.service, UUID.svcBatt],
+    });
+    S.perangkat = perangkat;
+    $('pNama').hidden = false;
+    $('pNama').textContent = `${perangkat.name || '(tanpa nama)'} · ${perangkat.id.slice(0,10)}…`;
+    perangkat.addEventListener('gattserverdisconnected', keTerputus);
+
+    setStatus('menyambung…', 'tunggu');
+    S.server = await perangkat.gatt.connect();
+    const svc = await S.server.getPrimaryService(UUID.service);
+
+    /* URUTAN HANDSHAKE (dokumen §10): baca Info -> langgani ketiganya ->
+     * BARU ANCHOR_WAKTU dan SINKRON. Notifikasi yang dikirim sebelum CCCD
+     * ditulis hilang tanpa jejak, sementara entrinya terlanjur ditandai
+     * "sudah dikirim" di jam dan tidak datang lagi sampai SINKRON berikutnya. */
+    const cInfo = await svc.getCharacteristic(UUID.info);
+    const nilaiInfo = await cInfo.readValue();
+    bacaInfo(nilaiInfo, new Uint8Array(nilaiInfo.buffer));
+
+    S.kontrol = await svc.getCharacteristic(UUID.kontrol);
+
+    const cPeristiwa = await svc.getCharacteristic(UUID.peristiwa);
+    const cSampel    = await svc.getCharacteristic(UUID.sampel);
+    const cStatus    = await svc.getCharacteristic(UUID.status);
+
+    cPeristiwa.addEventListener('characteristicvaluechanged', e =>
+      bacaPeristiwa(e.target.value, new Uint8Array(e.target.value.buffer)));
+    cSampel.addEventListener('characteristicvaluechanged', e =>
+      bacaSampel(e.target.value, new Uint8Array(e.target.value.buffer)));
+    S.cStatus = cStatus;
+    cStatus.addEventListener('characteristicvaluechanged', e =>
+      bacaStatus(e.target.value, new Uint8Array(e.target.value.buffer)));
+
+    await cPeristiwa.startNotifications();
+    await cSampel.startNotifications();
+    await cStatus.startNotifications();
+    info('berlangganan Peristiwa, Sampel, dan Status');
+
+    const st = await cStatus.readValue();
+    bacaStatus(st, new Uint8Array(st.buffer));
+
+    /* Baterai: layanan SIG standar, sengaja tanpa syarat enkripsi di jam. */
+    try {
+      const svcB = await S.server.getPrimaryService(UUID.svcBatt);
+      const cB = await svcB.getCharacteristic(UUID.chrBatt);
+      const b = await cB.readValue();
+      $('aBatt').textContent = `${b.getUint8(0)} %`;
+      cB.addEventListener('characteristicvaluechanged', e =>
+        $('aBatt').textContent = `${e.target.value.getUint8(0)} %`);
+      await cB.startNotifications();
+    } catch (e) { info(`layanan baterai tidak terbaca: ${e.message}`); }
+
+    await kirimAnchor();
+    await kirim([OP.SINKRON, 0], 'SINKRON');
+
+    setStatus('tersambung', 'on');
+    aktifkan(true);
+  } catch (e) {
+    salah(e.message);
+    setStatus('terputus', '');
+    aktifkan(false);
+  }
+}
+
+function keTerputus() {
+  setStatus('terputus', '');
+  aktifkan(false);
+  S.server = S.kontrol = null;
+  info('koneksi terputus — jam kembali mengiklan');
+}
+
+function setStatus(teks, kelas) {
+  $('tStatus').textContent = teks;
+  $('tTitik').className = 'titik ' + kelas;
+}
+
+function aktifkan(on) {
+  $('bSambung').disabled = on;
+  $('bPutus').disabled = !on;
+  for (const id of ['cArm','cBatal','cUkur','cUkurSekarang','cSinkron','cAnchor','cKal'])
+    $(id).disabled = !on;
+}
+
+/* ---------------- tombol ---------------- */
+$('bSambung').onclick = sambung;
+$('bPutus').onclick = () => S.server?.disconnect();
+
+$('cArm').onclick = () => {
+  S.sesiId = crypto.getRandomValues(new Uint8Array(16));
+  $('aSesi').textContent = hex(S.sesiId, '').slice(0, 16) + '…';
+  kirim([OP.ARM, ...S.sesiId], 'ARM_SESI');
+  info('sesi di-ARM — sekarang tekan tombol BOOT di jam untuk menandai selesai makan');
+};
+$('cBatal').onclick = () => S.sesiId
+  ? kirim([OP.BATAL, ...S.sesiId], 'BATAL_SESI')
+  : salah('belum ada sesi yang di-ARM dari halaman ini');
+$('cUkur').onclick = () => {
+  if (!S.sesiId) return salah('UKUR butuh sesiId — tekan ARM sesi dulu');
+  const i = Math.max(0, Math.min(3, parseInt($('cIndex').value) || 0));
+  kirim([OP.UKUR, ...S.sesiId, i], `UKUR index ${i}`);
+};
+$('cUkurSekarang').onclick = () => kirim([OP.UKUR_SEKARANG], 'UKUR_SEKARANG');
+$('cSinkron').onclick = () => kirim([OP.SINKRON, 0], 'SINKRON');
+$('cAnchor').onclick = () => kirimAnchor();
+$('cKal').onclick = () => {
+  const s = parseInt($('cSis').value) || 0, d = parseInt($('cDia').value) || 0;
+  kirim([OP.KALIBRASI, ...u16(s & 0xffff), ...u16(d & 0xffff)],
+        `SET_KALIBRASI ${s >= 0 ? '+' : ''}${s}/${d >= 0 ? '+' : ''}${d} mmHg`);
+};
+
+$('bBersih').onclick = () => $('log').innerHTML = '';
+$('bSalin').onclick = () => {
+  const teks = [...$('log').children].map(tr =>
+    [...tr.children].map(td => td.innerText.replace(/\n/g, ' ')).join('\t')).join('\n');
+  navigator.clipboard.writeText(teks).then(() => info('log disalin ke papan klip'));
+};
+
+/* ---------------- pemeriksaan lingkungan ---------------- */
+(function periksa() {
+  let alasan = '';
+  if (!navigator.bluetooth) {
+    alasan = location.protocol === 'file:'
+      ? 'Halaman ini dibuka lewat <code>file://</code>. Web Bluetooth hanya jalan di konteks aman — ' +
+        'jalankan <code>python3 -m http.server 8000</code> di folder ini lalu buka ' +
+        '<code>http://localhost:8000</code>.'
+      : 'Peramban ini tidak mendukung Web Bluetooth. Pakai Chrome, Edge, atau Opera ' +
+        '(desktop atau Android). Firefox dan Safari belum mendukungnya sama sekali.';
+  } else if (!window.isSecureContext) {
+    alasan = 'Halaman ini bukan konteks aman. Pakai <code>https://</code> atau <code>http://localhost</code>.';
+  }
+  if (alasan) {
+    $('wajibHttps').hidden = false;
+    $('alasanHttps').innerHTML = ' ' + alasan;
+    $('bSambung').disabled = true;
+  }
+})();
+</script>
+</body>
+</html>

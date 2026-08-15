@@ -60,9 +60,51 @@ static volatile bool     s_siap_baru = false;
 #define ADV_LAMBAT    1600    /* 1000 ms */
 #define ADV_CEPAT_MS 60000UL
 
+/* ---- Iklan gesit selama masih ada entri yang belum sampai ke aplikasi ----
+ * Dokumen 3.2 menentukan 100 ms selama 60 detik lalu 1000 ms, dan itu benar
+ * untuk keadaan biasa: jam yang tidak memegang apa-apa tidak perlu berteriak.
+ * Tetapi keadaan yang paling penting justru kebalikannya -- pengukuran selesai
+ * saat HP tidak ada, hasilnya menunggu di buffer, dan pada saat itulah jam
+ * paling perlu mudah ditemukan. Dengan iklan 1000 ms, HP bisa perlu beberapa
+ * detik hanya untuk melihatnya.
+ *
+ * Karena itu selama masih ada entri tertunda, iklannya dikembalikan ke 100 ms.
+ * Ini TIDAK mengubah satu byte pun di kawat -- isi paket iklannya sama persis,
+ * yang berubah cuma seberapa sering ia dipancarkan.
+ *
+ * Dibatasi 10 menit sejak entri BARU terakhir masuk, bukan selama entrinya ada:
+ * jam yang ditinggal seharian dengan hasil yang tidak pernah diambil akan
+ * mengiklan 10x lebih sering sepanjang hari, dan itu baterai yang terbuang untuk
+ * HP yang memang tidak datang. Setiap entri baru menyalakan lagi jendela itu. */
+#define ADV_GESIT_MS (10UL * 60UL * 1000UL)
+
+/* Daya pancar. Bawaan controller +3 dBm; dinaikkan ke +9 dBm.
+ *
+ * Ini pengungkit tunggal terbesar untuk "BLE-nya kuat": +6 dB adalah empat kali
+ * lipat daya, kira-kira dua kali jarak di ruang bebas, dan yang lebih penting --
+ * margin terhadap tubuh pemakainya sendiri. Jam tangan dipakai di pergelangan,
+ * dan lengan serta badan menyerap 2,4 GHz dengan sangat efektif; sambungan yang
+ * baik saat jam di atas meja bisa putus-putus begitu tangannya diayunkan.
+ *
+ * TIDAK dinaikkan sampai +20 dBm yang sebenarnya didukung C6: arus pancarnya
+ * naik tajam sementara perbaikan jaraknya tinggal 2x lagi, dan pada baterai jam
+ * sekecil ini itu pertukaran yang buruk. Kalau jangkauannya masih kurang,
+ * ESP_PWR_LVL_P12 langkah berikutnya yang masuk akal. */
+#define AW_DAYA_PANCAR  ESP_PWR_LVL_P9
+
 static uint32_t s_adv_cepat_sampai = 0;
 static bool     s_adv_sedang_cepat = false;
 static volatile bool s_perlu_iklan_ulang = false;
+
+/* Jumlah entri yang belum di-ACK aplikasi, dititipkan aw_jam tiap putaran. */
+static uint8_t  s_tertunda      = 0;
+static uint32_t s_gesit_sampai  = 0;
+
+/* Kapan terakhir keaktifan iklan diperiksa -- lihat penjaga di aw_ble_putar(). */
+static uint32_t s_periksa_iklan_ms = 0;
+
+/* Diminta dari onConnect (task host NimBLE), dikerjakan di konteks loop. */
+static volatile bool s_perlu_param_cepat = false;
 
 /* ---------------- Paket Info (dokumen 4) ----------------
  * Disusun TEPAT saat dibaca supaya uptime_s-nya segar, dan WAJIB murni RAM:
@@ -94,7 +136,22 @@ class SrvCB : public BLEServerCallbacks {
     /* Belum boleh mengirim apa-apa: CCCD ditulis ulang tiap koneksi, jadi
      * langganan koneksi sebelumnya tidak berlaku (dokumen 11). */
     s_langganan_sampel = s_langganan_peristiwa = false;
-    Serial.printf("[ble] tersambung, handle=%u\n", (unsigned)s_conn_handle);
+    /* Parameter tautan dicetak apa adanya. Tanpa angka ini, koneksi yang terasa
+     * lambat tidak bisa dibedakan penyebabnya: interval yang longgar, radio yang
+     * direbut Wi-Fi, atau enkripsi yang mengulang. Satuan interval 1,25 ms,
+     * timeout 10 ms. */
+    Serial.printf("[ble] tersambung, handle=%u  itvl=%u (%.1f ms) latency=%u "
+                  "timeout=%u (%u ms)\n",
+                  (unsigned)s_conn_handle, (unsigned)desc->conn_itvl,
+                  desc->conn_itvl * 1.25f, (unsigned)desc->conn_latency,
+                  (unsigned)desc->supervision_timeout,
+                  (unsigned)desc->supervision_timeout * 10);
+    /* Minta tautan yang rapat SEKARANG, sebelum aplikasi mulai menelusuri GATT.
+     * Penemuan layanan, penulisan CCCD, dan pengurasan buffer semuanya berupa
+     * banyak perjalanan pulang-pergi kecil, dan lamanya ditentukan interval
+     * koneksi -- pada interval 500 ms, tiga puluh perjalanan sudah 15 detik.
+     * Dilonggarkan lagi setelah langganan lengkap; lihat aw_ble_atur_interval(). */
+    s_perlu_param_cepat = true;
   }
 
   void onDisconnect(BLEServer *srv, ble_gap_conn_desc *desc) override {
@@ -232,6 +289,14 @@ void aw_ble_begin(void) {
    * dipecah (dokumen 10 & 15). */
   BLEDevice::setMTU(185);
 
+  /* Daya pancar dinaikkan untuk ketiga peran sekaligus. Menyetel yang DEFAULT
+   * saja tidak cukup: pada controller ESP, iklan punya setelan dayanya sendiri,
+   * dan iklan justru bagian yang paling menentukan apakah HP bisa MENEMUKAN jam
+   * dari seberang ruangan. */
+  BLEDevice::setPower(AW_DAYA_PANCAR, ESP_BLE_PWR_TYPE_ADV);
+  BLEDevice::setPower(AW_DAYA_PANCAR, ESP_BLE_PWR_TYPE_SCAN);
+  BLEDevice::setPower(AW_DAYA_PANCAR, ESP_BLE_PWR_TYPE_DEFAULT);
+
   /* Bonding + LE Secure Connections + Just Works, persis dokumen 10.
    *
    * Catatan supaya tidak terlihat seperti salah ketik: MITM diminta true
@@ -302,13 +367,64 @@ void aw_ble_begin(void) {
 }
 
 /* ---------------- Putaran ---------------- */
+void aw_ble_tertunda(uint8_t n) {
+  /* Entri BARU (bukan sekadar "masih ada") yang menyalakan jendela gesit. Tanpa
+   * perbandingan ini, jendelanya tidak akan pernah diperbarui dan hasil yang
+   * lahir sepuluh menit setelah entri pertama akan menunggu di iklan lambat. */
+  static uint8_t lalu = 0;
+  if (n > lalu) s_gesit_sampai = millis() + ADV_GESIT_MS;
+  lalu = n;
+  s_tertunda = n;
+}
+
 void aw_ble_putar(void) {
+  /* Parameter cepat dipasang di konteks loop, bukan di dalam onConnect: aturan
+   * dokumen 13.1 melarang pekerjaan apa pun di task host NimBLE selain
+   * memindahkan byte, dan permintaan pembaruan parameter memicu prosedur GAP
+   * yang lebih baik tidak dijalankan dari dalam callback-nya sendiri. */
+  if (s_perlu_param_cepat) {
+    s_perlu_param_cepat = false;
+    if (s_terhubung && s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+      s_server->updateConnParams(s_conn_handle, 12, 24, 0, 600);
+      Serial.println("[ble] minta interval rapat (15-30 ms) untuk penelusuran GATT");
+    }
+  }
+
   if (s_perlu_iklan_ulang) {
     s_perlu_iklan_ulang = false;
     setel_iklan(true);          /* 60 detik cepat lagi setelah putus */
     return;
   }
-  if (s_adv_sedang_cepat && !s_terhubung &&
+  if (s_terhubung) return;
+
+  /* ---- Penjaga: pastikan iklannya BENAR-BENAR menyala ----
+   * setel_iklan() memanggil adv->start(), tetapi tidak ada yang menjamin
+   * panggilan itu berhasil -- dan kalau ia gagal (mis. bentrok dengan operasi
+   * GAP lain tepat saat koneksi putus), jam menjadi tidak terlihat SELAMANYA
+   * tanpa satu pun gejala di layar. Itu kegagalan yang paling mahal di sini:
+   * hasil pengukuran menumpuk di buffer sementara HP tidak pernah bisa
+   * menemukan jamnya lagi, dan satu-satunya pemulihannya reboot.
+   *
+   * ble_gap_adv_active() menanyakan langsung ke stack, bukan ke bendera kita
+   * sendiri, jadi ia juga menangkap kasus iklan yang dimatikan dari dalam. */
+  if ((uint32_t)(millis() - s_periksa_iklan_ms) >= 5000) {
+    s_periksa_iklan_ms = millis();
+    if (!ble_gap_adv_active()) {
+      Serial.println("[ble] iklan tidak aktif padahal tidak tersambung -- dinyalakan ulang");
+      setel_iklan(s_adv_sedang_cepat);
+      return;
+    }
+  }
+
+  bool gesit = (s_tertunda > 0) && ((int32_t)(millis() - s_gesit_sampai) < 0);
+
+  if (gesit && !s_adv_sedang_cepat) {
+    Serial.printf("[ble] %u entri menunggu -- iklan dipercepat lagi\n",
+                  (unsigned)s_tertunda);
+    setel_iklan(true);
+    return;
+  }
+  if (!gesit && s_adv_sedang_cepat &&
       (int32_t)(millis() - s_adv_cepat_sampai) >= 0) {
     setel_iklan(false);
   }
@@ -362,12 +478,48 @@ bool aw_ble_ambil_flag_siap_baru(void) {
   return f;
 }
 
-void aw_ble_atur_interval(bool sesi_berjalan) {
+void aw_ble_atur_interval(bool sibuk) {
   if (!s_terhubung || s_conn_handle == BLE_HS_CONN_HANDLE_NONE) return;
-  /* Satuan 1,25 ms. Rapat saat sesi berjalan supaya sampel sampai tanpa
-   * tertahan; longgar saat idle supaya radio tidak menguras baterai. */
-  if (sesi_berjalan) s_server->updateConnParams(s_conn_handle,  24,  40, 0, 400);
-  else               s_server->updateConnParams(s_conn_handle, 160, 400, 0, 400);
+  /* Satuan interval 1,25 ms; satuan supervision timeout 10 ms. Rapat saat sesi
+   * berjalan supaya sampel sampai tanpa tertahan; longgar saat idle supaya radio
+   * tidak menguras baterai.
+   *
+   * Timeout dinaikkan dari 4 detik ke 6 detik di kedua keadaan. Timeout adalah
+   * berapa lama tautan boleh sunyi sebelum dianggap putus, dan 4 detik terlalu
+   * pendek untuk barang yang dipakai di pergelangan tangan: satu ayunan lengan
+   * yang menaruh badan pemakainya tepat di antara jam dan HP sudah bisa menelan
+   * beberapa detik paket. Putus di situ bukan cuma "menyambung lagi" -- CCCD
+   * ikut hilang, aplikasi harus berlangganan ulang, dan seluruh buffer diantre
+   * ulang. Dua detik tambahan jauh lebih murah daripada itu.
+   *
+   * Tidak dinaikkan lebih jauh karena timeout juga menentukan berapa lama jam
+   * merasa "masih tersambung" padahal HP-nya sudah pergi -- selama itu ia tidak
+   * mengiklan, dan tidak bisa ditemukan siapa pun. */
+  /* Keadaan idle memakai INTERVAL YANG SAMA rapatnya, dan menghemat lewat slave
+   * latency 20 -- bukan lewat interval yang dilonggarkan.
+   *
+   * Hasilnya sama untuk baterai: jam boleh melewatkan 20 selang berturut-turut,
+   * jadi radionya tetap bangun sekitar sekali per 600 ms, persis seperti
+   * interval 500 ms yang dipakai sebelumnya. Bedanya ada di dua hal yang justru
+   * paling terasa:
+   *
+   *   1. Begitu jam PUNYA sesuatu untuk dikirim, ia boleh bangun di selang
+   *      berikutnya -- 30 ms, bukan menunggu 500 ms. Latency adalah izin
+   *      melewatkan, bukan kewajiban.
+   *   2. Pusat menyimpan parameter terakhir yang diminta perangkat dan
+   *      memakainya untuk koneksi BERIKUTNYA. Dengan interval longgar, setiap
+   *      penyambungan ulang dimulai pada 495 ms, dan seluruh penelusuran GATT --
+   *      puluhan perjalanan pulang-pergi -- berjalan pada kecepatan itu.
+   *      Terukur langsung: 13-17 detik untuk menyambung, dan 3 detik hanya untuk
+   *      membaca satu karakteristik. Dengan interval rapat + latency, angka yang
+   *      sama turun ke sekitar 1 detik.
+   *
+   * Supervision timeout 6 detik tetap aman: syaratnya harus lebih besar dari
+   * (1 + latency) x interval maks x 2 = 21 x 50 ms x 2 = 2,1 detik. */
+  if (sibuk) s_server->updateConnParams(s_conn_handle, 24, 40,  0, 600);
+  else       s_server->updateConnParams(s_conn_handle, 24, 40, 20, 600);
+  Serial.printf("[ble] interval diminta: 30-50 ms latency=%s\n",
+                sibuk ? "0 (ada pekerjaan)" : "20 (idle, hemat daya)");
 }
 
 const uint8_t *aw_ble_serial(void) { return s_serial; }
