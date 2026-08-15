@@ -436,6 +436,195 @@ static lv_obj_t *mk_kartu(lv_obj_t *scr, int x, int y, const lv_img_dsc_t *ikon,
   return k;
 }
 
+/* ================= Garis kemajuan di TEPI LAYAR =================
+ * Garis hijau bercahaya yang merayap mengelilingi tepi layar selama pengukuran.
+ * Perannya sama dengan lingkaran loading -- memperlihatkan bahwa sesuatu sedang
+ * berjalan dan seberapa jauh -- hanya saja jalurnya persegi bersudut tumpul
+ * mengikuti bentuk layar, sehingga tidak memakan satu piksel pun dari empat
+ * kartu di tengah. Itu syarat yang tidak bisa ditawar di sini: wajah ini sudah
+ * penuh, dan justru selama mengukur keempat kartu itu yang paling ingin dilihat.
+ *
+ * JALURNYA dimulai di TENGAH TEPI ATAS lalu searah jarum jam, sama seperti
+ * lingkaran loading yang mulai di angka 12. Karena itu tepi atas terbagi dua
+ * potong: setengah kanan tumbuh paling awal, setengah kiri menutup paling akhir.
+ * Garis hanya bertemu titik awalnya saat kemajuan 100 -- dan tidak pernah
+ * mundur; lihat jam_ukur_persen() di aw_jam.cpp untuk jaminan monotonnya.
+ *
+ * BENTUKNYA sembilan potong: lima ruas lurus dan empat sudut melengkung
+ * berjari-jari TEPI_R. Ruas lurus adalah kotak tipis; sudutnya lv_arc seperempat
+ * lingkaran yang nilainya bisa diisi sebagian, jadi kepala garis bergerak mulus
+ * melewati tikungan alih-alih melompat dari satu sisi ke sisi berikutnya.
+ *
+ * Kenapa objek, bukan canvas: canvas seukuran layar butuh 240x280x2 = 134 KB,
+ * sementara seluruh heap LVGL di board ini 48 KB. Sembilan potong yang cuma
+ * diubah posisi, ukuran, dan nilainya tidak meminta memori tambahan sama sekali.
+ *
+ * CAHAYANYA dari lapisan kedua, bukan dari shadow. Shadow LVGL hanya mengikuti
+ * kotak latar sebuah objek, jadi ia tidak bisa melengkung mengikuti sudut --
+ * pada tikungan cahayanya akan terlihat sebagai kotak. Dua lapisan garis yang
+ * berbagi satu sumbu (yang bawah lebih tebal dan tembus pandang) melengkung
+ * dengan benar di seluruh jalur, dan digambar dengan cara yang sama persis. */
+#define TEPI_INSET     4     /* jarak sumbu garis dari tepi layar */
+#define TEPI_R        24     /* jari-jari sudut                   */
+#define TEPI_LEBAR     3     /* tebal garis                       */
+#define TEPI_HALO      9     /* tebal lapisan cahaya di bawahnya  */
+
+/* Jenis potong. Sudut butuh lv_arc karena hanya arc yang bisa diisi sebagian
+ * sambil tetap melengkung; ruas lurus cukup kotak. */
+typedef enum { TP_DATAR, TP_TEGAK, TP_SUDUT } tepi_jenis_t;
+
+typedef struct {
+  tepi_jenis_t jenis;
+  int panjang;     /* piksel sepanjang jalur                                  */
+  int p1, p2;      /* DATAR: y sumbu, x mulai; TEGAK: x sumbu, y mulai;
+                      SUDUT: cx, cy                                           */
+  int p3;          /* DATAR/TEGAK: arah tumbuh +1/-1; SUDUT: sudut mulai (deg) */
+} tepi_potong_t;
+
+/* Panjang busur seperempat lingkaran: (pi/2) * 24 = 37,7 -> 38. Dibulatkan
+ * sekali di sini supaya total jalur dan pembagian per potong memakai angka yang
+ * sama; kalau tidak, sisa pembulatan akan menumpuk di potong terakhir dan garis
+ * "menutup" beberapa piksel sebelum 100%. */
+#define TEPI_BUSUR  38
+
+/* Titik-titik sumbu jalur. Ditulis apa adanya, bukan lewat rumus, supaya mudah
+ * dicocokkan dengan gambar desain. */
+#define TEPI_X0  TEPI_INSET                         /*   4 */
+#define TEPI_X1  (SCREEN_W - TEPI_INSET)            /* 236 */
+#define TEPI_Y0  TEPI_INSET                         /*   4 */
+#define TEPI_Y1  (SCREEN_H - TEPI_INSET)            /* 276 */
+#define TEPI_XK  (TEPI_X0 + TEPI_R)                 /*  28, akhir tikungan kiri  */
+#define TEPI_XN  (TEPI_X1 - TEPI_R)                 /* 212, awal tikungan kanan  */
+#define TEPI_YA  (TEPI_Y0 + TEPI_R)                 /*  28 */
+#define TEPI_YB  (TEPI_Y1 - TEPI_R)                 /* 252 */
+#define TEPI_XT  (SCREEN_W / 2)                     /* 120, titik awal & akhir   */
+
+static const tepi_potong_t TEPI[9] = {
+  { TP_DATAR, TEPI_XN - TEPI_XT, TEPI_Y0, TEPI_XT, +1 },  /* atas, ke kanan   */
+  { TP_SUDUT, TEPI_BUSUR,        TEPI_XN, TEPI_YA, 270 }, /* sudut kanan atas */
+  { TP_TEGAK, TEPI_YB - TEPI_YA, TEPI_X1, TEPI_YA, +1 },  /* kanan, turun     */
+  { TP_SUDUT, TEPI_BUSUR,        TEPI_XN, TEPI_YB,   0 }, /* sudut kanan bawah*/
+  { TP_DATAR, TEPI_XN - TEPI_XK, TEPI_Y1, TEPI_XN, -1 },  /* bawah, ke kiri   */
+  { TP_SUDUT, TEPI_BUSUR,        TEPI_XK, TEPI_YB,  90 }, /* sudut kiri bawah */
+  { TP_TEGAK, TEPI_YB - TEPI_YA, TEPI_X0, TEPI_YB, -1 },  /* kiri, naik       */
+  { TP_SUDUT, TEPI_BUSUR,        TEPI_XK, TEPI_YA, 180 }, /* sudut kiri atas  */
+  { TP_DATAR, TEPI_XT - TEPI_XK, TEPI_Y0, TEPI_XK, +1 },  /* atas, menutup    */
+};
+
+/* Dua lapisan: [0] halo yang lebar dan tembus pandang, [1] garis yang tegas. */
+static lv_obj_t *tepi_obj[2][9];
+
+static lv_obj_t *mk_tepi_lurus(lv_obj_t *scr, uint8_t lebar, lv_opa_t opa) {
+  lv_obj_t *o = mk_box(scr, 0, 0, 1, 1, C_ISI, lebar / 2);
+  lv_obj_set_style_bg_opa(o, opa, 0);
+  lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+  return o;
+}
+
+static lv_obj_t *mk_tepi_sudut(lv_obj_t *scr, uint8_t lebar, lv_opa_t opa,
+                               int sudut_mulai) {
+  int d = TEPI_R * 2 + lebar;
+  lv_obj_t *a = lv_arc_create(scr);
+  lv_obj_remove_style(a, NULL, LV_PART_KNOB);
+  lv_obj_clear_flag(a, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_size(a, d, d);
+  lv_arc_set_rotation(a, 0);
+  lv_arc_set_bg_angles(a, sudut_mulai, sudut_mulai + 90);
+  lv_arc_set_range(a, 0, 1000);
+  lv_arc_set_value(a, 0);
+  /* Busur latar dimatikan: yang menggambar "belum tercapai" bukan tugas potong
+   * ini -- di jalur lurus tidak ada padanannya, dan setengah jalur yang punya
+   * jejak sementara setengahnya tidak akan terlihat seperti cacat gambar. */
+  lv_obj_set_style_arc_opa(a, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_style_arc_width(a, lebar, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_color(a, lv_color_hex(C_ISI), LV_PART_INDICATOR);
+  lv_obj_set_style_arc_opa(a, opa, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_rounded(a, true, LV_PART_INDICATOR);
+  lv_obj_add_flag(a, LV_OBJ_FLAG_HIDDEN);
+  return a;
+}
+
+static void build_tepi(lv_obj_t *scr) {
+  static const uint8_t LEBAR[2] = { TEPI_HALO, TEPI_LEBAR };
+  static const lv_opa_t OPA[2]  = { LV_OPA_30,  LV_OPA_COVER };
+
+  for (int lap = 0; lap < 2; lap++) {
+    for (int i = 0; i < 9; i++) {
+      tepi_obj[lap][i] = (TEPI[i].jenis == TP_SUDUT)
+        ? mk_tepi_sudut(scr, LEBAR[lap], OPA[lap], TEPI[i].p3)
+        : mk_tepi_lurus(scr, LEBAR[lap], OPA[lap]);
+    }
+  }
+}
+
+/* Gambar potong ke-i sepanjang `panjang` piksel pada lapisan dengan tebal
+ * `lebar`. Sumbu jalurnya sama untuk kedua lapisan -- yang berbeda cuma tebal,
+ * jadi halo selalu berpusat tepat di bawah garisnya.
+ *
+ * Potongnya ditunjuk INDEKS, bukan pointer ke tepi_potong_t, dan itu bukan
+ * selera: berkas .ino disisipi prototipe otomatis di bagian atas berkas, di atas
+ * typedef ini, sehingga parameter bertipe tepi_potong_t gagal dikompilasi dengan
+ * "does not name a type". Indeks int menghindari seluruh persoalan itu. */
+static void tepi_potong_gambar(lv_obj_t *o, int i, int panjang, int lebar) {
+  const tepi_potong_t *t = &TEPI[i];
+  if (panjang <= 0) {
+    lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+    return;
+  }
+  lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
+
+  switch (t->jenis) {
+    case TP_DATAR: {
+      int x = (t->p3 > 0) ? t->p2 : (t->p2 - panjang);
+      lv_obj_set_pos(o, x, t->p1 - lebar / 2);
+      lv_obj_set_size(o, panjang, lebar);
+      break;
+    }
+    case TP_TEGAK: {
+      int y = (t->p3 > 0) ? t->p2 : (t->p2 - panjang);
+      lv_obj_set_pos(o, t->p1 - lebar / 2, y);
+      lv_obj_set_size(o, lebar, panjang);
+      break;
+    }
+    default: {   /* TP_SUDUT */
+      int d = TEPI_R * 2 + lebar;
+      lv_obj_set_pos(o, t->p1 - d / 2, t->p2 - d / 2);
+      lv_arc_set_value(o, (int32_t)((long)panjang * 1000 / t->panjang));
+      break;
+    }
+  }
+}
+
+/* Panjang seluruh jalur. Dijumlah dari tabel, bukan dari keliling layar:
+ * sudut yang melengkung memotong jalurnya, jadi keliling persegi akan terlalu
+ * panjang dan garis tidak akan pernah benar-benar menutup di 100%. */
+static int tepi_total(void) {
+  static int total = 0;
+  if (!total) for (int i = 0; i < 9; i++) total += TEPI[i].panjang;
+  return total;
+}
+
+/* persen 0 menyembunyikan seluruh garis. Keluar lebih awal kalau angkanya tidak
+ * berubah: mengubah posisi/ukuran objek LVGL meng-invalidate areanya, dan di
+ * sini area itu melingkari seluruh tepi layar. */
+static void tepi_set(int persen) {
+  static int persen_lalu = -1;
+  if (persen == persen_lalu) return;
+  persen_lalu = persen;
+
+  static const int LEBAR[2] = { TEPI_HALO, TEPI_LEBAR };
+
+  for (int lap = 0; lap < 2; lap++) {
+    long sisa = (long)tepi_total() * persen / 100;
+    for (int i = 0; i < 9; i++) {
+      int panjang = (sisa >= TEPI[i].panjang) ? TEPI[i].panjang
+                                              : (sisa > 0 ? (int)sisa : 0);
+      sisa -= panjang;
+      tepi_potong_gambar(tepi_obj[lap][i], i, panjang, LEBAR[lap]);
+    }
+  }
+}
+
 /* Satu cincin kemajuan.
  *
  * Knob-nya dilepas dan flag klik dimatikan: lv_arc bawaan LVGL adalah kendali
@@ -554,6 +743,10 @@ static void build_wajah(void) {
            &lv_font_montserrat_30, &lbl_gl, &sat_gl);
   mk_kartu(scr_wajah, KARTU_X2, KARTU_Y2, &ic_tekanan, "TEKANAN", NULL,
            &lv_font_montserrat_26, &lbl_bp, NULL);
+
+  /* Paling akhir supaya pita tepi berada DI ATAS segalanya: cahayanya memang
+   * dimaksudkan jatuh menimpa apa pun yang kebetulan ada di dekat tepi. */
+  build_tepi(scr_wajah);
 }
 
 /* ================= Pembaruan isi ================= */
@@ -733,6 +926,11 @@ static void refresh_cb(lv_timer_t *tm) {
   }
 
   status_baris();
+
+  /* ---- pita kemajuan di tepi layar ----
+   * Hanya hidup selama pengukuran; di luar itu tepi layar harus bersih supaya
+   * wajah jam kembali seperti desainnya. */
+  tepi_set(jam_sedang_mengukur() ? (int)jam_ukur_persen() : 0);
 
   /* ---- panggilan pengukuran membangunkan layar ----
    * Hanya pada TRANSISI menjadi jatuh tempo, bukan selama ia menunggu: kalau

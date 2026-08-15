@@ -94,6 +94,13 @@ uint16_t jam_ukur_detik(void);         /* lama pengukuran berjalan              
 uint16_t jam_ukur_detak(void);
 uint16_t jam_ukur_detak_perlu(void);
 
+/* Kemajuan pengukuran 0..100, diambil dari syarat yang paling tertinggal
+ * (detak, waktu minimum, kelengkapan metrik). Tidak pernah mundur selama satu
+ * pengukuran, dan hanya mencapai 100 saat pengukurannya benar-benar tuntas --
+ * itulah yang membuatnya bisa dipakai sebagai cincin tepi layar yang tidak boleh
+ * bertemu titik awalnya sebelum selesai. 0 kalau tidak sedang mengukur. */
+uint8_t jam_ukur_persen(void);
+
 /* Perkiraan sisa waktu pengukuran dalam detik, dihitung ulang dari laju detak
  * yang sebenarnya terjadi -- memendek saat nadi mudah ditemukan, memanjang saat
  * susah. 0 kalau tidak sedang mengukur. Ini PERKIRAAN, bukan hitung mundur:

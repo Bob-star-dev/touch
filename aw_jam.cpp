@@ -953,6 +953,39 @@ void jam_snapshot(ppg_data_t *out) {
  * memanjang di tengah jalan terasa jauh lebih buruk daripada yang memendek. */
 #define UKUR_TEBAKAN_AWAL_MS  30000UL
 
+/* Kemajuan pengukuran, 0..100.
+ *
+ * Diambil dari gerbang yang PALING TERTINGGAL, bukan dari waktu berjalan: sebuah
+ * pengukuran selesai kalau detaknya cukup DAN sudah berjalan cukup lama DAN
+ * keempat metriknya ada, jadi kemajuan yang jujur adalah yang paling kecil di
+ * antara syarat-syarat itu. Cincin yang penuh sementara satu syarat belum
+ * terpenuhi akan berbohong tepat pada detik yang paling diperhatikan pengguna.
+ *
+ * Ketiganya hanya bisa naik selama satu pengukuran (detak mencacah, waktu
+ * berjalan, akumulator tidak pernah dikosongkan di tengah jalan), jadi angkanya
+ * tidak pernah mundur -- syarat mutlak bagi cincin yang tidak boleh bertemu
+ * titik awalnya lagi sebelum benar-benar selesai.
+ *
+ * Kelengkapan metrik sengaja tidak dipakai sebagai suku ketiga yang setara:
+ * keempatnya lahir bersamaan dari satu window (lihat accumulate_spo2 di
+ * ppg.cpp), jadi ia melompat 0 -> penuh dan akan membuat cincin diam di nol
+ * selama detik-detik pertama. Ia dipakai sebagai penahan di ujung: 95% adalah
+ * batas selama masih ada metrik yang belum pernah lolos gerbang kirim. */
+uint8_t jam_ukur_persen(void) {
+  if (!s_ukur_aktif) return 0;
+
+  uint32_t jalan = (uint32_t)(millis() - s_ukur_mulai_ms);
+  float f_detak = (float)s_ukur_detak / (float)UKUR_MIN_DETAK;
+  float f_waktu = (float)jalan / (float)UKUR_MIN_MS;
+  float f = f_detak < f_waktu ? f_detak : f_waktu;
+  if (f > 1.0f) f = 1.0f;
+
+  bool punya_semua = s_acc_bpm && s_acc_spo2 && s_acc_gula && s_acc_sis;
+  if (!punya_semua && f > 0.95f) f = 0.95f;
+
+  return (uint8_t)(f * 100.0f + 0.5f);
+}
+
 uint16_t jam_ukur_sisa_detik(void) {
   if (!s_ukur_aktif) return 0;
 
