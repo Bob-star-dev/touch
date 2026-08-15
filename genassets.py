@@ -23,6 +23,23 @@ ASSETS = [
     # hati jatuh persis di pusat aset.
     ("img_heart_lg", "3.png", (80, 150, 122, 190), (21, 20)),
     ("img_diamond",  "1baru.png", (230, 358, 250, 378), (10, 10)),
+
+    # --- Ikon kartu wajah jam baru ---
+    # Diambil 1:1 dari wajah_jam_modular_240x280.png, yang memang sudah dibuat
+    # pada ukuran layar sebenarnya -- jadi tidak ada penskalaan sama sekali dan
+    # ikonnya setajam di desain. Kotak 16x18 dipakai untuk KEEMPATNYA walau
+    # ikonnya sendiri berbeda ukuran (hati 12x11, tetes 10x12, segi enam 12x14,
+    # meteran 16x13): dengan kotak seragam, keempat kartu memakai koordinat
+    # tempel yang sama dan perbedaan ukuran ikon tidak bocor ke tata letak.
+    #
+    # Aset LVGL ini TRUE_COLOR tanpa alpha, jadi latar yang ikut terpotong
+    # menjadi bagian gambar. Itu justru yang diinginkan di sini: latarnya persis
+    # warna kartu (#171A21), dan kartu di layar memakai warna yang sama, jadi
+    # potongannya melebur tanpa kotak yang terlihat.
+    ("ic_detak",   "wajah_jam_modular_240x280.png", (20, 110, 36, 128), (16, 18)),
+    ("ic_spo2",    "wajah_jam_modular_240x280.png", (134, 110, 150, 128), (16, 18)),
+    ("ic_glukosa", "wajah_jam_modular_240x280.png", (20, 200, 36, 218), (16, 18)),
+    ("ic_tekanan", "wajah_jam_modular_240x280.png", (134, 200, 150, 218), (16, 18)),
 ]
 
 

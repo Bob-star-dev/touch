@@ -1,32 +1,43 @@
 /*
- * LVGL 8.3 UI -- 5 halaman sesuai mockup 1baru.png + 2..5.png
- * (1baru.png menggantikan 1.png; satu-satunya perbedaan: label "BATERAI" hilang)
+ * AsaWatch -- wajah jam SATU HALAMAN, LVGL 8.3
  * Board : Waveshare ESP32-C6-Touch-LCD-1.69  (240x280, ST7789V2 + CST816T)
+ *
+ * Acuan piksel: wajah_jam_modular_240x280.png, dibuat pada ukuran layar
+ * sebenarnya -- jadi setiap koordinat di berkas ini diukur langsung dari
+ * gambar itu, bukan dari mockup 2x yang dibagi dua seperti versi sebelumnya.
+ *
+ * KENAPA SATU HALAMAN
+ * Versi lama punya 7 layar dan sebuah menu. Itu masuk akal selama ada layar
+ * sentuh. Pada board ini sentuhannya tidak berfungsi (CST816T tidak menjawab
+ * di I2C sama sekali), dan menavigasi 7 layar lewat satu tombol BOOT berarti
+ * pengguna harus menekan berkali-kali hanya untuk melihat satu angka. Jadi
+ * seluruh informasi dipadatkan ke satu wajah yang tidak perlu dinavigasi:
+ * empat kartu metrik terlihat bersamaan, dan tidak ada lagi yang tersembunyi.
+ *
+ * Sisi aplikasilah yang kini memegang kendali (BLE), sesuai keputusan pemilik
+ * perangkat. Jam menjadi sensor + buffer + penampil.
+ *
+ * SATU TOMBOL YANG TETAP HARUS ADA
+ * Dokumen protokol bagian 3 menyatakan: "Jam adalah satu-satunya sumber t0.
+ * Aplikasi tidak punya tombol yang setara, dan tidak boleh menghitung t0 dari
+ * waktu pesan tiba." Karena itu menghapus SEMUA kendali dari jam akan memutus
+ * jaminan inti protokolnya -- sesi tidak akan pernah bisa dimulai. Perannya
+ * dipindah ke tekan-lama tombol BOOT, yang tidak memakan tempat di layar.
+ * Lihat boot_poll().
+ *
+ * YANG HILANG DIBANDING VERSI 7 LAYAR, dan itu memang konsekuensi desain ini:
+ * cuaca, ikon Bluetooth, pil status sesi, grafik riwayat, chip statistik, dan
+ * layar "sedang mengukur". Yang paling penting di antaranya -- status sesi dan
+ * kemajuan pengukuran -- tidak dibuang begitu saja: keduanya pindah ke baris
+ * tanggal, yang berubah peran menjadi baris status saat ada sesuatu yang
+ * sedang terjadi. Lihat status_baris().
  *
  * Libraries : lvgl 8.3.x, GFX Library for Arduino, SensorLib
  * lv_conf.h : /home/harjo/Arduino/libraries/lv_conf.h  (LV_TICK_CUSTOM=1, 16bpp)
  *
- * Halaman :
- *   1 Home     - ilustrasi, tombol daya sensor, jam + tanggal, header cuaca &
- *                baterai. Tombol daya ON menyalakan MAX30105 sekaligus membuka
- *                menu; OFF mematikan LED-nya dan tetap di halaman ini.
- *   2 Menu     - 4 kartu: Heart rate / SpO2 / Glukosa / Tekanan darah
- *   3 Detail   - Heart rate     : arc, EKG, bar 12 jam, chip statistik
- *   4 Detail   - SpO2           : ring, legend zona, grafik riwayat
- *   5 Detail   - Glukosa        : angka besar, bar rentang, tren harian
- *   6 Detail   - Tekanan darah  : angka sistol/diastol, bar zona, tren harian
- *
- * Halaman 6 tidak punya acuan mockup (fitur ditambahkan belakangan) --
- * geometrinya mengikuti pola halaman 5, bukan piksel dari gambar manapun.
- * Sisanya: geometri & warna diambil langsung dari mockup 480x560 (tepat 2x
- * layar), jadi semua koordinat di bawah = koordinat mockup / 2.
- *
- * Aset gambar (pesawat+bulan, ikon) ada di ui_assets.h, dibuat otomatis dari
- * mockup. Jalankan genassets.py kalau mockup berubah.
- *
  * Modul data (semua akses I2C ada di konteks loop, lihat net.h soal thread):
  *   rtc / time_manager  - PCF85063 + sinkronisasi NTP
- *   net / weather       - Wi-Fi, NTP, OpenWeatherMap
+ *   net                 - Wi-Fi + NTP
  *   battery             - ADC1 + kurva Li-Po
  *   ppg                 - MAX30105/30102: BPM, SpO2, glukosa, tekanan darah
  *                         EKSPERIMENTAL
@@ -49,50 +60,18 @@
 #include "config.h"
 #include "rtc.h"
 #include "time_manager.h"
-#include "weather.h"
 #include "net.h"
 #include "battery.h"
 #include "ppg.h"
 #include "aw_jam.h"
 
-/* Subset digit-only dari montserrat_46/48 (cuma glyph 0-9 dan '-'), dipakai di
- * layar jam & glukosa yang tidak pernah menampilkan huruf. Font bawaan LVGL di
- * ukuran itu ikut membawa seluruh ASCII + ikon FontAwesome (~90 KB/font) yang
- * tak pernah dirender di sini; lihat font_digits_46.c / font_digits_48.c. */
+/* Subset digit-only dari montserrat_48 (cuma glyph '-' '.' '/' dan 0-9),
+ * dipakai untuk jam besar. Font bawaan LVGL di ukuran itu ikut membawa seluruh
+ * ASCII + ikon FontAwesome (~90 KB) yang tak pernah dirender di sini.
+ * font_digits_46 tetap ada di direktori sketsa tapi tidak lagi dipakai. */
 extern "C" {
-LV_FONT_DECLARE(font_digits_46)
 LV_FONT_DECLARE(font_digits_48)
 }
-
-/* Tujuan navigasi satu tombol/kartu. Definisinya harus di sini, di atas fungsi
- * pertama: Arduino menyuntikkan prototipe otomatis tepat sebelum definisi fungsi
- * pertama, jadi tipe yang dipakai di parameter harus sudah dikenal sebelum itu. */
-typedef struct {
-  lv_obj_t  **target;   /* alamat handle layar (layarnya dibuat belakangan) */
-  bool        forward;  /* arah animasi: true = slide ke kiri */
-  const char *name;     /* untuk log serial */
-} nav_target_t;
-
-/* Sasaran yang bisa disorot tombol BOOT. Ada di sini karena alasan yang sama
- * dengan nav_target_t di atas, dan ini bukan teori: menaruhnya di dekat
- * pemakaiannya membuat kompilasi gagal dengan "'fokus_layar_t' does not name a
- * type" pada prototipe yang tidak pernah ditulis siapa pun. Penjelasan
- * lengkapnya menyertai kodenya, di bawah daftar NAV_*. */
-#define FOKUS_MAKS_LAYAR  8
-#define FOKUS_MAKS_ITEM   6
-
-typedef struct {
-  lv_obj_t           *obj;
-  const nav_target_t *nav;    /* NULL = tombol utama halaman home */
-  bool                balik;  /* tombol back di header */
-} fokus_item_t;
-
-typedef struct {
-  lv_obj_t     *layar;
-  fokus_item_t  item[FOKUS_MAKS_ITEM];
-  uint8_t       n;
-  uint8_t       i;            /* sasaran yang sedang disorot */
-} fokus_layar_t;
 
 /* ---------------- Pin map ESP32-C6-Touch-LCD-1.69 ---------------- */
 #define LCD_SCK    1
@@ -118,26 +97,19 @@ typedef struct {
  * harus menahan pin ini HIGH -- itulah "latch"-nya. Tanpa itu board mati
  * seketika saat tombol dilepas, dan gejalanya persis seperti board rusak.
  *
- * Kenapa baru sekarang perlu: memberi daya lewat pin 3V3/5V menyuap rail
- * SETELAH gerbang ini, jadi latch-nya tidak pernah relevan. Begitu daya masuk
- * lewat soket baterai MX1.25 resmi, seluruh arus lewat gerbang ini.
- *
  * PWR_KEY aktif LOW (ditekan = 0). Ia juga dibawa keluar ke header board, jadi
  * jangan pakai pad GPIO18 untuk hal lain -- ia berbagi jalur dengan tombol. */
 #define BAT_EN    15
 #define PWR_KEY   18
 
-/* ---- Tombol BOOT: kendali pengganti layar sentuh ----
+/* ---- Tombol BOOT: satu-satunya kendali yang tersisa ----
  * Nomor pin dari contoh Arduino resmi Waveshare 02_button_example.ino untuk
  * board ini, yang menamainya "BOOT Button" dan memakai OneButton(pin, true) --
  * artinya aktif LOW, sama seperti PWR_KEY.
  *
  * Ini juga strapping pin: DITAHAN SAAT RESET, chip masuk mode download alih-alih
  * menjalankan sketch. Saat runtime itu tidak berlaku, jadi aman dibaca di
- * loop() -- tapi ia sebabnya boot_poll() memakai trik "arming" yang sama dengan
- * pwr_poll(): tombol harus terlihat dilepas sekali sebelum tekanan pertama
- * dihitung, supaya jari yang masih menempel setelah flash tidak langsung
- * menggeser fokus. */
+ * loop(). */
 #define BOOT_KEY   9
 
 #define SCREEN_W 240
@@ -164,18 +136,17 @@ static lv_indev_drv_t indev_drv;
 static int16_t last_touch_x = 0, last_touch_y = 0;
 
 /* ---------------- Touch: dibaca saat IRQ ----------------
- * CST816T di board ini mengosongkan byte finger-count hampir seketika setelah
- * IRQ, jadi polling bebas hampir selalu melewatkannya (terukur: 621 IRQ tapi
- * hanya 20 hit dari 1372 polling). Data dibaca tepat saat IRQ, lalu status
- * "ditekan" dipertahankan sampai event lift-up atau timeout supaya drag mulus.
- */
+ * Dipertahankan utuh walau board ini tidak punya sentuh yang berfungsi, supaya
+ * satu firmware yang sama tetap jalan di board yang sentuhannya baik. Wajah
+ * satu halaman ini memang tidak punya sasaran sentuh apa pun -- tidak ada yang
+ * bisa diketuk -- jadi jalur ini kini murni tidak berefek, bukan alternatif
+ * kendali.
+ *
+ * CST816T di board yang sehat mengosongkan byte finger-count hampir seketika
+ * setelah IRQ, jadi polling bebas hampir selalu melewatkannya. Data dibaca
+ * tepat saat IRQ. */
 #define TOUCH_ADDR      0x15
-#define TOUCH_HOLD_MS   180   /* jaring pengaman kalau event lift-up terlewat */
-
-/* LVGL membaca indev tiap LV_INDEV_DEF_READ_PERIOD (30 ms). Ketukan cepat bisa
- * naik-turun seluruhnya di antara dua polling sehingga LVGL tidak pernah melihat
- * press-nya sama sekali -- ketukan hilang tanpa jejak. Karena itu setiap press
- * ditahan minimal 60 ms (>= 2 siklus polling) sebelum lift-up dieksekusi. */
+#define TOUCH_HOLD_MS   180
 #define TOUCH_MIN_MS    60
 
 static volatile bool touch_irq_flag = false;
@@ -215,14 +186,11 @@ static void touch_poll(void) {
       uint16_t y = ((b[5] & 0x0F) << 8) | b[6];
 
       if (evt == 1) {
-        touch_release_pending = true;              /* jari diangkat, tahan dulu */
+        touch_release_pending = true;
       } else if ((fingers > 0 || evt == 2) && x < SCREEN_W && y < SCREEN_H) {
         last_touch_x = x;
         last_touch_y = y;
-        if (!touch_down) {
-          touch_press_ms = millis();
-          Serial.printf("[touch] press (%d,%d)\n", x, y);
-        }
+        if (!touch_down) touch_press_ms = millis();
         touch_down = true;
         touch_release_pending = false;
         touch_last_ms = millis();
@@ -233,12 +201,11 @@ static void touch_poll(void) {
 
   if (touch_down) {
     uint32_t now = millis();
-    /* lift-up hanya dieksekusi setelah press terlihat >= TOUCH_MIN_MS */
     if (touch_release_pending && (now - touch_press_ms) >= TOUCH_MIN_MS) {
       touch_down = false;
       touch_release_pending = false;
     } else if ((now - touch_last_ms) > TOUCH_HOLD_MS) {
-      touch_down = false;                          /* jaring pengaman */
+      touch_down = false;
       touch_release_pending = false;
     }
   }
@@ -262,119 +229,66 @@ static void my_touch_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
   data->state = touch_down ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
 }
 
-/* Glyph non-ASCII yang tersedia di lv_font_montserrat_* bawaan LVGL.
- * Rentangnya 0x20-0x7F + 0xB0 + 0x2022, jadi cuma dua ini yang aman dipakai. */
+/* Glyph non-ASCII yang tersedia di lv_font_montserrat_* bawaan LVGL. */
 #define TXT_DEG  "\xC2\xB0"      /* U+00B0 derajat */
 #define TXT_DOT  "\xE2\x80\xA2"  /* U+2022 bullet  */
 
-/* ================= Palet (diambil dari mockup) ================= */
-/* 1 Home */
-#define C_S1_BG     0x034B55
-#define C_S1_HDR    0x04363D
-#define C_GOLD      0xB79D2D
-#define C_AMBER     0xECC94B
-#define C_WHITE     0xF6F6F2
-#define C_S1_MUTED  0xCFE3DE
-#define C_S1_DIV    0x3D6A70
-#define C_S1_LINE   0x9BBBBD
-#define C_BATT      0xF2CC5B
-#define C_DATE      0xE6F2EF
-/* 2 Menu */
-#define C_S2_BG     0x0E3D47
-#define C_S2_BTN    0x155562
-#define C_S2_FOOT   0x7FA3AC
-#define C_HR_BG     0x5C2530
-#define C_HR_TITLE  0xFFE3E3
-#define C_HR_SUB    0xF0A8A8
-#define C_SP_BG     0x1D3A63
-#define C_SP_TITLE  0xE3EFFF
-#define C_SP_SUB    0xA9C9F2
-#define C_GL_BG     0x4D3A17
-#define C_GL_TITLE  0xFFF3D6
-#define C_GL_SUB    0xECCF94
-#define C_BP_BG     0x3A1E52
-#define C_BP_TITLE  0xEFE3FF
-#define C_BP_SUB    0xC9A8F0
-/* 3 Heart rate */
-#define C_S3_BG     0x2A1A24
-#define C_S3_DECO   0x39222E
-#define C_S3_CARD   0x3D222D
-#define C_S3_TRACK  0x4A2A36
-#define C_S3_BAR    0x6E3A48
-#define C_PINK      0xFF8A8A
-#define C_S3_MUTE   0xD8A4A4
-/* 4 SpO2 */
-#define C_S4_BG     0x14253F
-#define C_S4_DECO   0x1B3152
-#define C_S4_CARD   0x1F3A61
-#define C_S4_TITLE  0xEEF2FB
-#define C_S4_MUTE   0xA9C9F2
-#define C_BLUE      0x7DB8FF
-/* 5 Glukosa */
-#define C_S5_BG     0x33270F
-#define C_S5_DECO   0x443413
-#define C_S5_CARD   0x453413
-#define C_S5_MUTE   0xD9BD85
-#define C_AMBER2    0xFFCF70
-/* 6 Tekanan darah (tanpa acuan mockup, lihat catatan di atas file) */
-#define C_S6_BG     0x241A3D
-#define C_S6_DECO   0x33234F
-#define C_S6_CARD   0x3A2A54
-#define C_S6_TITLE  0xF0E6FF
-#define C_S6_MUTE   0xC7ADE8
-#define C_PURPLE    0xB48CFF  /* sistol */
-#define C_PURPLE2   0x7A5CC7  /* diastol */
-/* zona */
-#define C_GREEN     0x4FBF7A
-#define C_GREEN2    0x7EE2A8
-#define C_YELLOW    0xE8B34A
-#define C_RED       0xE05B5B
+/* ================= Palet =================
+ * Setiap nilai di bawah adalah warna yang benar-benar diambil dari piksel
+ * wajah_jam_modular_240x280.png, bukan tafsiran. */
+#define C_BG_ATAS   0x06070B   /* latar di tepi atas   */
+#define C_BG_BAWAH  0x0D0C18   /* latar di tepi bawah  */
+#define C_KARTU     0x171A21
+#define C_KARTU_BRD 0x23262D
+#define C_PUTIH     0xFFFFFF   /* angka besar & jam    */
+#define C_TANGGAL   0xB9C1D0   /* baris tanggal        */
+#define C_REDUP     0x8E96A6   /* judul kartu, satuan, persen baterai */
+#define C_ISI       0xA2E32B   /* petir "sedang mengisi" */
+#define C_TRACK     0x2E3444   /* jalur gelap di belakang cincin */
+#define C_CINCIN_HR 0xFF3B5C
+#define C_CINCIN_SP 0xA2E32B
+#define C_CINCIN_GL 0x22D3EE
+
+/* ================= Geometri =================
+ * Diukur dari gambar desain, bukan dikira-kira:
+ *   kartu kiri  x=10..115   kartu kanan x=124..229   (lebar 106, jarak 8)
+ *   baris atas  y=101..180  baris bawah y=191..270   (tinggi 80, jarak 10)
+ *   cincin      bbox x=11..79, y=15..83 -> pusat (45,49), jari-jari luar 34
+ *   pita cincin 7 px, jari-jari luar 34 / 25 / 16 */
+#define KARTU_W   106
+#define KARTU_H   80
+#define KARTU_X1  10
+#define KARTU_X2  124
+#define KARTU_Y1  101
+#define KARTU_Y2  191
+
+#define CINCIN_CX 45
+#define CINCIN_CY 49
+#define CINCIN_W  7
 
 /* ================= SUMBER DATA =================
- * Semua nilai di UI kini berasal dari perangkat keras nyata:
- *   jam/hari/tanggal/bulan/tahun  -> RTC PCF85063 + sinkronisasi NTP
- *   cuaca + suhu                  -> OpenWeatherMap lewat Wi-Fi
- *   kapasitas baterai             -> ADC1 + kurva Li-Po
- *   BPM + SpO2                    -> MAX30105/30102 (PPG, Red+IR)
- *   glukosa                       -> MAX30105/30102, EKSPERIMENTAL (lihat ppg.h)
+ * Tidak ada angka yang dikarang di layar ini. Kalau sebuah nilai belum
+ * tersedia -- jari tidak menempel, sensor tidak terpasang, ADC belum stabil --
+ * yang tampil adalah "--", bukan angka contoh. Pada layar kesehatan, angka
+ * contoh yang tampak nyata lebih berbahaya daripada tanda hubung.
  *
- * Tidak ada lagi angka yang dikarang. Kalau sebuah nilai belum tersedia --
- * sensor tidak menempel, cuaca belum terambil -- label menampilkan "--", bukan
- * angka contoh. Pada layar kesehatan, angka contoh yang tampak nyata lebih
- * berbahaya daripada tanda hubung.
+ *   jam / hari / tanggal   -> RTC PCF85063 + sinkronisasi NTP
+ *   persen baterai         -> ADC1 + kurva Li-Po (battery.cpp)
+ *   detak, SpO2, glukosa,  -> MAX30105/30102 lewat jam_snapshot()
+ *   tekanan darah             glukosa & tekanan EKSPERIMENTAL, lihat ppg.h
  */
 
-/* ================= Handle layar & widget ================= */
-static lv_obj_t *scr_home, *scr_menu, *scr_hr, *scr_spo2, *scr_glu, *scr_bp;
-static lv_obj_t *scr_meas;   /* layar "sedang mengukur", dokumen 14 */
+/* ================= Handle widget ================= */
+static lv_obj_t *scr_wajah;
 
-/* home */
-static lv_obj_t *lbl_hh, *lbl_mm, *lbl_wthr, *lbl_batt;
-/* Hari dan tanggal kini satu label. Keduanya dulu bertumpuk (dua baris, 32 px);
- * setelah tombol daya masuk ke halaman ini tinggi itu tidak tersedia lagi, dan
- * keduanya toh selalu berubah pada saat yang sama -- pergantian hari. */
-static lv_obj_t *lbl_date;
-static lv_obj_t *lbl_cond;   /* caption kondisi cuaca di header */
-static lv_obj_t *lbl_ble;    /* ikon Bluetooth di header, tiga keadaan          */
-static lv_obj_t *lbl_pending;/* jumlah entri belum di-ack, sembunyi kalau nol   */
-static lv_obj_t *lbl_sesi;   /* pil status sesi tepat di atas tombol            */
-static lv_obj_t *btn_utama, *ic_utama;   /* satu tombol, dua peran (lihat di bawah) */
-/* layar sedang mengukur */
-static lv_obj_t *lbl_meas_judul, *lbl_meas_sub, *lbl_meas_waktu, *bar_meas;
-static lv_obj_t *dot_meas[4], *lbl_meas_metrik[4];
-/* menu */
-static lv_obj_t *lbl_card_hr, *lbl_card_sp, *lbl_card_gl, *lbl_card_bp;
-/* detail */
-static lv_obj_t *arc_hr, *lbl_hr_big, *ring_sp, *lbl_sp_big, *lbl_glu_big;
-static lv_obj_t *lbl_bp_big;
-static lv_obj_t *dot_live;
-/* Handle tambahan supaya chip statistik, teks zona, dan penanda bar ikut
- * mengikuti data nyata. Ini hanya menyimpan pointer objek yang sudah ada --
- * posisi, ukuran, font, dan warnanya tidak diubah. Perlu, karena angka utama
- * yang nyata di atas angka yang dikarang di bawahnya justru menyesatkan. */
-static lv_obj_t *chip_hr[3], *chip_sp[3], *chip_gl[3], *chip_bp[3];
-static lv_obj_t *lbl_hr_zone, *lbl_glu_status, *lbl_bp_status;
-static lv_obj_t *mark_hr, *mark_glu, *mark_bp;
+static lv_obj_t *lbl_jam_hh, *lbl_jam_mm;   /* "14" dan "35"                  */
+static lv_obj_t *lbl_status;                /* baris tanggal / status         */
+static lv_obj_t *lbl_batt, *lbl_ikon_batt;
+
+static lv_obj_t *cincin_hr, *cincin_sp, *cincin_gl;
+
+static lv_obj_t *lbl_hr, *lbl_sp, *lbl_gl, *lbl_bp;          /* angka besar   */
+static lv_obj_t *sat_hr, *sat_sp, *sat_gl;                   /* satuan        */
 
 /* ================= Helper pembuat widget ================= */
 
@@ -390,18 +304,6 @@ static lv_obj_t *mk_box(lv_obj_t *parent, int x, int y, int w, int h,
   lv_obj_set_style_radius(o, radius, 0);
   lv_obj_clear_flag(o, LV_OBJ_FLAG_SCROLLABLE);
   return o;
-}
-
-/* Jadikan objek bisa disentuh.
- *
- * ext = piksel perluasan area sentuh di luar batas visual. Tombol back cuma
- * 24x24 px (~2.5 mm di panel 1.69") -- terlalu kecil untuk ujung jari, jadi
- * areanya diperluas tanpa mengubah tampilan. */
-static void mk_touchable(lv_obj_t *o, int ext) {
-  lv_obj_add_flag(o, LV_OBJ_FLAG_CLICKABLE);
-  if (ext) lv_obj_set_ext_click_area(o, ext);
-  /* umpan balik visual: sedikit transparan saat ditekan supaya jelas kena */
-  lv_obj_set_style_bg_opa(o, LV_OPA_70, LV_STATE_PRESSED);
 }
 
 static lv_obj_t *mk_label(lv_obj_t *parent, const char *txt, const lv_font_t *font,
@@ -421,541 +323,483 @@ static lv_obj_t *mk_img(lv_obj_t *parent, const lv_img_dsc_t *src, int x, int y)
   return i;
 }
 
-/* Lingkaran dekoratif di latar (tidak menangkap sentuhan). */
-static void mk_deco(lv_obj_t *scr, int cx, int cy, int r, uint32_t color) {
-  lv_obj_t *o = mk_box(scr, cx - r, cy - r, r * 2, r * 2, color, LV_RADIUS_CIRCLE);
-  lv_obj_move_background(o);
+/* Sejajarkan satuan pada GARIS DASAR angkanya, bukan pada tepi kotaknya.
+ *
+ * Dihitung dari metrik font, bukan dari angka ajaib hasil coba-coba: jarak dari
+ * tepi atas kotak baris ke garis dasar adalah (line_height - base_line), jadi
+ * selisih kedua font itulah pergeseran yang membuat kedua garis dasar berimpit.
+ * Kalau ukuran font angka diganti nanti, satuannya ikut benar dengan
+ * sendirinya. Dipanggil ulang tiap kali teks angkanya berubah, karena lebar
+ * label ikut berubah ("98" jadi "100") dan satuan harus menempel di kanannya. */
+static void satuan_sejajar(lv_obj_t *satuan, lv_obj_t *nilai, const lv_font_t *fn) {
+  if (!satuan) return;
+  int dy = (int)(fn->line_height - fn->base_line)
+         - (int)(lv_font_montserrat_12.line_height - lv_font_montserrat_12.base_line);
+  lv_obj_align_to(satuan, nilai, LV_ALIGN_OUT_RIGHT_TOP, 4, dy);
 }
 
-/* Bar tersegmen (zona hijau/kuning/merah) + penanda putih. */
-static lv_obj_t *mk_zonebar(lv_obj_t *parent, int x, int y, int w, int h,
-                            const int *seg_w, const uint32_t *seg_c, int n,
-                            int marker_x) {
-  int cx = x;
-  for (int i = 0; i < n; i++) {
-    int r = (i == 0 || i == n - 1) ? h / 2 : 0;
-    mk_box(parent, cx, y, seg_w[i], h, seg_c[i], r);
-    cx += seg_w[i];
+/* Satu kartu metrik: ikon, judul, angka besar, satuan.
+ *
+ * font_nilai diparameterkan karena kartu tekanan memuat enam karakter
+ * ("118/76") sedangkan yang lain paling banyak tiga -- memaksakan satu ukuran
+ * untuk keempatnya akan membuat tekanan meluber keluar kartu. Gambar desainnya
+ * sendiri sudah merender kartu itu lebih kecil (tinggi ink 21 px lawan 23 px),
+ * jadi ini mengikuti desain, bukan menyimpang darinya. */
+static lv_obj_t *mk_kartu(lv_obj_t *scr, int x, int y, const lv_img_dsc_t *ikon,
+                          const char *judul, const char *satuan,
+                          const lv_font_t *font_nilai,
+                          lv_obj_t **out_nilai, lv_obj_t **out_satuan) {
+  lv_obj_t *k = mk_box(scr, x, y, KARTU_W, KARTU_H, C_KARTU, 14);
+  lv_obj_set_style_border_width(k, 1, 0);
+  lv_obj_set_style_border_color(k, lv_color_hex(C_KARTU_BRD), 0);
+  lv_obj_set_style_border_opa(k, LV_OPA_COVER, 0);
+
+  mk_img(k, ikon, 10, 9);
+  mk_label(k, judul, &lv_font_montserrat_12, C_REDUP, 33, 8);
+
+  *out_nilai = mk_label(k, "--", font_nilai, C_PUTIH, 10, 26);
+  if (satuan) {
+    *out_satuan = mk_label(k, satuan, &lv_font_montserrat_12, C_REDUP, 0, 0);
+    satuan_sejajar(*out_satuan, *out_nilai, font_nilai);
+  } else if (out_satuan) {
+    *out_satuan = NULL;
   }
-  return mk_box(parent, x + marker_x, y - 1, 3, h + 2, 0xFFFFFF, 1);
+  return k;
 }
 
-/* Tiga chip statistik di bagian bawah halaman detail. */
-static void mk_chips(lv_obj_t *parent, const char *a, const char *b, const char *c,
-                     uint32_t bg, uint32_t fg, lv_obj_t **out) {
-  const char *txt[3] = { a, b, c };
-  for (int i = 0; i < 3; i++) {
-    lv_obj_t *chip = mk_box(parent, 10 + i * 75, 235, 70, 30, bg, 10);
-    lv_obj_t *l = mk_label(chip, txt[i], &lv_font_montserrat_12, fg, 0, 0);
-    lv_obj_center(l);
-    if (out) out[i] = l;
+/* Satu cincin kemajuan.
+ *
+ * Knob-nya dilepas dan flag klik dimatikan: lv_arc bawaan LVGL adalah kendali
+ * yang bisa diseret, dan di sini ia murni penampil. Tanpa itu, sentuhan di
+ * board yang sehat bisa menggeser nilainya dan membuat cincin menampilkan
+ * angka yang tidak berasal dari sensor mana pun. */
+static lv_obj_t *mk_cincin(lv_obj_t *scr, int r_luar, uint32_t warna) {
+  int d = r_luar * 2 + 1;
+  lv_obj_t *a = lv_arc_create(scr);
+  lv_obj_remove_style(a, NULL, LV_PART_KNOB);
+  lv_obj_clear_flag(a, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_size(a, d, d);
+  lv_obj_set_pos(a, CINCIN_CX - r_luar, CINCIN_CY - r_luar);
+  lv_arc_set_rotation(a, 270);          /* 0% mulai di jam 12 */
+  lv_arc_set_bg_angles(a, 0, 360);
+  lv_arc_set_range(a, 0, 1000);
+  lv_arc_set_value(a, 0);
+  lv_obj_set_style_arc_width(a, CINCIN_W, LV_PART_MAIN);
+  lv_obj_set_style_arc_width(a, CINCIN_W, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_color(a, lv_color_hex(C_TRACK), LV_PART_MAIN);
+  lv_obj_set_style_arc_color(a, lv_color_hex(warna), LV_PART_INDICATOR);
+  lv_obj_set_style_arc_rounded(a, true, LV_PART_MAIN);
+  lv_obj_set_style_arc_rounded(a, true, LV_PART_INDICATOR);
+  return a;
+}
+
+/* ================= Cincin: apa yang sebenarnya ditampilkan =================
+ * Ketiga cincin adalah pengukur tiga metrik terhadap rentang tampilan di
+ * bawah. Rentang ini SEMATA-MATA untuk menggambar, bukan ambang medis, dan
+ * tidak boleh dibaca sebagai "normal" atau "berbahaya" -- ia cuma menentukan
+ * berapa penuh sebuah cincin tergambar.
+ *
+ * Kalau metriknya belum sah, cincinnya tinggal jalur gelap. Itu memang yang
+ * diinginkan: cincin kosong berarti "belum ada data", bukan "nilainya nol".
+ * Cincin sengaja tidak pernah menahan nilai terakhir seperti kartu, karena
+ * bentuk visual yang penuh tanpa angka pendampingnya mustahil dibedakan dari
+ * pengukuran yang sedang berlangsung. */
+#define HR_MIN   40.0f
+#define HR_MAKS 180.0f
+#define SP_MIN   85.0f
+#define SP_MAKS 100.0f
+#define GL_MIN   70.0f
+#define GL_MAKS 200.0f
+
+static void cincin_set(lv_obj_t *a, bool sah, float v, float lo, float hi) {
+  int nilai = 0;
+  if (sah) {
+    float f = (v - lo) / (hi - lo);
+    if (f < 0.0f) f = 0.0f;
+    if (f > 1.0f) f = 1.0f;
+    nilai = (int)(f * 1000.0f + 0.5f);
   }
+  if (lv_arc_get_value(a) != nilai) lv_arc_set_value(a, nilai);
 }
 
-/* Chip kecil di kanan atas halaman detail. */
-static lv_obj_t *mk_pill(lv_obj_t *parent, int x, int w, const char *txt,
-                         uint32_t bg, uint32_t fg) {
-  lv_obj_t *p = mk_box(parent, x, 12, w, 16, bg, 8);
-  lv_obj_t *l = mk_label(p, txt, &lv_font_montserrat_10, fg, 0, 0);
-  lv_obj_center(l);
-  return p;
+/* ================= Wajah jam ================= */
+static void build_wajah(void) {
+  scr_wajah = lv_obj_create(NULL);
+  lv_obj_remove_style_all(scr_wajah);
+  lv_obj_clear_flag(scr_wajah, LV_OBJ_FLAG_SCROLLABLE);
+  /* Latarnya gradien tipis seperti di desain (tepi atas lebih gelap daripada
+   * tepi bawah). Bedanya cuma beberapa digit, tapi tanpa itu layar terlihat
+   * datar dan kartu-kartunya kehilangan kedalaman. */
+  lv_obj_set_style_bg_color(scr_wajah, lv_color_hex(C_BG_ATAS), 0);
+  lv_obj_set_style_bg_grad_color(scr_wajah, lv_color_hex(C_BG_BAWAH), 0);
+  lv_obj_set_style_bg_grad_dir(scr_wajah, LV_GRAD_DIR_VER, 0);
+  lv_obj_set_style_bg_opa(scr_wajah, LV_OPA_COVER, 0);
+
+  /* --- tiga cincin, dari luar ke dalam --- */
+  cincin_hr = mk_cincin(scr_wajah, 34, C_CINCIN_HR);
+  cincin_sp = mk_cincin(scr_wajah, 25, C_CINCIN_SP);
+  cincin_gl = mk_cincin(scr_wajah, 16, C_CINCIN_GL);
+
+  /* --- baris tanggal / status ---
+   * letter_space 1: tanpa itu "SAB 15 AGU" terbaca merapat jadi satu blok di
+   * montserrat_12, dan desainnya sendiri memang merender baris ini dengan huruf
+   * yang berjarak. x=82, bukan 86, untuk memberi ruang tambahan ke kelompok
+   * baterai di kanan -- cincin berakhir di x=79 jadi 82 masih aman. */
+  lbl_status = mk_label(scr_wajah, "--", &lv_font_montserrat_12, C_TANGGAL, 82, 13);
+  lv_obj_set_style_text_letter_space(lbl_status, 1, 0);
+
+  /* --- kelompok baterai: "94%" lalu ikonnya, tepi kanan dikunci di x=232 ---
+   * Posisinya dihitung ulang tiap kali teksnya berubah (lihat batt_tata()),
+   * sebab "9%" dan "100%" berbeda belasan piksel sedangkan tepi kanannya harus
+   * tetap sejajar dengan tepi kanan kartu di bawahnya. */
+  lbl_batt      = mk_label(scr_wajah, "--%", &lv_font_montserrat_12, C_REDUP, 190, 13);
+  lbl_ikon_batt = mk_label(scr_wajah, LV_SYMBOL_BATTERY_EMPTY, &lv_font_montserrat_12,
+                           C_REDUP, 221, 13);
+
+  /* --- jam besar ---
+   * font_digits_48 punya 9 px kosong di atas ink digit, jadi label di y=33
+   * menaruh ink di y=42 -- persis seperti desain. "14" dirata-kanan ke x=153
+   * dan "35" mulai di x=172; celah di antaranya diisi titik dua. */
+  lbl_jam_hh = mk_label(scr_wajah, "--", &font_digits_48, C_PUTIH, 0, 33);
+  lv_obj_set_width(lbl_jam_hh, 153);
+  lv_obj_set_style_text_align(lbl_jam_hh, LV_TEXT_ALIGN_RIGHT, 0);
+
+  /* Titik dua digambar sebagai dua kotak, bukan glyph: font_digits_48 memang
+   * tidak punya ':' (rentangnya cuma 45..57, yaitu '-' '.' '/' dan 0-9). */
+  mk_box(scr_wajah, 158, 51, 8, 8, C_PUTIH, 2);
+  mk_box(scr_wajah, 158, 68, 8, 8, C_PUTIH, 2);
+
+  lbl_jam_mm = mk_label(scr_wajah, "--", &font_digits_48, C_PUTIH, 172, 33);
+
+  /* --- empat kartu metrik --- */
+  mk_kartu(scr_wajah, KARTU_X1, KARTU_Y1, &ic_detak,   "DETAK",   "BPM",
+           &lv_font_montserrat_30, &lbl_hr, &sat_hr);
+  mk_kartu(scr_wajah, KARTU_X2, KARTU_Y1, &ic_spo2,    "SpO2",    "%",
+           &lv_font_montserrat_30, &lbl_sp, &sat_sp);
+  mk_kartu(scr_wajah, KARTU_X1, KARTU_Y2, &ic_glukosa, "GLUKOSA", "mg/dL",
+           &lv_font_montserrat_30, &lbl_gl, &sat_gl);
+  mk_kartu(scr_wajah, KARTU_X2, KARTU_Y2, &ic_tekanan, "TEKANAN", NULL,
+           &lv_font_montserrat_26, &lbl_bp, NULL);
 }
 
-/* ================= Garis tepi layar: indikator kemajuan pengukuran =================
- * Garis bercahaya yang tumbuh menyusuri tepi layar, dipasang di keempat halaman
- * detail (HR/SpO2/Glukosa/Tensi) dan di layar "sedang mengukur".
+/* ================= Pembaruan isi ================= */
+
+/* true kalau teksnya benar-benar berubah. lv_label_set_text() selalu
+ * meng-invalidate area labelnya, jadi menulis ulang teks yang sama memaksa
+ * gambar ulang dua kali per detik tanpa alasan. */
+static bool set_jika_beda(lv_obj_t *lbl, const char *txt) {
+  if (strcmp(lv_label_get_text(lbl), txt) == 0) return false;
+  lv_label_set_text(lbl, txt);
+  return true;
+}
+
+static void nilai_set(lv_obj_t *lbl, lv_obj_t *satuan, const lv_font_t *fn,
+                      bool sah, const char *fmt, float a, float b) {
+  char buf[16];
+  if (!sah)                 snprintf(buf, sizeof(buf), "--");
+  else if (b < 0.0f)        snprintf(buf, sizeof(buf), fmt, a);
+  else                      snprintf(buf, sizeof(buf), fmt, a, b);
+  if (set_jika_beda(lbl, buf)) satuan_sejajar(satuan, lbl, fn);
+}
+
+/* ---- Kelompok baterai: persen + ikon ----
+ * Ikonnya BUKAN gambar tetap. Ia mengikuti persen yang sama dengan angkanya,
+ * jadi dua penanda itu tidak akan pernah saling bertentangan -- ikon penuh di
+ * sebelah tulisan "20%" adalah persis jenis kebohongan kecil yang membuat
+ * seluruh tampilan tidak bisa dipercaya.
  *
- * BUKAN animasi berputar. Panjang garis = kemajuan pengukuran, satu putaran
- * penuh untuk satu pengukuran: berangkat dari tengah sisi atas, searah jarum
- * jam, dan ujungnya baru kembali menyentuh titik berangkat kalau pengukurannya
- * benar-benar selesai. Titik berjalan yang lama justru menipu -- ia terus
- * berputar dengan kecepatan tetap entah sensornya menangkap sesuatu atau tidak,
- * jadi pengguna tidak punya cara membedakan "hampir selesai" dari "belum mulai".
+ * Saat mengisi, ikonnya BERGANTI jadi petir alih-alih menambah lambang ketiga
+ * di sebelahnya. Itu bukan sekadar selera: baris ini cuma punya ~50 px di
+ * kanan tanggal, dan lambang tambahan akan menabrak "SAB 15 AGU" pada tanggal
+ * yang namanya panjang. Petir menggantikan tempat, bukan meminta tempat baru.
  *
- * Kemajuannya = min(detak/detak_perlu, metrik_didapat/4), persis dua syarat
- * yang dipakai ukur_putar() di aw_jam.cpp untuk menyatakan satu pengukuran
- * selesai. Karena diambil yang terkecil, lingkaran menutup TEPAT saat kedua
- * syarat terpenuhi -- tidak ada 100% palsu yang menggantung menunggu syarat
- * satunya. Kontak lepas berarti detaknya balik nol, dan garisnya ikut surut:
- * itu memang keadaan sebenarnya, pengukuran harus diulang dari awal.
+ * Ambangnya sengaja tidak rata: yang penting dibedakan adalah ujung bawah
+ * (baterai hampir habis), bukan ujung atas. */
+static const char *batt_ikon(int persen, bool mengisi) {
+  if (mengisi)     return LV_SYMBOL_CHARGE;
+  if (persen >= 90) return LV_SYMBOL_BATTERY_FULL;
+  if (persen >= 65) return LV_SYMBOL_BATTERY_3;
+  if (persen >= 40) return LV_SYMBOL_BATTERY_2;
+  if (persen >= 15) return LV_SYMBOL_BATTERY_1;
+  return LV_SYMBOL_BATTERY_EMPTY;
+}
+
+static void batt_tata(bool mengisi) {
+  /* Lebar label baru sah setelah tata letaknya dihitung ulang; tanpa ini
+   * lv_obj_get_width() masih mengembalikan lebar teks yang lama. */
+  lv_obj_update_layout(scr_wajah);
+  lv_obj_set_pos(lbl_ikon_batt, 232 - lv_obj_get_width(lbl_ikon_batt), 13);
+  lv_obj_align_to(lbl_batt, lbl_ikon_batt, LV_ALIGN_OUT_LEFT_MID, -4, 0);
+  lv_obj_set_style_text_color(lbl_ikon_batt,
+                              lv_color_hex(mengisi ? C_ISI : C_REDUP), 0);
+}
+
+/* ---- Baris tanggal yang merangkap baris status ----
+ * Ini satu-satunya area teks bebas di wajah ini, jadi ia memikul tiga hal
+ * sekaligus. Urutan prioritasnya penting dan disengaja:
  *
- * Warna memetakan ppg_state_t yang sudah dihitung ppg.cpp, tidak ada logika
- * deteksi baru di sini:
- *   PPG_NO_CONTACT             -> merah   (belum ada kulit menempel)
- *   PPG_SETTLING/PPG_ACQUIRING -> kuning  (sinyal ada, detak belum konsisten)
- *   PPG_STABLE                 -> hijau   (bacaan sudah valid)
- * PPG_ABSENT/PPG_OFF menyembunyikan garisnya -- tidak ada proses untuk
- * diperlihatkan.
- *
- * Lintasannya dipecah jadi lima ruas persegi panjang, bukan satu lv_line satu
- * layar penuh: sebuah objek selebar layar akan membatalkan (invalidate) seluruh
- * 240x280 px tiap kali panjangnya berubah, dan ST7789 di SPI ini harus mengirim
- * ulang 134 KB untuk itu. Dengan ruas terpisah yang digambar ulang cuma bilah
- * setebal ~24 px (garis + bayangannya). Bayangan lv_obj hanya ada untuk
- * persegi panjang, jadi bentuk ini sekaligus yang memungkinkan efek cahayanya.
- *
- * Timer terpisah dari refresh_cb (500 ms) dengan sengaja: refresh_cb jarang
- * supaya label besar tidak digambar ulang tanpa alasan (lihat catatan di
- * atasnya), sedangkan garis ini perlu banyak frame per detik supaya
- * pertumbuhannya terlihat mengalir, bukan meloncat 1/15 lintasan tiap detak.
+ *   1. Pesan sesaat (2 detik) -- jawaban atas tombol yang baru saja ditekan.
+ *      Paling atas karena ini satu-satunya umpan balik yang dimiliki tombol
+ *      BOOT; tanpa itu menekan tombol terasa seperti tidak terjadi apa-apa.
+ *   2. Kemajuan pengukuran -- pengguna harus diam selama puluhan detik, dan
+ *      dokumen 14 mewajibkan ia tahu bahwa sesuatu sedang berjalan serta
+ *      seberapa jauh. Yang ditampilkan detak tercacah, bukan detik berjalan,
+ *      sebab itulah gerbang sebenarnya berakhirnya pengukuran.
+ *   3. Tanggal -- keadaan tenang.
  */
-#define SCAN_INSET       3       /* jarak lintasan dari tepi layar, px */
-#define SCAN_THICK       4       /* tebal garis, px */
-#define SCAN_GLOW       10       /* lebar bayangan/cahaya di sekeliling garis */
-#define SCAN_EASE    0.14f       /* pengejaran per frame menuju kemajuan asli */
+static uint32_t pesan_sampai_ms = 0;
+static char     pesan_teks[24]  = "";
 
-/* Lintasan: persegi panjang di tepi layar, mulai/berakhir di tengah sisi atas.
- * Ruas 0..4 searah jarum jam -- sisi atas terbelah dua supaya titik berangkat
- * dan titik akhirnya sama-sama di tengah atas. */
-#define SCAN_X0  SCAN_INSET
-#define SCAN_Y0  SCAN_INSET
-#define SCAN_X1  (SCREEN_W - SCAN_INSET)
-#define SCAN_Y1  (SCREEN_H - SCAN_INSET)
-#define SCAN_XC  (SCREEN_W / 2)
-
-#define SCAN_SEG_N 5
-static const int SCAN_SEG_LEN[SCAN_SEG_N] = {
-  SCAN_X1 - SCAN_XC,   /* 0: atas, tengah -> kanan */
-  SCAN_Y1 - SCAN_Y0,   /* 1: kanan, atas -> bawah  */
-  SCAN_X1 - SCAN_X0,   /* 2: bawah, kanan -> kiri  */
-  SCAN_Y1 - SCAN_Y0,   /* 3: kiri, bawah -> atas   */
-  SCAN_XC - SCAN_X0,   /* 4: atas, kiri -> tengah  */
-};
-#define SCAN_PERIM ((SCAN_X1 - SCAN_XC) + (SCAN_Y1 - SCAN_Y0) + \
-                    (SCAN_X1 - SCAN_X0) + (SCAN_Y1 - SCAN_Y0) + (SCAN_XC - SCAN_X0))
-
-static lv_obj_t *scan_seg[SCAN_SEG_N];
-static float scan_progress = 0;   /* nilai yang digambar, mengejar kemajuan asli */
-static int   scan_last_d = -1;    /* panjang yang terakhir digambar, px */
-
-static lv_obj_t *mk_scan_seg(lv_obj_t *parent) {
-  lv_obj_t *o = lv_obj_create(parent);
-  lv_obj_remove_style_all(o);
-  lv_obj_set_size(o, 0, 0);
-  lv_obj_set_style_radius(o, 2, 0);
-  lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
-  lv_obj_set_style_bg_color(o, lv_color_hex(C_RED), 0);
-  /* Bayangan sewarna garisnya: yang diinginkan cahaya yang meluber ke dalam
-   * layar, bukan bayangan gelap yang membuat tepi terlihat kotor. */
-  lv_obj_set_style_shadow_width(o, SCAN_GLOW, 0);
-  lv_obj_set_style_shadow_spread(o, 1, 0);
-  lv_obj_set_style_shadow_ofs_x(o, 0, 0);
-  lv_obj_set_style_shadow_ofs_y(o, 0, 0);
-  lv_obj_set_style_shadow_color(o, lv_color_hex(C_RED), 0);
-  lv_obj_set_style_shadow_opa(o, LV_OPA_50, 0);
-  lv_obj_clear_flag(o, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_clear_flag(o, LV_OBJ_FLAG_CLICKABLE);   /* jangan pernah menelan sentuhan */
-  lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
-  return o;
+static void status_pesan(const char *txt) {
+  strncpy(pesan_teks, txt, sizeof(pesan_teks) - 1);
+  pesan_teks[sizeof(pesan_teks) - 1] = '\0';
+  pesan_sampai_ms = millis() + 2000;
 }
 
-static void scan_build(lv_obj_t *parent) {
-  for (int i = 0; i < SCAN_SEG_N; i++) scan_seg[i] = mk_scan_seg(parent);
-}
+static void status_baris(void) {
+  char buf[40];
 
-static void scan_hide(void) {
-  for (int i = 0; i < SCAN_SEG_N; i++) lv_obj_add_flag(scan_seg[i], LV_OBJ_FLAG_HIDDEN);
-  scan_last_d = -1;   /* sembunyi menghapus bentuk terakhir; paksa gambar lagi nanti */
-}
-
-/* Panjang satu ruas dalam px; ujung yang tumbuh selalu ujung yang searah jarum
- * jam, jadi ruas bawah dan kiri ditambatkan di sisi jauhnya. */
-static void scan_seg_set(int i, int len) {
-  lv_obj_t *o = scan_seg[i];
-  if (len <= 0) { lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN); return; }
-  switch (i) {
-    case 0: lv_obj_set_pos(o, SCAN_XC, SCAN_Y0);
-            lv_obj_set_size(o, len, SCAN_THICK); break;
-    case 1: lv_obj_set_pos(o, SCAN_X1 - SCAN_THICK, SCAN_Y0);
-            lv_obj_set_size(o, SCAN_THICK, len); break;
-    case 2: lv_obj_set_pos(o, SCAN_X1 - len, SCAN_Y1 - SCAN_THICK);
-            lv_obj_set_size(o, len, SCAN_THICK); break;
-    case 3: lv_obj_set_pos(o, SCAN_X0, SCAN_Y1 - len);
-            lv_obj_set_size(o, SCAN_THICK, len); break;
-    default: lv_obj_set_pos(o, SCAN_X0, SCAN_Y0);
-             lv_obj_set_size(o, len, SCAN_THICK); break;
+  if (pesan_sampai_ms && (int32_t)(millis() - pesan_sampai_ms) < 0) {
+    if (set_jika_beda(lbl_status, pesan_teks))
+      lv_obj_set_style_text_color(lbl_status, lv_color_hex(C_PUTIH), 0);
+    return;
   }
-  lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
-}
+  pesan_sampai_ms = 0;
 
-/* Kemajuan asli pengukuran, 0..1. Saat ada sesi pengukuran resmi angkanya
- * diambil dari aw_jam (itu yang menentukan kapan pengukuran berhenti); di luar
- * itu -- pengguna cuma membuka halaman detail sambil menempelkan jari --
- * dipakai bacaan langsung ppg dengan syarat yang sama. */
-static float scan_target(const ppg_data_t *p) {
-  /* Kontak lepas atau angka yang tampil cuma salinan hasil terakhir berarti
-   * tidak ada yang sedang berjalan: lintasan balik ke titik berangkat. */
-  if (p->state == PPG_NO_CONTACT || p->held) return 0;
-
-  uint16_t detak, perlu = jam_ukur_detak_perlu();
-  int punya;
   if (jam_sedang_mengukur()) {
-    detak = jam_ukur_detak();
-    punya = (jam_ukur_punya_bpm() ? 1 : 0) + (jam_ukur_punya_spo2() ? 1 : 0) +
-            (jam_ukur_punya_glukosa() ? 1 : 0) + (jam_ukur_punya_tensi() ? 1 : 0);
-  } else {
-    detak = p->beats;
-    punya = (p->bpm_valid ? 1 : 0) + (p->spo2_valid ? 1 : 0) +
-            (p->glu_valid ? 1 : 0) + (p->bp_valid ? 1 : 0);
+    snprintf(buf, sizeof(buf), "MENGUKUR %u/%u",
+             (unsigned)jam_ukur_detak(), (unsigned)jam_ukur_detak_perlu());
+    if (set_jika_beda(lbl_status, buf))
+      lv_obj_set_style_text_color(lbl_status, lv_color_hex(C_ISI), 0);
+    return;
   }
-  if (perlu == 0) perlu = 1;
 
-  float a = (float)detak / (float)perlu;   if (a > 1.0f) a = 1.0f;
-  float b = (float)punya / 4.0f;
-  return a < b ? a : b;
+  struct tm t;
+  if (!tm_now(&t)) {
+    if (set_jika_beda(lbl_status, "--"))
+      lv_obj_set_style_text_color(lbl_status, lv_color_hex(C_TANGGAL), 0);
+    return;
+  }
+  /* "SAB 15 AGU": tiga huruf pertama nama hari dan bulan. Dalam bahasa
+   * Indonesia potongan itu selalu jatuh benar (SABTU->SAB, AGUSTUS->AGU,
+   * SEPTEMBER->SEP), jadi tidak perlu tabel singkatan terpisah. */
+  const char *hari  = tm_day_name(t.tm_wday);
+  const char *bulan = tm_month_name(t.tm_mon);
+  snprintf(buf, sizeof(buf), "%.3s %d %.3s", hari, t.tm_mday, bulan);
+  if (set_jika_beda(lbl_status, buf))
+    lv_obj_set_style_text_color(lbl_status, lv_color_hex(C_TANGGAL), 0);
 }
 
-static void scan_anim_cb(lv_timer_t *tm) {
+static void refresh_cb(lv_timer_t *tm) {
   (void)tm;
-  lv_obj_t *act = lv_scr_act();
-  bool on_detail = (act == scr_hr || act == scr_spo2 || act == scr_glu ||
-                    act == scr_bp || act == scr_meas);
-  if (!on_detail) { scan_hide(); return; }
+  /* Konteks loop: di sinilah RTC dibaca dan hasil NTP diterapkan. */
+  tm_tick();
 
+  /* ---- jam besar ---- */
+  struct tm t;
+  bool have_time = tm_now(&t);
+  if (have_time) {
+    static int menit_lalu = -1;
+    if (t.tm_min != menit_lalu) {
+      menit_lalu = t.tm_min;
+      lv_label_set_text_fmt(lbl_jam_hh, "%02d", t.tm_hour);
+      lv_label_set_text_fmt(lbl_jam_mm, "%02d", t.tm_min);
+    }
+  }
+
+  status_baris();
+
+  /* ---- baterai ----
+   * Persen saja tidak jujur saat kabel tertancap. Selama mengisi, tegangan sel
+   * dinaikkan oleh arus pengisian dan fase CV menahannya di 4,2 V, jadi kurva
+   * Li-Po membaca hampir 100% jauh sebelum selnya benar-benar penuh.
+   *
+   * battery_charging() menilai tren tegangan berbeban 3 menit terakhir, jadi ia
+   * punya dua batas: baru menjawab setelah jam menyala 3 menit, dan tidak
+   * mengenali fase CV di ujung pengisian karena tegangannya sudah rata.
+   * Keduanya hanya membuat petirnya TIDAK muncul -- tidak pernah klaim palsu
+   * bahwa jam sedang mengisi. */
+  battery_update();
+  if (battery_valid()) {
+    static int batt_lalu = -1;
+    static int isi_lalu  = -1;
+    int bp  = battery_percent();
+    int chg = battery_charging() ? 1 : 0;
+    if (bp != batt_lalu || chg != isi_lalu) {
+      batt_lalu = bp;
+      isi_lalu  = chg;
+      lv_label_set_text_fmt(lbl_batt, "%d%%", bp);
+      lv_label_set_text(lbl_ikon_batt, batt_ikon(bp, chg != 0));
+      batt_tata(chg != 0);
+    }
+  }
+
+  /* ---- empat metrik + tiga cincin ----
+   * jam_snapshot() dipakai, BUKAN ppg_get(): sensor hanya menyala selama
+   * pengukuran, jadi membaca langsung dari sensor berarti keempat kartu
+   * menampilkan "--" hampir sepanjang waktu -- benar, tetapi tidak berguna.
+   * jam_snapshot() menambalnya dengan hasil pengukuran terakhir. */
   ppg_data_t p;
-  ppg_get(&p);
-  if (p.state == PPG_ABSENT || p.state == PPG_OFF) {
-    scan_progress = 0;
-    scan_hide();
-    return;
+  jam_snapshot(&p);
+
+  nilai_set(lbl_hr, sat_hr, &lv_font_montserrat_30, p.bpm_valid,  "%.0f", p.bpm, -1.0f);
+  nilai_set(lbl_sp, sat_sp, &lv_font_montserrat_30, p.spo2_valid, "%.0f", p.spo2, -1.0f);
+  nilai_set(lbl_gl, sat_gl, &lv_font_montserrat_30, p.glu_valid,  "%.0f", p.glucose, -1.0f);
+  nilai_set(lbl_bp, NULL,   &lv_font_montserrat_26, p.bp_valid,   "%.0f/%.0f", p.sbp, p.dbp);
+
+  cincin_set(cincin_hr, p.bpm_valid,  p.bpm,     HR_MIN, HR_MAKS);
+  cincin_set(cincin_sp, p.spo2_valid, p.spo2,    SP_MIN, SP_MAKS);
+  cincin_set(cincin_gl, p.glu_valid,  p.glucose, GL_MIN, GL_MAKS);
+
+  /* ================= Heartbeat serial, tiap 5 detik =================
+   * Ini satu-satunya jendela ke dalam jam sekarang: wajah barunya tidak punya
+   * ikon Bluetooth, pil status sesi, maupun penghitung entri tertunda, jadi
+   * yang dulu bisa dibaca dari layar kini HANYA ada di sini. Menghapusnya
+   * bersama layar-layar itu akan membuat jam yang diam mustahil dibedakan dari
+   * jam yang macet. */
+  static uint8_t n = 0;
+  if (++n < 10) return;
+  n = 0;
+
+  /* Diagnostik boot dicetak di heartbeat PERTAMA, bukan di setup(): USB CDC
+   * board ini re-enumerate setelah reset sehingga apa pun yang dicetak setup()
+   * hampir selalu hilang sebelum host siap menerima. */
+  static bool diag_done = false;
+  if (!diag_done) {
+    diag_done = true;
+    Serial.printf("[diag] PCF85063 terdeteksi: %s\n", rtc_ok() ? "YA" : "TIDAK");
+    Serial.printf("[diag] waktu saat boot: %s\n", tm_boot_info());
+    rtc_scan_bus();
   }
 
-  if (lv_obj_get_parent(scan_seg[0]) != act) {
-    for (int i = 0; i < SCAN_SEG_N; i++) {
-      lv_obj_set_parent(scan_seg[i], act);
-      lv_obj_move_foreground(scan_seg[i]);
+  static const char *SRC[] = { "none", "rtc", "ntp" };
+  Serial.printf("[hb] %02d:%02d:%02d src=%s wifi=%d ble=%d sesi=%d tunda=%d  "
+                "touch irq=%lu err=%lu evt=%lu  heap=%lu\n",
+                have_time ? t.tm_hour : 0, have_time ? t.tm_min : 0,
+                have_time ? t.tm_sec : 0,
+                SRC[tm_source()], net_connected() ? 1 : 0,
+                jam_siap_notifikasi() ? 2 : (jam_terhubung() ? 1 : 0),
+                (int)jam_status(), (int)jam_tertunda(),
+                (unsigned long)touch_irq_count, (unsigned long)touch_readerr,
+                (unsigned long)touch_events, (unsigned long)ESP.getFreeHeap());
+
+  long dir, dred, dthr; uint32_t dn, dp;
+  ppg_diag(&dir, &dred, &dn, &dthr, &dp);
+  Serial.printf("[ppg]  %s%s  bpm=%s%.0f  spo2=%s%.1f  glukosa*=%s%.0f  "
+                "td*=%s%.0f/%.0f\n",
+                ppg_state_text(), p.held ? " [tahan]" : "",
+                p.bpm_valid  ? "" : "(-)", p.bpm,
+                p.spo2_valid ? "" : "(-)", p.spo2,
+                p.glu_valid  ? "" : "(-)", p.glucose,
+                p.bp_valid   ? "" : "(-)", p.sbp, p.dbp);
+  /* Baris mentah: sampel yang diam di satu angka berarti FIFO tidak
+   * menghasilkan apa pun -- biasanya sensor tidak dicatu daya. */
+  Serial.printf("[ppg] mentah ir=%ld red=%ld (ambang %ld)  sampel=%lu  poll=%lu\n",
+                dir, dred, dthr, (unsigned long)dn, (unsigned long)dp);
+
+  Serial.printf("[batt] counts=%d/4095  raw=%d mV (sebaran %d mV)  "
+                "baterai=%d mV  floor=%d mV%s  %d%%\n",
+                battery_raw_counts(), battery_raw_millivolts(),
+                battery_spread_mv(), battery_millivolts(),
+                battery_floor_mv(), battery_charging() ? " [mengisi]" : "",
+                battery_percent());
+  if (battery_history_count() > 1) {
+    char hb[192];
+    battery_history(hb, sizeof(hb));
+    Serial.printf("[batt] riwayat/menit (mV di pin, tertua dulu): %s\n", hb);
+  }
+}
+
+/* ================= Tombol PWR: tekan sekali hidup, tekan lagi mati ========= */
+#define PWR_DEBOUNCE_MS  50
+
+static bool     pwr_siap = false;      /* tombol sudah pernah dilepas sejak boot */
+static int      pwr_level_lalu = HIGH;
+static uint32_t pwr_stabil_ms = 0;
+
+static void pwr_matikan(void) {
+  Serial.println("[pwr] tombol PWR ditekan -- mematikan");
+  ledcWrite(LCD_BL, 0);
+  jam_siap_mati();
+  digitalWrite(BAT_EN, LOW);
+  uint32_t t0 = millis();
+  bool dicatat = false;
+  for (;;) {
+    if (!dicatat && (uint32_t)(millis() - t0) >= 2000) {
+      dicatat = true;
+      Serial.println("[pwr] masih hidup setelah latch dilepas -- board dicatu USB, "
+                     "bukan baterai. Cabut USB atau tekan RST.");
     }
+    delay(100);
   }
+}
 
-  static uint32_t last_color = 0;
-  uint32_t color = C_RED;
-  if (p.state == PPG_SETTLING || p.state == PPG_ACQUIRING) color = C_YELLOW;
-  else if (p.state == PPG_STABLE)                          color = C_GREEN2;
-  if (color != last_color) {
-    last_color = color;
-    for (int i = 0; i < SCAN_SEG_N; i++) {
-      lv_obj_set_style_bg_color(scan_seg[i], lv_color_hex(color), 0);
-      lv_obj_set_style_shadow_color(scan_seg[i], lv_color_hex(color), 0);
+static void pwr_poll(void) {
+  int level = digitalRead(PWR_KEY);      /* LOW = sedang ditekan */
+  if (level != pwr_level_lalu) {
+    pwr_level_lalu = level;
+    pwr_stabil_ms  = millis();
+    return;
+  }
+  if ((uint32_t)(millis() - pwr_stabil_ms) < PWR_DEBOUNCE_MS) return;
+  if (!pwr_siap) {
+    if (level == HIGH) {
+      pwr_siap = true;
+      Serial.println("[pwr] tombol dilepas -- tekan sekali lagi untuk mematikan");
     }
-  }
-
-  /* Detak datang satu-satu, jadi kemajuan aslinya meloncat 1/15 lintasan (~68
-   * px) sekaligus. Nilai yang digambar mengejarnya pelan supaya perpindahan itu
-   * terlihat mengalir; selisih yang tinggal sedikit langsung dikunci, kalau
-   * tidak ujung garis akan merayap satu piksel selamanya dan memaksa gambar
-   * ulang terus-menerus. */
-  float target = scan_target(&p);
-  scan_progress += (target - scan_progress) * SCAN_EASE;
-  if (fabsf(target - scan_progress) < 0.002f) scan_progress = target;
-
-  /* Gambar ulang hanya kalau ujungnya benar-benar pindah piksel. */
-  int d = (int)(scan_progress * SCAN_PERIM + 0.5f);
-  if (d == scan_last_d) return;
-  scan_last_d = d;
-
-  int sisa = d;
-  for (int i = 0; i < SCAN_SEG_N; i++) {
-    int len = sisa;
-    if (len > SCAN_SEG_LEN[i]) len = SCAN_SEG_LEN[i];
-    if (len < 0) len = 0;
-    scan_seg_set(i, len);
-    sisa -= len;
-  }
-}
-
-/* ================= Navigasi ================= */
-/* Abaikan event yang datang saat animasi pindah layar masih jalan, supaya satu
- * ketukan tidak memicu dua transisi bertumpuk. */
-static uint32_t nav_lock_ms = 0;
-
-static void go(lv_obj_t *target, bool forward, const char *name) {
-  if (millis() - nav_lock_ms < 220) return;
-  nav_lock_ms = millis();
-  Serial.printf("[nav] -> %s\n", name);
-  lv_scr_load_anim(target,
-                   forward ? LV_SCR_LOAD_ANIM_MOVE_LEFT : LV_SCR_LOAD_ANIM_MOVE_RIGHT,
-                   180, 0, false);
-}
-
-/* ---- Navigasi khusus ketukan ----
- * Kartu dan tombol back TIDAK boleh aktif karena geseran: dulu memakai
- * LV_EVENT_PRESSED, jadi menggeser jari melewati kartu SpO2 langsung membuka
- * halamannya. LV_EVENT_CLICKED bawaan LVGL juga tidak menolongnya, sebab LVGL
- * hanya membatalkan klik kalau ada leluhur yang scrollable -- di UI ini semua
- * scroll dimatikan, sehingga CLICKED tetap terkirim setelah geseran panjang.
- * Karena itu jaraknya diukur sendiri: press dicatat, lalu saat release jarak
- * tempuhnya dibandingkan dengan TAP_SLOP. */
-#define TAP_SLOP 12   /* px; ketukan normal bergetar < 5 px, geseran > 30 px */
-
-static const nav_target_t NAV_HOME = { &scr_home, false, "home" };
-static const nav_target_t NAV_MENU = { &scr_menu, false, "menu (back)" };
-static const nav_target_t NAV_MENU_DARI_HOME = { &scr_menu, true, "menu" };
-static const nav_target_t NAV_HR   = { &scr_hr,   true,  "heart rate" };
-static const nav_target_t NAV_SPO2 = { &scr_spo2, true,  "spo2" };
-static const nav_target_t NAV_GLU  = { &scr_glu,  true,  "glukosa" };
-static const nav_target_t NAV_BP   = { &scr_bp,   true,  "tekanan darah" };
-
-/* ================= Fokus: kendali satu tombol =================
- * Board kedua tidak punya layar sentuh yang berfungsi, jadi seluruh kendali
- * harus muat di satu tombol BOOT. Polanya standar untuk kendali satu tombol:
- *
- *   tekan sebentar  -> pindah sorotan ke sasaran berikutnya di layar ini
- *   tekan lama      -> jalankan sasaran yang sedang disorot
- *
- * Yang penting bukan pola itu, melainkan DARI MANA daftar sasarannya datang:
- * pendaftaran menumpang di mk_tap_nav() dan di tombol utama, yaitu dua tempat
- * yang sudah dipakai untuk memasang sentuhan. Jadi daftar ini tidak bisa
- * ketinggalan zaman -- setiap objek yang bisa disentuh otomatis bisa dijangkau
- * tombol, dan sasaran baru yang ditambahkan nanti ikut terdaftar tanpa siapa pun
- * harus ingat menambahkannya di sini. Daftar terpisah yang disalin dengan tangan
- * akan menyimpang pada perubahan pertama.
- *
- * Sorotannya WAJIB ada dan wajib terlihat: tanpa penanda, tekanan lama adalah
- * tebakan. Ia digambar sebagai outline emas, bukan perubahan warna latar, supaya
- * tidak bentrok dengan warna kartu yang sudah membawa arti sendiri.
- *
- * Layar sentuh sengaja TIDAK dilepas. Kedua jalur hidup berdampingan, jadi satu
- * firmware yang sama jalan di board yang sentuhannya baik maupun yang rusak.
- *
- * fokus_item_t dan fokus_layar_t sendiri terpaksa didefinisikan jauh di atas,
- * bersama nav_target_t, karena prototipe otomatis Arduino. */
-static fokus_layar_t fokus_tab[FOKUS_MAKS_LAYAR];
-static uint8_t       fokus_n_layar = 0;
-
-static fokus_layar_t *fokus_cari(lv_obj_t *layar, bool buat) {
-  for (uint8_t k = 0; k < fokus_n_layar; k++)
-    if (fokus_tab[k].layar == layar) return &fokus_tab[k];
-  if (!buat || fokus_n_layar >= FOKUS_MAKS_LAYAR) return NULL;
-  fokus_layar_t *f = &fokus_tab[fokus_n_layar++];
-  f->layar = layar;
-  f->n = 0;
-  f->i = 0;
-  return f;
-}
-
-/* nav == NULL berarti tombol utama halaman home; aksinya bercabang di
- * boot_aktifkan(), bukan di sini. */
-static void fokus_daftar(lv_obj_t *o, const nav_target_t *nav, bool balik) {
-  fokus_layar_t *f = fokus_cari(lv_obj_get_screen(o), true);
-  if (!f || f->n >= FOKUS_MAKS_ITEM) {
-    /* Diam-diam gagal berarti sebuah kendali jadi tidak terjangkau di board
-     * tanpa sentuh -- persis kegagalan yang tidak akan terlihat sampai ada yang
-     * mencoba memakainya. Jadi ia berisik. */
-    Serial.println("[fokus] daftar penuh, sebuah sasaran tidak terjangkau tombol");
     return;
   }
-  f->item[f->n].obj   = o;
-  f->item[f->n].nav   = nav;
-  f->item[f->n].balik = balik;
-  f->n++;
+  if (level == LOW) pwr_matikan();       /* tidak pernah kembali */
 }
 
-static void fokus_sorot(lv_obj_t *o, bool aktif) {
-  lv_obj_set_style_outline_width(o, aktif ? 2 : 0, 0);
-  if (!aktif) return;
-  lv_obj_set_style_outline_color(o, lv_color_hex(C_GOLD), 0);
-  lv_obj_set_style_outline_opa(o, LV_OPA_COVER, 0);
-  lv_obj_set_style_outline_pad(o, 2, 0);
-}
-
-/* Sorotan awal jatuh ke sasaran pertama yang BUKAN tombol back. Di layar detail
- * back adalah satu-satunya sasaran sehingga ia tetap terpilih; di menu kesehatan
- * aturan ini melewatinya, karena membuka kartu adalah alasan orang membuka menu
- * -- dan back tetap terjangkau satu putaran kemudian. */
-static uint8_t fokus_awal(const fokus_layar_t *f) {
-  for (uint8_t k = 0; k < f->n; k++)
-    if (!f->item[k].balik) return k;
-  return 0;
-}
-
-static int16_t tap_x0, tap_y0;
-
-static void tap_press_cb(lv_event_t *e) {
-  (void)e;
-  tap_x0 = last_touch_x;
-  tap_y0 = last_touch_y;
-}
-
-static void tap_release_cb(lv_event_t *e) {
-  const nav_target_t *t = (const nav_target_t *)lv_event_get_user_data(e);
-  int dx = last_touch_x - tap_x0;
-  int dy = last_touch_y - tap_y0;
-  if (dx * dx + dy * dy > TAP_SLOP * TAP_SLOP) {
-    Serial.printf("[nav] geseran %d px, %s dibatalkan\n",
-                  (int)sqrtf((float)(dx * dx + dy * dy)), t->name);
-    return;
-  }
-  go(*t->target, t->forward, t->name);
-}
-
-/* Pasang navigasi ketuk-saja pada sebuah objek. */
-static void mk_tap_nav(lv_obj_t *o, int ext, const nav_target_t *t) {
-  mk_touchable(o, ext);
-  lv_obj_add_event_cb(o, tap_press_cb,   LV_EVENT_PRESSED,  (void *)t);
-  lv_obj_add_event_cb(o, tap_release_cb, LV_EVENT_RELEASED, (void *)t);
-  /* Sasaran mundur dikenali dari t->forward, bukan dari daftar terpisah. Kedua
-   * hal itu memang satu konsep yang sama: arah animasi geser ditentukan oleh
-   * apakah perpindahannya masuk lebih dalam atau keluar, dan "keluar" persis
-   * arti tombol back. Target baru yang forward=false akan diperlakukan sebagai
-   * back, dan itu memang yang diinginkan. */
-  fokus_daftar(o, t, !t->forward);
-}
-
-/* Header standar halaman 2..5: tombol back + judul. */
-static lv_obj_t *mk_header(lv_obj_t *scr, const char *title, uint32_t btn_bg,
-                           const nav_target_t *back) {
-  lv_obj_t *btn = mk_box(scr, 10, 10, 24, 24, btn_bg, 8);
-  mk_tap_nav(btn, 14, back);        /* target sentuh efektif jadi ~52x52 */
-  lv_obj_t *ic = mk_label(btn, LV_SYMBOL_LEFT, &lv_font_montserrat_12, 0xFFFFFF, 0, 0);
-  lv_obj_center(ic);
-  return mk_label(scr, title, &lv_font_montserrat_16, 0xFFFFFF, 43, 12);
-}
-
-/* ================= Tombol utama: satu tombol, dua peran =================
- * Satu-satunya kendali di halaman home, di tengah, dan artinya ditentukan oleh
- * status sesi -- bukan oleh dua tombol terpisah.
+/* ================= Tombol BOOT: satu-satunya kendali =================
+ * Perannya persis peran tombol utama di versi 7 layar, dan percabangannya sama:
  *
- *   IDLE     "Cek manual". Menekannya mengukur sekali jalan, dan hasilnya
- *            berhenti di layar jam: tidak ada entri sampel, tidak ada event,
- *            tidak ada satu byte pun ke aplikasi.
- *   ARMED    "Selesai Makan", hijau dan menonjol. Ini keadaan yang pengguna
- *            tunggu, dan menekannya adalah SUMBER TUNGGAL t0.
- *   RUNNING  ambar, tidak menerima tekanan lagi; pil di atasnya berubah jadi
- *            hitung mundur ke pengukuran berikutnya.
+ *   IDLE            -> cek manual. Hasilnya berhenti di layar jam: tidak ada
+ *                      entri sampel, tidak ada event, tidak ada satu byte pun
+ *                      yang dikirim ke aplikasi.
+ *   ARMED / RUNNING -> "Selesai Makan", yaitu SUMBER TUNGGAL t0 (dokumen 3).
  *
- * Menggabungkan keduanya justru memperkuat jaminan yang paling penting di
- * dokumen 12: tidak ada sesi tanpa foto makanan. Di IDLE tombol ini memang
- * menyala dan memang bisa ditekan, tetapi yang dijalankannya cek manual --
- * BUKAN memulai sesi. Sesi tetap hanya bisa lahir setelah aplikasi mengirim
- * ARM_SESI, persis seperti sebelumnya.
+ * Hanya tekan-lama yang dihitung, dan itu bukan gaya-gayaan: tombol ini juga
+ * strapping pin yang dipakai untuk masuk mode download, jadi ia gampang
+ * tersenggol saat menancapkan kabel. Salah satu perannya memulai sesi dua jam
+ * yang tidak bisa dibatalkan dari jam, jadi ambang 700 ms jauh lebih murah
+ * daripada sesi yang lahir karena senggolan.
  *
- * Yang perlu dijaga saat menyentuh kode ini: peran tombol harus selalu terbaca
- * dari layar, bukan dihafal. Itu tugas ikon + warna di sini dan pil status di
- * atasnya -- keduanya harus berubah bersamaan, karena satu tombol yang
- * mengerjakan dua hal berbeda tanpa penanda adalah cara termudah membuat
- * pengguna mengira pengukuran manualnya terkirim ke aplikasi.
- */
-static void utama_btn_refresh(void) {
-  /* Style hanya disentuh saat keadaan benar-benar berpindah. Fungsi ini
-   * dipanggil dari refresh_cb tiap 500 ms, dan lv_obj_set_style_*() selalu
-   * meng-invalidate objeknya -- tanpa penjaga ini tombolnya digambar ulang dua
-   * kali per detik tanpa alasan. */
-  static int last = -1;
-  int st = jam_status();
-  if (st == last) return;
-  last = st;
-
-  uint32_t bg, border, fg;
-  const char *ikon;
-  if (st == AW_SESI_ARMED) {
-    bg = C_GREEN;  border = C_GREEN2; fg = 0xFFFFFF; ikon = LV_SYMBOL_OK;
-  } else if (st == AW_SESI_RUNNING) {
-    bg = C_S1_HDR; border = C_AMBER;  fg = C_AMBER;  ikon = LV_SYMBOL_REFRESH;
-  } else {
-    /* Peran cek manual. Ikonnya LV_SYMBOL_POWER seperti tombol daya lama,
-     * karena inilah yang menggantikan fungsinya: menyalakan sensor sekarang,
-     * atas kehendak pengguna. */
-    bg = C_S1_HDR; border = C_S1_DIV; fg = C_S1_LINE; ikon = LV_SYMBOL_POWER;
-  }
-  lv_obj_set_style_bg_color(btn_utama, lv_color_hex(bg), 0);
-  lv_obj_set_style_border_color(btn_utama, lv_color_hex(border), 0);
-  lv_obj_set_style_text_color(ic_utama, lv_color_hex(fg), 0);
-  lv_label_set_text(ic_utama, ikon);
-}
-
-/* Ketuk-saja, dengan pengukuran jarak yang sama seperti kartu menu: kedua peran
- * tombol ini menyalakan perangkat keras dan salah satunya memulai sesi dua jam,
- * jadi geseran yang kebetulan berakhir di atasnya jelas bukan maksud pengguna. */
-static void utama_release_cb(lv_event_t *e) {
-  (void)e;
-  int dx = last_touch_x - tap_x0;
-  int dy = last_touch_y - tap_y0;
-  if (dx * dx + dy * dy > TAP_SLOP * TAP_SLOP) {
-    Serial.printf("[nav] geseran %d px, tombol utama dibatalkan\n",
-                  (int)sqrtf((float)(dx * dx + dy * dy)));
-    return;
-  }
-
-  /* Percabangan peran ada di sini, satu tempat. aw_jam tetap memeriksa
-   * syaratnya sendiri -- jam_cek_manual() menolak kalau ada sesi, dan
-   * jam_tekan_tombol() menolak kalau belum ARMED -- jadi baris ini soal maksud
-   * pengguna, bukan soal keamanan. */
-  if (jam_status() == AW_SESI_IDLE) jam_cek_manual();
-  else                              jam_tekan_tombol();
-  utama_btn_refresh();
-}
-
-/* ================= Tombol BOOT: baca, sorot, jalankan =================
- * Diletakkan di sini, bukan di dekat pendaftaran fokus, karena bagian ini butuh
- * utama_btn_refresh() dan percabangan peran tombol utama yang baru selesai
- * didefinisikan di atas. */
+ * Aksinya dijalankan saat ambang terlewati, bukan saat jari dilepas: kalau
+ * menunggu pelepasan, pengguna menahan sambil menebak apakah sudah cukup lama,
+ * dan tebakan itu satu-satunya umpan balik yang ada. */
 #define BOOT_DEBOUNCE_MS   30
-#define BOOT_LAMA_MS      600   /* ambang "tekan lama" */
+#define BOOT_LAMA_MS      700
 
-static bool      boot_siap        = false;  /* pernah terlihat dilepas sejak boot */
-static int       boot_level_lalu  = HIGH;   /* level mentah, untuk debounce      */
-static int       boot_stabil_lvl  = HIGH;   /* level yang sudah lolos debounce   */
+static bool      boot_siap        = false;
+static int       boot_level_lalu  = HIGH;
+static int       boot_stabil_lvl  = HIGH;
 static uint32_t  boot_stabil_ms   = 0;
 static uint32_t  boot_tekan_ms    = 0;
 static bool      boot_sudah_jalan = false;
-static lv_obj_t *fokus_layar_lalu = NULL;
 
-/* Pindahkan sorotan mengikuti layar yang sedang tampil.
- *
- * Sengaja dibuat sebagai pengamat lv_scr_act(), bukan dipanggil dari dalam go().
- * Layar tidak hanya berpindah karena tombol: sentuhan masih bisa memindahkannya
- * di board yang sentuhannya baik, dan refresh_cb memindahkan sendiri ke layar
- * "sedang mengukur" tanpa lewat go() sama sekali. Mengamati keadaan akhir
- * menangkap ketiganya; memanggil dari go() hanya menangkap satu. */
-static void fokus_ikuti_layar(void) {
-  lv_obj_t *akt = lv_scr_act();
-  if (akt == fokus_layar_lalu) return;
-
-  fokus_layar_t *lama = fokus_cari(fokus_layar_lalu, false);
-  if (lama && lama->n) fokus_sorot(lama->item[lama->i].obj, false);
-  fokus_layar_lalu = akt;
-
-  fokus_layar_t *baru = fokus_cari(akt, false);
-  if (!baru || !baru->n) return;   /* layar "sedang mengukur": memang tanpa kendali */
-  baru->i = fokus_awal(baru);
-  fokus_sorot(baru->item[baru->i].obj, true);
-}
-
-static void boot_geser(void) {
-  fokus_layar_t *f = fokus_cari(lv_scr_act(), false);
-  if (!f || f->n == 0) {
-    /* Layar "sedang mengukur" memang tidak punya kendali -- pengukuran berhenti
-     * sendiri saat detaknya cukup, dan membatalkannya bukan fitur yang ada. */
-    Serial.println("[boot] layar ini tidak punya kendali");
-    return;
-  }
-  fokus_sorot(f->item[f->i].obj, false);
-  f->i = (uint8_t)((f->i + 1) % f->n);
-  fokus_sorot(f->item[f->i].obj, true);
-  Serial.printf("[boot] sorot %u/%u: %s\n", (unsigned)(f->i + 1), (unsigned)f->n,
-                f->item[f->i].nav ? f->item[f->i].nav->name : "tombol utama");
-}
-
+/* Umpan balik penolakan wajib spesifik. "Tidak terjadi apa-apa" adalah cara
+ * tercepat membuat pengguna menyimpulkan jamnya rusak, padahal jam menolak
+ * karena alasan yang benar. */
 static void boot_aktifkan(void) {
-  fokus_layar_t *f = fokus_cari(lv_scr_act(), false);
-  if (!f || f->n == 0) return;
-  const fokus_item_t *it = &f->item[f->i];
-  if (it->nav) {
-    go(*it->nav->target, it->nav->forward, it->nav->name);
-    return;
+  bool idle = (jam_status() == AW_SESI_IDLE);
+  if (idle) jam_cek_manual();
+  else      jam_tekan_tombol();
+
+  switch (jam_umpan_balik_ditolak()) {
+    case JAM_TOLAK_SEDANG_UKUR: status_pesan("SEDANG MENGUKUR");   return;
+    case JAM_TOLAK_BATERAI:     status_pesan("BATERAI LEMAH");     return;
+    case JAM_TOLAK_SENSOR:      status_pesan("SENSOR TIDAK ADA");  return;
+    case JAM_TOLAK_SESI_AKTIF:  status_pesan("SESI SEDANG JALAN"); return;
+    case JAM_TOLAK_SESI_BERJALAN: status_pesan("SESI SUDAH MULAI"); return;
+    case JAM_TOLAK_BELUM_ARM:   status_pesan("BELUM DISIAPKAN");   return;
+    default: break;
   }
-  /* Tombol utama. Percabangan perannya sama persis dengan utama_release_cb(),
-   * tetapi TANPA pemeriksaan TAP_SLOP: yang diukur di sana adalah pergeseran
-   * jari di kaca, dan di jalur ini tidak ada jari sama sekali. aw_jam tetap
-   * memeriksa syaratnya sendiri, jadi baris ini soal maksud, bukan keamanan. */
-  if (jam_status() == AW_SESI_IDLE) jam_cek_manual();
-  else                              jam_tekan_tombol();
-  utama_btn_refresh();
+  status_pesan(idle ? "CEK MANUAL" : "SELESAI MAKAN");
 }
 
 static void boot_poll(void) {
-  fokus_ikuti_layar();
-
   int level = digitalRead(BOOT_KEY);            /* LOW = sedang ditekan */
   if (level != boot_level_lalu) {
     boot_level_lalu = level;
@@ -969,14 +813,9 @@ static void boot_poll(void) {
     } else if (!boot_siap) {
       boot_siap = true;
       Serial.println("[boot] tombol dilepas -- siap dipakai");
-    } else if (!boot_sudah_jalan) {
-      boot_geser();                             /* dilepas sebelum ambang lama */
     }
   }
 
-  /* Tekan lama dijalankan saat ambangnya terlewati, bukan saat jari dilepas.
-   * Kalau menunggu pelepasan, pengguna menahan tombol sambil menebak apakah
-   * sudah cukup lama -- dan tebakan itu satu-satunya umpan balik yang ada. */
   if (boot_siap && boot_stabil_lvl == LOW && !boot_sudah_jalan &&
       (uint32_t)(millis() - boot_tekan_ms) >= BOOT_LAMA_MS) {
     boot_sudah_jalan = true;
@@ -984,1190 +823,20 @@ static void boot_poll(void) {
   }
 }
 
-/* ================= Halaman 1 : Home ================= */
-static void build_home(void) {
-  scr_home = lv_obj_create(NULL);
-  lv_obj_remove_style_all(scr_home);
-  lv_obj_set_style_bg_color(scr_home, lv_color_hex(C_S1_BG), 0);
-  lv_obj_set_style_bg_opa(scr_home, LV_OPA_COVER, 0);
-  lv_obj_clear_flag(scr_home, LV_OBJ_FLAG_SCROLLABLE);
-
-  /* --- header --- */
-  lv_obj_t *hdr = mk_box(scr_home, 0, 0, SCREEN_W, 31, C_S1_HDR, 0);
-  mk_box(scr_home, 0, 31, SCREEN_W, 1, C_GOLD, 0);           /* garis emas */
-
-  /* Baris header disetel supaya pusat kapital "29C" dan "82%" sama-sama jatuh
-   * di y=13 seperti mockup: montserrat_12 punya line_height 15 dan base_line 3,
-   * jadi kapital mulai di (y_label + 4) dan pusatnya di (y_label + 8). */
-  mk_img(hdr, &img_weather, 12, 5);
-  lbl_wthr = mk_label(hdr, "--" TXT_DEG "C", &lv_font_montserrat_12, C_WHITE, 46, 5);
-  /* Handle disimpan supaya teksnya bisa diisi data OWM. Posisi, font, dan warna
-   * tidak diubah -- hanya pointernya yang kini dipegang. */
-  lbl_cond = mk_label(hdr, "--", &lv_font_montserrat_10, C_WHITE, 46, 17);
-
-  mk_box(hdr, 120, 7, 1, 18, C_S1_DIV, 0);                   /* pemisah */
-
-  /* Ikon Bluetooth, TIGA keadaan -- bukan dua (dokumen 14):
-   *   redup       tidak tersambung
-   *   biru pucat  tersambung, tapi aplikasi belum menulis CCCD
-   *   biru terang tersambung DAN dilanggani -- hanya ini yang berarti data
-   *               sedang benar-benar mengalir keluar
-   * Perbedaan kedua dan ketiga itu yang paling sering dikira sama; kalau
-   * digabung, jam yang tersambung tapi diam terlihat identik dengan jam yang
-   * bekerja normal.
-   *
-   * x=132 aman: persen baterai dirata-kanan ke x=190 dan string terlebar yang
-   * mungkin ("100%") mulai di ~159. */
-  lbl_ble = mk_label(hdr, LV_SYMBOL_BLUETOOTH, &lv_font_montserrat_12,
-                     C_S1_DIV, 132, 8);
-
-  /* Entri yang belum di-ack. Informasi yang menenangkan, bukan peringatan:
-   * buffer 64 entri setara ~16 sesi, jadi angka kecil di sini normal.
-   * Disembunyikan saat nol supaya header tidak ramai tanpa alasan. */
-  lbl_pending = mk_label(hdr, "", &lv_font_montserrat_10, C_S1_MUTED, 145, 9);
-  lv_obj_add_flag(lbl_pending, LV_OBJ_FLAG_HIDDEN);
-
-  /* Kelompok baterai. Angkanya dirata-kanan ke x=190 supaya jarak 7 px ke ikon
-   * tetap sama walau lebarnya berubah ("9%" vs "100%"). Ukuran font mengikuti
-   * mockup: kapital 8 px / lebar 25 px = montserrat_12, sepasang dengan "29C". */
-  /* "--%", bukan "82%". Angka awal yang tampak masuk akal adalah angka karangan,
-   * persis yang dihindari di seluruh layar kesehatan: kalau sebuah nilai belum
-   * tersedia, labelnya "--". Biasanya ia cuma tampil ~500 ms sampai refresh_cb
-   * pertama, tetapi kalau ADC bermasalah dan battery_valid() tidak pernah true,
-   * "82%" akan bertahan selamanya sebagai laporan palsu tentang sisa daya. */
-  lbl_batt = mk_label(hdr, "--%", &lv_font_montserrat_12, C_BATT, 0, 5);
-  lv_obj_set_width(lbl_batt, 190);
-  lv_obj_set_style_text_align(lbl_batt, LV_TEXT_ALIGN_RIGHT, 0);
-
-  /* 1baru.png menghapus label "BATERAI" -- tinggal persentase + ikon. */
-  mk_img(hdr, &img_battery, 197, 8);
-
-  /* ================= Tata letak vertikal halaman home =================
-   * Urutan: ilustrasi -> pil status -> tombol sesi -> jam -> hari+tanggal.
-   *
-   * Ruang di bawah header hanya 248 px (y=32..279) dan sekarang harus memuat
-   * satu elemen tambahan. Anggarannya, memakai tinggi kotak font sebenarnya:
-   *   pesawat 122 + tombol 46 + jam 52 (font_digits_48) + baris tanggal 15
-   *   = 235, menyisakan 13 px untuk SELURUH jarak antar-elemen.
-   *
-   * Karena itu dua hal berubah, dan keduanya memang menghasilkan tempat:
-   *   - hari dan tanggal digabung jadi satu baris (hemat 17 px). Keduanya toh
-   *     selalu berubah pada saat yang sama, yaitu saat tanggal berganti.
-   *   - pemisah garis-berlian-garis dilepas (hemat 10 px). Tempatnya persis
-   *     yang kini ditempati tombol daya, dan tombol itu sendiri sudah menjadi
-   *     pemisah visual antara ilustrasi dan blok jam.
-   *
-   * Jarak antar kotak terbaca rapat di koordinat, tapi tidak di layar: kotak
-   * font_digits_48 punya 9 px kosong di atas ink digit dan 9 px di bawahnya,
-   * dan montserrat_12 punya 4 px di atas kapital. Jarak visual dari ink jam ke
-   * kapital tanggal misalnya 14 px, bukan 1 px seperti yang terbaca dari
-   * selisih koordinatnya.
-   */
-
-  /* --- ilustrasi pesawat + bulan (152x122) ---
-   * Sekaligus jalan menuju menu kesehatan. Tombol home sudah dipakai sesi, dan
-   * menambah tombol kelima ke layar 240x280 yang sudah padat akan lebih buruk
-   * daripada memakai gambar yang toh sudah ada di sana. Ketuk-saja, sehingga
-   * geseran tidak membukanya. */
-  lv_obj_t *img_ilus = mk_img(scr_home, &img_plane, 44, 33);
-  mk_tap_nav(img_ilus, 0, &NAV_MENU_DARI_HOME);
-
-  /* --- pil status sesi, menempel di atas tombol ---
-   * 19 px terakhir dari pita ilustrasi. Ia memang menutupi sedikit bagian bawah
-   * gambar, dan itu pilihan sadar: tanpa baris ini tombol di bawahnya tidak
-   * punya penjelasan sama sekali, dan pengguna yang menekan tombol redup lalu
-   * tidak terjadi apa-apa akan menyimpulkan jamnya rusak. */
-  lv_obj_t *pil = mk_box(scr_home, 25, 136, 190, 19, C_S1_HDR, 9);
-  lbl_sesi = mk_label(pil, "", &lv_font_montserrat_10, C_S1_MUTED, 0, 0);
-  lv_obj_set_width(lbl_sesi, 186);
-  lv_obj_set_style_text_align(lbl_sesi, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_center(lbl_sesi);
-
-  /* --- tombol utama, di tengah tepat di bawah ilustrasi ---
-   * Tetap 46x46 di x=97 seperti sebelumnya: ini satu-satunya kendali di layar
-   * ini, jadi ia memang milik sumbu tengah. Perannya yang berganti mengikuti
-   * status sesi, bukan posisinya. */
-  btn_utama = mk_box(scr_home, 97, 159, 46, 46, C_S1_HDR, LV_RADIUS_CIRCLE);
-  lv_obj_set_style_border_width(btn_utama, 2, 0);
-  lv_obj_set_style_border_color(btn_utama, lv_color_hex(C_S1_DIV), 0);
-  lv_obj_set_style_border_opa(btn_utama, LV_OPA_COVER, 0);
-  mk_touchable(btn_utama, 14);          /* target sentuh efektif jadi ~74x74 */
-  lv_obj_add_event_cb(btn_utama, tap_press_cb,     LV_EVENT_PRESSED,  NULL);
-  lv_obj_add_event_cb(btn_utama, utama_release_cb, LV_EVENT_RELEASED, NULL);
-  fokus_daftar(btn_utama, NULL, false);   /* nav NULL = "jalankan tombol utama" */
-
-  ic_utama = mk_label(btn_utama, LV_SYMBOL_POWER, &lv_font_montserrat_22,
-                      C_S1_LINE, 0, 0);
-  lv_obj_center(ic_utama);
-
-  /* --- jam: "10" [kotak][kotak] "24" ---
-   * Kotak titik dua tetap di +16 dan +32 dari y label: jarak relatifnya
-   * terhadap ink digit (y+9..y+43) sama persis seperti tata letak sebelumnya. */
-  lbl_hh = mk_label(scr_home, "10", &font_digits_48, 0xFFFFFF, 0, 206);
-  lv_obj_set_width(lbl_hh, 112);
-  lv_obj_set_style_text_align(lbl_hh, LV_TEXT_ALIGN_RIGHT, 0);
-
-  mk_box(scr_home, 116, 222, 8, 8, C_AMBER, 1);
-  mk_box(scr_home, 116, 238, 8, 8, C_AMBER, 1);
-
-  lbl_mm = mk_label(scr_home, "24", &font_digits_48, 0xFFFFFF, 128, 206);
-
-  /* --- hari + tanggal, satu baris ---
-   * letter_space 1, bukan 2: string terpanjang yang mungkin muncul
-   * ("MINGGU " TXT_DOT " 28 SEPTEMBER 2026") terukur 215 px di montserrat_12
-   * dengan spasi 1, tapi 240 px dengan spasi 2 -- tepat selebar layar, tanpa
-   * margin sama sekali. Diukur dari tabel advance width font-nya, bukan
-   * dikira-kira.
-   *
-   * y=259 menyisakan 6 px di bawah, sama seperti tata letak lama -- panel 1.69"
-   * ini bersudut membulat, jadi baris terakhir sengaja tidak dirapatkan ke tepi.
-   * Kotak jam (206..257) karenanya juga tidak menimpa kotak baris ini, dan
-   * jarak ink digit ke kapital tanggal jadi 14 px -- persis seperti sebelumnya,
-   * karena kotak font_digits_48 sendiri menyumbang 9 px kosong di bawah
-   * angkanya. */
-  lbl_date = mk_label(scr_home, "KAMIS " TXT_DOT " 23 JULI 2026",
-                      &lv_font_montserrat_12, C_DATE, 0, 259);
-  lv_obj_set_style_text_letter_space(lbl_date, 1, 0);
-  lv_obj_set_width(lbl_date, SCREEN_W);
-  lv_obj_set_style_text_align(lbl_date, LV_TEXT_ALIGN_CENTER, 0);
-
-  utama_btn_refresh();
-}
-
-/* ================= Layar "sedang mengukur" =================
- * Dokumen 14: dengan sensor sungguhan satu pengukuran makan puluhan detik dan
- * pengguna harus diam, jadi ia perlu layarnya sendiri -- bukan sekadar ikon di
- * pojok. Layar ini muncul sendiri saat pengukuran mulai dan menghilang sendiri
- * saat selesai; tidak ada tombol batal, karena dokumen memang tidak memberi
- * jam wewenang membatalkan pengukuran (itu milik opcode BATAL_SESI dari
- * aplikasi), dan pengukuran toh berhenti sendiri dalam satu menit.
- *
- * Daftar keempat metrik bukan hiasan: ia menjawab pertanyaan yang paling wajar
- * saat menunggu, yaitu "ini sedang jalan atau menggantung". Titik yang satu per
- * satu berubah hijau memperlihatkan kemajuan yang sebenarnya, dan yang belum
- * hijau saat waktu habis persis metrik yang nanti dikirim sebagai sentinel 0.
- */
-static void build_meas(void) {
-  scr_meas = lv_obj_create(NULL);
-  lv_obj_remove_style_all(scr_meas);
-  lv_obj_set_style_bg_color(scr_meas, lv_color_hex(C_S1_BG), 0);
-  lv_obj_set_style_bg_opa(scr_meas, LV_OPA_COVER, 0);
-  lv_obj_clear_flag(scr_meas, LV_OBJ_FLAG_SCROLLABLE);
-
-  mk_deco(scr_meas, 220, 40, 44, C_S1_HDR);
-  mk_deco(scr_meas, 18, 245, 40, C_S1_HDR);
-
-  lbl_meas_judul = mk_label(scr_meas, "Mengukur", &lv_font_montserrat_16,
-                            0xFFFFFF, 0, 26);
-  lv_obj_set_width(lbl_meas_judul, SCREEN_W);
-  lv_obj_set_style_text_align(lbl_meas_judul, LV_TEXT_ALIGN_CENTER, 0);
-
-  lbl_meas_sub = mk_label(scr_meas, "Tempelkan jari, jangan bergerak",
-                          &lv_font_montserrat_10, C_S1_MUTED, 0, 50);
-  lv_obj_set_width(lbl_meas_sub, SCREEN_W);
-  lv_obj_set_style_text_align(lbl_meas_sub, LV_TEXT_ALIGN_CENTER, 0);
-
-  /* Empat baris metrik. Urutannya mengikuti urutan matangnya di ppg.cpp --
-   * detak lebih dulu, glukosa dan tensi paling akhir -- supaya titik-titiknya
-   * menyala kira-kira dari atas ke bawah dan terbaca sebagai kemajuan. */
-  static const char *NAMA[4] = { "Detak jantung", "SpO2", "Glukosa", "Tekanan darah" };
-  for (int i = 0; i < 4; i++) {
-    int y = 78 + i * 30;
-    lv_obj_t *baris = mk_box(scr_meas, 20, y, 200, 24, C_S1_HDR, 8);
-    dot_meas[i] = mk_box(baris, 0, 0, 10, 10, C_S1_DIV, LV_RADIUS_CIRCLE);
-    lv_obj_align(dot_meas[i], LV_ALIGN_LEFT_MID, 10, 0);
-    lbl_meas_metrik[i] = mk_label(baris, NAMA[i], &lv_font_montserrat_12,
-                                  C_S1_MUTED, 0, 0);
-    lv_obj_align(lbl_meas_metrik[i], LV_ALIGN_LEFT_MID, 28, 0);
-  }
-
-  /* Bar kemajuan waktu. Dibuat dari dua kotak polos, bukan lv_bar: satu-satunya
-   * yang berubah adalah lebar kotak dalam, dan lv_bar membawa animasi + style
-   * indicator yang tidak dipakai di sini. */
-  mk_box(scr_meas, 20, 212, 200, 6, C_S1_HDR, 3);
-  bar_meas = mk_box(scr_meas, 20, 212, 0, 6, C_AMBER, 3);
-
-  lbl_meas_waktu = mk_label(scr_meas, "0s", &lv_font_montserrat_12,
-                            C_S1_MUTED, 0, 228);
-  lv_obj_set_width(lbl_meas_waktu, SCREEN_W);
-  lv_obj_set_style_text_align(lbl_meas_waktu, LV_TEXT_ALIGN_CENTER, 0);
-}
-
-/* ================= Halaman 2 : Menu kesehatan ================= */
-/* Satu kartu menu: latar berwarna, ikon, judul, nilai, chevron.
- *
- * Tinggi kartu diparameterkan (dulu tetap 64 px) sejak kartu ke-4 (Tekanan
- * darah) ditambahkan -- 4 kartu 64 px + footer tidak muat di layar 280 px
- * tinggi, jadi seluruh kartu diperkecil bersama-sama, bukan cuma yang baru. */
-static lv_obj_t *mk_card(lv_obj_t *scr, int y, int h, uint32_t bg, const char *title,
-                         const char *val, uint32_t c_title, uint32_t c_sub,
-                         const nav_target_t *nav, lv_obj_t **out_val) {
-  lv_obj_t *card = mk_box(scr, 10, y, 220, h, bg, 12);
-  mk_tap_nav(card, 0, nav);         /* 220 px lebar, sudah cukup besar */
-
-  mk_label(card, title, &lv_font_montserrat_14, c_title, 45, 6);
-  *out_val = mk_label(card, val, &lv_font_montserrat_14, c_sub, 45, 24);
-
-  lv_obj_t *ch = mk_label(card, LV_SYMBOL_RIGHT, &lv_font_montserrat_12, c_sub, 0, 0);
-  lv_obj_align(ch, LV_ALIGN_RIGHT_MID, -10, 0);
-  return card;
-}
-
-static void build_menu(void) {
-  scr_menu = lv_obj_create(NULL);
-  lv_obj_remove_style_all(scr_menu);
-  lv_obj_set_style_bg_color(scr_menu, lv_color_hex(C_S2_BG), 0);
-  lv_obj_set_style_bg_opa(scr_menu, LV_OPA_COVER, 0);
-  lv_obj_clear_flag(scr_menu, LV_OBJ_FLAG_SCROLLABLE);
-
-  mk_header(scr_menu, "Menu kesehatan", C_S2_BTN, &NAV_HOME);
-
-  /* 4 kartu tinggi 52 px, jarak 60 px (gap 8 px): 42, 102, 162, 222 ->
-   * kartu terakhir berakhir di 274, menyisakan 6 px ke tepi bawah layar
-   * bundar -- sama seperti margin bawah di halaman home. Footer
-   * "3 sensor aktif..." dihapus: tidak ada lagi ruang untuknya, dan dengan
-   * 4 metrik dari sensor yang sama, "3 sensor" sudah tidak akurat juga. */
-  static const int CARD_H = 52, CARD_Y0 = 42, CARD_DY = 60;
-  lv_obj_t *c1 = mk_card(scr_menu, CARD_Y0,              CARD_H, C_HR_BG, "Heart rate", "-- bpm",
-                         C_HR_TITLE, C_HR_SUB, &NAV_HR,   &lbl_card_hr);
-  lv_obj_t *c2 = mk_card(scr_menu, CARD_Y0 + CARD_DY,     CARD_H, C_SP_BG, "SpO2", "-- %",
-                         C_SP_TITLE, C_SP_SUB, &NAV_SPO2, &lbl_card_sp);
-  lv_obj_t *c3 = mk_card(scr_menu, CARD_Y0 + CARD_DY * 2, CARD_H, C_GL_BG, "Glukosa", "-- mg/dL",
-                         C_GL_TITLE, C_GL_SUB, &NAV_GLU,  &lbl_card_gl);
-  lv_obj_t *c4 = mk_card(scr_menu, CARD_Y0 + CARD_DY * 3, CARD_H, C_BP_BG, "Tekanan darah", "--/-- mmHg",
-                         C_BP_TITLE, C_BP_SUB, &NAV_BP,   &lbl_card_bp);
-
-  /* ikon kartu: dipusatkan vertikal lewat align, bukan koordinat y tetap --
-   * tahan terhadap perubahan tinggi kartu di masa depan. */
-  lv_obj_t *i1 = mk_img(c1, &img_heart_sm, 12, 0); lv_obj_align(i1, LV_ALIGN_LEFT_MID, 12, 0);
-  lv_obj_t *i2 = mk_img(c2, &img_drop,     14, 0); lv_obj_align(i2, LV_ALIGN_LEFT_MID, 14, 0);
-  lv_obj_t *i3 = mk_box(c3, 0, 0, 16, 16, C_AMBER2, LV_RADIUS_CIRCLE); lv_obj_align(i3, LV_ALIGN_LEFT_MID, 14, 0);
-  lv_obj_t *i4 = mk_box(c4, 0, 0, 16, 16, C_PURPLE, LV_RADIUS_CIRCLE); lv_obj_align(i4, LV_ALIGN_LEFT_MID, 14, 0);
-}
-
-/* ================= Halaman 3 : Heart rate ================= */
-/* Gelombang EKG: 4 denyut, koordinat relatif terhadap posisi objek line. */
-#define ECG_BEATS 4
-#define ECG_PTS   (ECG_BEATS * 6 + 1)
-static lv_point_t ecg_pts[ECG_PTS];
-
-static void ecg_build(void) {
-  /* satu denyut: datar, takik kecil, spike naik, palung, kembali datar */
-  static const int dx[6] = { 0, 12, 16, 20, 26, 30 };
-  static const int dy[6] = { 0, 0,   3, -11,  8,  0 };
-  int i = 0;
-  for (int b = 0; b < ECG_BEATS; b++) {
-    int x0 = b * 55;
-    for (int k = 0; k < 6; k++) {
-      ecg_pts[i].x = x0 + dx[k];
-      ecg_pts[i].y = 12 + dy[k];
-      i++;
-    }
-  }
-  ecg_pts[i].x = ECG_BEATS * 55;
-  ecg_pts[i].y = 12;
-}
-
-static void build_hr(void) {
-  scr_hr = lv_obj_create(NULL);
-  lv_obj_remove_style_all(scr_hr);
-  lv_obj_set_style_bg_color(scr_hr, lv_color_hex(C_S3_BG), 0);
-  lv_obj_set_style_bg_opa(scr_hr, LV_OPA_COVER, 0);
-  lv_obj_clear_flag(scr_hr, LV_OBJ_FLAG_SCROLLABLE);
-
-  mk_deco(scr_hr, 220, 48, 48, C_S3_DECO);
-  mk_deco(scr_hr, 15, 230, 45, C_S3_DECO);
-
-  mk_header(scr_hr, "Heart rate", C_S3_CARD, &NAV_MENU);
-
-  /* penanda "live" */
-  dot_live = mk_box(scr_hr, 198, 19, 6, 6, C_GREEN2, LV_RADIUS_CIRCLE);
-  mk_label(scr_hr, "live", &lv_font_montserrat_12, C_GREEN2, 208, 15);
-
-  /* arc + ikon hati */
-  arc_hr = lv_arc_create(scr_hr);
-  lv_obj_set_pos(arc_hr, 16, 50);
-  lv_obj_set_size(arc_hr, 68, 68);
-  lv_arc_set_rotation(arc_hr, 135);
-  lv_arc_set_bg_angles(arc_hr, 0, 270);
-  lv_arc_set_range(arc_hr, 0, 100);
-  lv_arc_set_value(arc_hr, 0);
-  lv_obj_remove_style(arc_hr, NULL, LV_PART_KNOB);
-  lv_obj_clear_flag(arc_hr, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_set_style_arc_width(arc_hr, 7, LV_PART_MAIN);
-  lv_obj_set_style_arc_width(arc_hr, 7, LV_PART_INDICATOR);
-  lv_obj_set_style_arc_color(arc_hr, lv_color_hex(C_S3_TRACK), LV_PART_MAIN);
-  lv_obj_set_style_arc_color(arc_hr, lv_color_hex(C_PINK), LV_PART_INDICATOR);
-  lv_obj_set_style_arc_rounded(arc_hr, true, LV_PART_INDICATOR);
-  lv_obj_set_style_bg_opa(arc_hr, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(arc_hr, 0, 0);
-  /* Posisi dihitung, bukan dikira: aset sekarang 21x20 dengan pusat hati di
-   * (9.5, 9.0) di dalamnya, jadi (40,75) menempatkan pusat hati di (49.5, 84.0)
-   * -- pusat arc ada di (16+34, 50+34) = (50, 84). Sebelumnya aset 30x30 di
-   * (35,69) menaruh hati di (45, 78.5) karena padding crop-nya tidak simetris. */
-  mk_img(scr_hr, &img_heart_lg, 40, 75);
-
-  lbl_hr_big = mk_label(scr_hr, "--", &lv_font_montserrat_30, 0xFFFFFF, 96, 64);
-  mk_label(scr_hr, "bpm", &lv_font_montserrat_14, C_S3_MUTE, 151, 84);
-
-  lbl_hr_zone = mk_label(scr_hr, "Zona: -- " TXT_DOT " -- target",
-                         &lv_font_montserrat_10, C_PINK, 94, 103);
-
-  static const int    zw[3] = { 36, 37, 37 };
-  static const uint32_t zc[3] = { C_GREEN, C_YELLOW, C_RED };
-  mark_hr = mk_zonebar(scr_hr, 94, 118, 110, 9, zw, zc, 3, 26);
-
-  /* EKG */
-  ecg_build();
-  lv_obj_t *ln = lv_line_create(scr_hr);
-  lv_line_set_points(ln, ecg_pts, ECG_PTS);
-  lv_obj_set_pos(ln, 10, 139);
-  lv_obj_set_style_line_color(ln, lv_color_hex(C_PINK), 0);
-  lv_obj_set_style_line_width(ln, 2, 0);
-  lv_obj_set_style_line_rounded(ln, false, 0);
-
-  mk_label(scr_hr, "24 jam terakhir", &lv_font_montserrat_12, C_S3_MUTE, 10, 165);
-
-  /* bar 12 jam terakhir, batang terakhir disorot */
-  static const int bh[12] = { 17, 15, 19, 14, 23, 27, 21, 17, 25, 20, 16, 23 };
-  for (int i = 0; i < 12; i++) {
-    mk_box(scr_hr, 11 + i * 18, 214 - bh[i], 12, bh[i],
-           i == 11 ? C_PINK : C_S3_BAR, 3);
-  }
-
-  mk_chips(scr_hr, "Ist. --", "Avg --", "Max --", C_S3_CARD, C_HR_TITLE, chip_hr);
-}
-
-/* ================= Halaman 4 : SpO2 ================= */
-static lv_chart_series_t *sp_ser;
-static lv_obj_t *sp_chart;
-
-static void build_spo2(void) {
-  scr_spo2 = lv_obj_create(NULL);
-  lv_obj_remove_style_all(scr_spo2);
-  lv_obj_set_style_bg_color(scr_spo2, lv_color_hex(C_S4_BG), 0);
-  lv_obj_set_style_bg_opa(scr_spo2, LV_OPA_COVER, 0);
-  lv_obj_clear_flag(scr_spo2, LV_OBJ_FLAG_SCROLLABLE);
-
-  mk_deco(scr_spo2, 15, 65, 38, C_S4_DECO);
-  mk_deco(scr_spo2, 215, 235, 48, C_S4_DECO);
-
-  /* judul "SpO2" -- angka 2 dibuat subscript dengan label kecil terpisah */
-  mk_header(scr_spo2, "SpO", C_S4_CARD, &NAV_MENU);
-  mk_label(scr_spo2, "2", &lv_font_montserrat_10, 0xFFFFFF, 78, 21);
-
-  mk_pill(scr_spo2, 152, 78, "terukur 10:20", C_S4_CARD, C_GREEN2);
-
-  /* ring besar */
-  ring_sp = lv_arc_create(scr_spo2);
-  lv_obj_set_pos(ring_sp, 24, 56);
-  lv_obj_set_size(ring_sp, 93, 93);
-  lv_arc_set_rotation(ring_sp, 270);
-  lv_arc_set_bg_angles(ring_sp, 0, 360);
-  lv_arc_set_range(ring_sp, 0, 100);
-  lv_arc_set_value(ring_sp, 0);
-  lv_obj_remove_style(ring_sp, NULL, LV_PART_KNOB);
-  lv_obj_clear_flag(ring_sp, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_set_style_arc_width(ring_sp, 9, LV_PART_MAIN);
-  lv_obj_set_style_arc_width(ring_sp, 9, LV_PART_INDICATOR);
-  lv_obj_set_style_arc_color(ring_sp, lv_color_hex(C_S4_DECO), LV_PART_MAIN);
-  lv_obj_set_style_arc_color(ring_sp, lv_color_hex(C_BLUE), LV_PART_INDICATOR);
-  lv_obj_set_style_arc_rounded(ring_sp, true, LV_PART_INDICATOR);
-  lv_obj_set_style_bg_opa(ring_sp, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(ring_sp, 0, 0);
-
-  /* Ukuran font diambil dari mockup 4.png, bukan dikira-kira. Terukur di sana:
-   * "98%" lebar 45.5 px dengan tinggi cap 15 px. montserrat_22 memberi 46.3 px
-   * dan cap 16 px -- selisih di bawah 1 px. montserrat_30 yang dipakai
-   * sebelumnya menghasilkan 63.1 px, 39% lebih lebar dari desainnya.
-   *
-   * Itu juga sebab "100%" meleset: pada font 30 lebarnya 76.4 px, sementara
-   * ring hanya membentang x=24..117 dan kotak legenda mulai di x=132 -- jadi
-   * angkanya keluar ring lalu menabrak legenda. Pada font 22 lebarnya 56.1 px,
-   * masuk nyaman di ruang dalam ring yang di puncak angka hanya ~65 px. */
-  lbl_sp_big = mk_label(scr_spo2, "--", &lv_font_montserrat_22, 0xFFFFFF, 0, 0);
-  /* Lebar dipatok selebar ring dengan teks di-center. Tanpa ini angkanya
-   * bergeser setiap kali jumlah digit berubah: lv_obj_align_to() menghitung
-   * posisi SEKALI saat dipanggil -- dan saat itu isinya masih "--" (16.9 px) --
-   * lalu tidak pernah menghitung ulang ketika label melebar. Dengan lebar
-   * tetap, yang bergeser isi labelnya, bukan kotaknya. */
-  lv_obj_set_width(lbl_sp_big, 93);
-  lv_obj_set_style_text_align(lbl_sp_big, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_align_to(lbl_sp_big, ring_sp, LV_ALIGN_CENTER, 0, -7);
-
-  /* "oksigen" ikut dikecilkan ke montserrat_10 (40.2 px, mockup 37.5 px).
-   * Kalau dibiarkan di montserrat_14 ia jadi 56.2 px -- LEBIH LEBAR dari
-   * nilainya sendiri (46.3 px), sehingga hierarki visualnya terbalik.
-   * dy +13, bukan +16: terukur dari mockup, pusat ink-nya +14 dari pusat ring
-   * dan pusat ink label ada +1 px di bawah pusat kotaknya. */
-  lv_obj_t *ok = mk_label(scr_spo2, "oksigen", &lv_font_montserrat_10, C_BLUE, 0, 0);
-  lv_obj_align_to(ok, ring_sp, LV_ALIGN_CENTER, 0, 13);
-
-  /* legend zona */
-  static const char *lg[3] = { "95-100 normal", "90-94 rendah", "<90 kritis" };
-  static const uint32_t lc[3] = { C_GREEN2, C_YELLOW, C_RED };
-  for (int i = 0; i < 3; i++) {
-    mk_box(scr_spo2, 132, 84 + i * 16, 9, 9, lc[i], 2);
-    mk_label(scr_spo2, lg[i], &lv_font_montserrat_10, C_S4_MUTE, 146, 81 + i * 16);
-  }
-
-  mk_label(scr_spo2, "Riwayat 7 pengukuran", &lv_font_montserrat_12, C_S4_MUTE, 11, 157);
-
-  /* grafik riwayat */
-  sp_chart = lv_chart_create(scr_spo2);
-  lv_obj_set_pos(sp_chart, 7, 172);
-  lv_obj_set_size(sp_chart, 226, 34);
-  lv_chart_set_type(sp_chart, LV_CHART_TYPE_LINE);
-  lv_chart_set_point_count(sp_chart, 7);
-  lv_chart_set_range(sp_chart, LV_CHART_AXIS_PRIMARY_Y, 92, 100);
-  lv_chart_set_div_line_count(sp_chart, 0, 0);
-  lv_obj_set_style_bg_opa(sp_chart, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(sp_chart, 0, 0);
-  lv_obj_set_style_pad_all(sp_chart, 5, 0);
-  lv_obj_set_style_line_width(sp_chart, 2, LV_PART_ITEMS);
-  lv_obj_set_style_size(sp_chart, 6, LV_PART_INDICATOR);
-  lv_obj_set_style_bg_color(sp_chart, lv_color_hex(C_BLUE), LV_PART_INDICATOR);
-  lv_obj_clear_flag(sp_chart, LV_OBJ_FLAG_SCROLLABLE);
-  sp_ser = lv_chart_add_series(sp_chart, lv_color_hex(C_BLUE), LV_CHART_AXIS_PRIMARY_Y);
-  static const int spv[7] = { 95, 96, 95, 97, 96, 98, 98 };
-  for (int i = 0; i < 7; i++) lv_chart_set_value_by_id(sp_chart, sp_ser, i, spv[i]);
-
-  mk_chips(scr_spo2, "Min --", "Avg --", "--", C_S4_CARD, C_S4_TITLE, chip_sp);
-}
-
-/* ================= Halaman 5 : Glukosa ================= */
-static lv_chart_series_t *gl_ser;
-static lv_obj_t *gl_chart;
-
-static void build_glu(void) {
-  scr_glu = lv_obj_create(NULL);
-  lv_obj_remove_style_all(scr_glu);
-  lv_obj_set_style_bg_color(scr_glu, lv_color_hex(C_S5_BG), 0);
-  lv_obj_set_style_bg_opa(scr_glu, LV_OPA_COVER, 0);
-  lv_obj_clear_flag(scr_glu, LV_OBJ_FLAG_SCROLLABLE);
-
-  mk_deco(scr_glu, 220, 55, 45, C_S5_DECO);
-  mk_deco(scr_glu, 15, 235, 45, C_S5_DECO);
-
-  mk_header(scr_glu, "Glukosa darah", C_S5_CARD, &NAV_MENU);
-  mk_pill(scr_glu, 168, 72, "stabil " LV_SYMBOL_RIGHT, C_S5_CARD, C_GREEN2);
-
-  lbl_glu_big = mk_label(scr_glu, "--", &font_digits_46, 0xFFFFFF, 12, 42);
-  mk_label(scr_glu, "mg/dL", &lv_font_montserrat_14, C_S5_MUTE, 72, 66);
-
-  /* Bar digeser ke x=122 (mockup: 110) karena montserrat_46 lebih lebar dari
-   * font mockup, jadi "96" + "mg/dL" butuh 12 px ekstra. */
-  static const int    gw[3] = { 19, 53, 25 };
-  static const uint32_t gc[3] = { C_YELLOW, C_GREEN, C_RED };
-  mark_glu = mk_zonebar(scr_glu, 122, 62, 97, 7, gw, gc, 3, 32);
-
-  /* Teks ini semula mengklaim "Normal" tanpa melihat data. Sekarang mengikuti
-   * nilai sebenarnya -- klaim klinis yang salah lebih buruk daripada "--". */
-  lbl_glu_status = mk_label(scr_glu, "Menunggu pengukuran",
-                            &lv_font_montserrat_10, C_GREEN2, 10, 91);
-
-  mk_label(scr_glu, "Tren hari ini", &lv_font_montserrat_12, C_S5_MUTE, 10, 111);
-
-  /* panel + grafik tren */
-  mk_box(scr_glu, 10, 128, 224, 30, C_S5_CARD, 6);
-  gl_chart = lv_chart_create(scr_glu);
-  lv_obj_set_pos(gl_chart, 10, 126);
-  lv_obj_set_size(gl_chart, 224, 40);
-  lv_chart_set_type(gl_chart, LV_CHART_TYPE_LINE);
-  lv_chart_set_point_count(gl_chart, 7);
-  lv_chart_set_range(gl_chart, LV_CHART_AXIS_PRIMARY_Y, 80, 132);
-  lv_chart_set_div_line_count(gl_chart, 0, 0);
-  lv_obj_set_style_bg_opa(gl_chart, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(gl_chart, 0, 0);
-  lv_obj_set_style_pad_all(gl_chart, 5, 0);
-  lv_obj_set_style_line_width(gl_chart, 2, LV_PART_ITEMS);
-  lv_obj_set_style_size(gl_chart, 6, LV_PART_INDICATOR);
-  lv_obj_set_style_bg_color(gl_chart, lv_color_hex(C_AMBER2), LV_PART_INDICATOR);
-  lv_obj_clear_flag(gl_chart, LV_OBJ_FLAG_SCROLLABLE);
-  gl_ser = lv_chart_add_series(gl_chart, lv_color_hex(C_AMBER2), LV_CHART_AXIS_PRIMARY_Y);
-  static const int glv[7] = { 86, 90, 124, 96, 104, 112, 108 };
-  for (int i = 0; i < 7; i++) lv_chart_set_value_by_id(gl_chart, gl_ser, i, glv[i]);
-
-  /* label sumbu waktu */
-  mk_label(scr_glu, "06.00", &lv_font_montserrat_10, C_S5_MUTE, 10, 175);
-  lv_obj_t *m = mk_label(scr_glu, "08.00", &lv_font_montserrat_10, C_S5_MUTE, 0, 175);
-  lv_obj_set_width(m, SCREEN_W);
-  lv_obj_set_style_text_align(m, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_t *r = mk_label(scr_glu, "10.00", &lv_font_montserrat_10, C_S5_MUTE, 0, 175);
-  lv_obj_set_width(r, 230);
-  lv_obj_set_style_text_align(r, LV_TEXT_ALIGN_RIGHT, 0);
-
-  mk_chips(scr_glu, "Min --", "Maks --", "PI --", C_S5_CARD, C_GL_TITLE, chip_gl);
-}
-
-/* ================= Halaman 6 : Tekanan darah =================
- * Tidak ada mockup untuk halaman ini (fitur ditambahkan belakangan). Geometri
- * di bawah SENGAJA meniru rima vertikal halaman 5 (Glukosa) piksel demi piksel
- * -- itu satu-satunya halaman yang sudah terbukti muat di layar 240x280 dengan
- * struktur setara (angka besar + bar zona + status + tren + chip), jadi lebih
- * aman menyalin proporsinya daripada menerka ulang dari nol. */
-static lv_chart_series_t *bp_ser_sbp, *bp_ser_dbp;
-static lv_obj_t *bp_chart;
-
-static void build_bp(void) {
-  scr_bp = lv_obj_create(NULL);
-  lv_obj_remove_style_all(scr_bp);
-  lv_obj_set_style_bg_color(scr_bp, lv_color_hex(C_S6_BG), 0);
-  lv_obj_set_style_bg_opa(scr_bp, LV_OPA_COVER, 0);
-  lv_obj_clear_flag(scr_bp, LV_OBJ_FLAG_SCROLLABLE);
-
-  mk_deco(scr_bp, 220, 55, 45, C_S6_DECO);
-  mk_deco(scr_bp, 15, 235, 45, C_S6_DECO);
-
-  mk_header(scr_bp, "Tekanan darah", C_S6_CARD, &NAV_MENU);
-  /* Lencana permanen, bukan data yang bisa jadi basi seperti pill "terukur
-   * 10:20" di halaman SpO2 -- di sini lebih penting selalu terlihat mengingat
-   * modelnya bahkan belum dapat satu titik kalibrasi pun (lihat ppg.cpp). */
-  mk_pill(scr_bp, 152, 78, "eksperimental", C_S6_CARD, C_S6_MUTE);
-
-  /* "120/80" pakai montserrat_30 biasa, bukan font_digits: font_digits cuma
-   * berisi glyph 0-9 dan '-', tidak ada '/' untuk memisahkan sistol/diastol. */
-  lbl_bp_big = mk_label(scr_bp, "--/--", &lv_font_montserrat_30, 0xFFFFFF, 12, 42);
-  mk_label(scr_bp, "mmHg", &lv_font_montserrat_14, C_S6_MUTE, 150, 60);
-
-  static const int    bw[4] = { 14, 40, 25, 18 };
-  static const uint32_t bc[4] = { C_BLUE, C_GREEN, C_YELLOW, C_RED };
-  mark_bp = mk_zonebar(scr_bp, 122, 62, 97, 7, bw, bc, 4, 32);
-
-  lbl_bp_status = mk_label(scr_bp, "Menunggu pengukuran",
-                           &lv_font_montserrat_10, C_S6_MUTE, 10, 91);
-
-  mk_label(scr_bp, "Tren hari ini", &lv_font_montserrat_12, C_S6_MUTE, 10, 111);
-
-  /* panel + grafik tren, dua seri (sistol/diastol) */
-  mk_box(scr_bp, 10, 128, 224, 30, C_S6_CARD, 6);
-  bp_chart = lv_chart_create(scr_bp);
-  lv_obj_set_pos(bp_chart, 10, 126);
-  lv_obj_set_size(bp_chart, 224, 40);
-  lv_chart_set_type(bp_chart, LV_CHART_TYPE_LINE);
-  lv_chart_set_point_count(bp_chart, 7);
-  lv_chart_set_range(bp_chart, LV_CHART_AXIS_PRIMARY_Y, 50, 160);
-  lv_chart_set_div_line_count(bp_chart, 0, 0);
-  lv_obj_set_style_bg_opa(bp_chart, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(bp_chart, 0, 0);
-  lv_obj_set_style_pad_all(bp_chart, 5, 0);
-  lv_obj_set_style_line_width(bp_chart, 2, LV_PART_ITEMS);
-  /* Titik indikator dimatikan (size 0), beda dengan chart SpO2/glukosa yang
-   * cuma satu seri: dengan dua seri di sini titiknya akan memakai satu warna
-   * default yang sama untuk sistol maupun diastol dan malah membingungkan --
-   * warna garis saja sudah cukup membedakan keduanya. */
-  lv_obj_set_style_size(bp_chart, 0, LV_PART_INDICATOR);
-  lv_obj_clear_flag(bp_chart, LV_OBJ_FLAG_SCROLLABLE);
-  bp_ser_sbp = lv_chart_add_series(bp_chart, lv_color_hex(C_PURPLE), LV_CHART_AXIS_PRIMARY_Y);
-  bp_ser_dbp = lv_chart_add_series(bp_chart, lv_color_hex(C_PURPLE2), LV_CHART_AXIS_PRIMARY_Y);
-  static const int sbpv[7] = { 118, 121, 125, 119, 123, 127, 120 };
-  static const int dbpv[7] = { 76,  78,  80,  77,  79,  82,  78  };
-  for (int i = 0; i < 7; i++) {
-    lv_chart_set_value_by_id(bp_chart, bp_ser_sbp, i, sbpv[i]);
-    lv_chart_set_value_by_id(bp_chart, bp_ser_dbp, i, dbpv[i]);
-  }
-
-  /* label sumbu waktu */
-  mk_label(scr_bp, "06.00", &lv_font_montserrat_10, C_S6_MUTE, 10, 175);
-  lv_obj_t *m = mk_label(scr_bp, "08.00", &lv_font_montserrat_10, C_S6_MUTE, 0, 175);
-  lv_obj_set_width(m, SCREEN_W);
-  lv_obj_set_style_text_align(m, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_t *r = mk_label(scr_bp, "10.00", &lv_font_montserrat_10, C_S6_MUTE, 0, 175);
-  lv_obj_set_width(r, 230);
-  lv_obj_set_style_text_align(r, LV_TEXT_ALIGN_RIGHT, 0);
-
-  mk_chips(scr_bp, "Sistol --", "Diastol --", "Nadi --", C_S6_CARD, C_S6_TITLE, chip_bp);
-}
-
-/* ================= Timer: perbarui isi layar =================
- * Semua label diperbarui HANYA saat nilainya berubah. lv_label_set_text()
- * selalu meng-invalidate area labelnya, dan beberapa di antaranya memakai
- * montserrat_46/48 -- redraw dua kali per detik tanpa alasan membuat animasi
- * transisi layar tersendat.
- */
-
-/* Tulis label hanya kalau isinya beda. Mengembalikan true kalau berubah. */
-static bool set_if_changed(lv_obj_t *lbl, const char *txt) {
-  const char *cur = lv_label_get_text(lbl);
-  if (cur && strcmp(cur, txt) == 0) return false;
-  lv_label_set_text(lbl, txt);
-  return true;
-}
-
-/* Perbarui seluruh tampilan kesehatan.
- *
- * Sumbernya jam_snapshot(), bukan ppg_get() langsung: sejak MAX30105 hanya
- * menyala selama pengukuran, membaca sensor langsung berarti keempat halaman
- * detail menampilkan "--" hampir sepanjang waktu. jam_snapshot() mengisinya
- * dengan pengukuran yang sedang berjalan, atau hasil pengukuran terakhir kalau
- * tidak ada yang berjalan -- sementara statistik sesi (chip min/avg/maks) tetap
- * datang dari sensor apa adanya, karena angka itu hanya berarti selama sensor
- * benar-benar mencacah. */
-static void update_health_ui(void) {
-  ppg_data_t p;
-  jam_snapshot(&p);
-  /* 48 byte, bukan 24: "Zona: rendah <bullet> 100% target" = 28 byte (bullet
-   * UTF-8 3 byte) dan "Estimasi dalam rentang (70-140)" = 31 byte. */
-  char b[48];
-
-  /* ---- kartu menu ---- */
-  if (p.bpm_valid) snprintf(b, sizeof(b), "%d bpm", (int)lroundf(p.bpm));
-  else             snprintf(b, sizeof(b), "-- bpm");
-  set_if_changed(lbl_card_hr, b);
-
-  if (p.spo2_valid) snprintf(b, sizeof(b), "%d %%", (int)lroundf(p.spo2));
-  else              snprintf(b, sizeof(b), "-- %%");
-  set_if_changed(lbl_card_sp, b);
-
-  if (p.glu_valid) snprintf(b, sizeof(b), "%d mg/dL", (int)lroundf(p.glucose));
-  else             snprintf(b, sizeof(b), "-- mg/dL");
-  set_if_changed(lbl_card_gl, b);
-
-  if (p.bp_valid) snprintf(b, sizeof(b), "%d/%d mmHg",
-                           (int)lroundf(p.sbp), (int)lroundf(p.dbp));
-  else            snprintf(b, sizeof(b), "--/-- mmHg");
-  set_if_changed(lbl_card_bp, b);
-
-  /* ---- halaman 3: heart rate ---- */
-  if (p.bpm_valid) {
-    int bpm = (int)lroundf(p.bpm);
-    snprintf(b, sizeof(b), "%d", bpm);
-    set_if_changed(lbl_hr_big, b);
-    lv_arc_set_value(arc_hr, bpm > 100 ? 100 : bpm);
-
-    /* Zona dihitung dari nilai sebenarnya, bukan teks tetap. */
-    const char *zona = bpm < 60  ? "rendah"
-                     : bpm < 100 ? "ringan"
-                     : bpm < 140 ? "sedang" : "berat";
-    int target = (int)((bpm * 100L) / 190);      /* 190 = perkiraan HR maks */
-    snprintf(b, sizeof(b), "Zona: %s " TXT_DOT " %d%% target", zona, target);
-    set_if_changed(lbl_hr_zone, b);
-    lv_obj_set_x(mark_hr, 94 + (bpm > 200 ? 110 : bpm * 110 / 200));
-  } else {
-    set_if_changed(lbl_hr_big, "--");
-    lv_arc_set_value(arc_hr, 0);
-    set_if_changed(lbl_hr_zone, "Zona: -- " TXT_DOT " -- target");
-    /* Penanda dikembalikan ke posisi awalnya. Kalau tidak, ia tetap menunjuk
-     * nilai terakhir di bar zona sementara angkanya sudah "--" -- bar yang
-     * menunjuk sesuatu itu klaim, dan saat sensor dimatikan klaim itu palsu. */
-    lv_obj_set_x(mark_hr, 94 + 26);
-  }
-
-  /* ---- halaman 4: SpO2 ---- */
-  if (p.spo2_valid) {
-    int sp = (int)lroundf(p.spo2);
-    snprintf(b, sizeof(b), "%d%%", sp);
-    set_if_changed(lbl_sp_big, b);
-    lv_arc_set_value(ring_sp, sp);
-  } else {
-    set_if_changed(lbl_sp_big, "--");
-    lv_arc_set_value(ring_sp, 0);
-  }
-
-  /* ---- halaman 5: glukosa (EKSPERIMENTAL) ---- */
-  if (p.glu_valid) {
-    int gl = (int)lroundf(p.glucose);
-    snprintf(b, sizeof(b), "%d", gl);
-    set_if_changed(lbl_glu_big, b);
-    /* Status mengikuti nilai. Sengaja TIDAK memakai centang "Normal" seperti
-     * sebelumnya: nilainya berasal dari model yang belum tervalidasi, jadi
-     * klaim klinis tidak pantas. Kata "estimasi" dipertahankan agar terlihat. */
-    snprintf(b, sizeof(b), "Estimasi %s (70-140)",
-             gl < 70 ? "rendah" : gl <= 140 ? "dalam rentang" : "tinggi");
-    set_if_changed(lbl_glu_status, b);
-    lv_obj_set_x(mark_glu, 122 + (gl < 40 ? 0 : gl > 240 ? 97
-                                  : (gl - 40) * 97 / 200));
-  } else {
-    set_if_changed(lbl_glu_big, "--");
-    set_if_changed(lbl_glu_status, "Menunggu pengukuran");
-    lv_obj_set_x(mark_glu, 122 + 32);
-  }
-
-  /* ---- halaman 6: tekanan darah (EKSPERIMENTAL) ---- */
-  if (p.bp_valid) {
-    int sb = (int)lroundf(p.sbp);
-    int db = (int)lroundf(p.dbp);
-    snprintf(b, sizeof(b), "%d/%d", sb, db);
-    set_if_changed(lbl_bp_big, b);
-    /* Status mengikuti sistol saja, sama seperti zona HR yang cuma memakai
-     * satu angka -- diastol tetap terlihat di angka besar & chip, cukup
-     * tidak ikut menentukan kategori supaya logikanya tetap sederhana. */
-    const char *kat = sb < 90  ? "rendah"
-                    : sb < 120 ? "normal"
-                    : sb < 140 ? "meningkat" : "tinggi";
-    snprintf(b, sizeof(b), "Estimasi %s (normal ~90-120)", kat);
-    set_if_changed(lbl_bp_status, b);
-    int sb_clamped = sb < 70 ? 70 : (sb > 160 ? 160 : sb);
-    lv_obj_set_x(mark_bp, 122 + (sb_clamped - 70) * 97 / 90);
-  } else {
-    set_if_changed(lbl_bp_big, "--/--");
-    set_if_changed(lbl_bp_status, "Menunggu pengukuran");
-    lv_obj_set_x(mark_bp, 122 + 32);
-  }
-
-  /* ---- chip statistik sesi ---- */
-  if (p.stats_valid) {
-    snprintf(b, sizeof(b), "Ist. %d", p.bpm_min);  set_if_changed(chip_hr[0], b);
-    snprintf(b, sizeof(b), "Avg %d",  p.bpm_avg);  set_if_changed(chip_hr[1], b);
-    snprintf(b, sizeof(b), "Max %d",  p.bpm_max);  set_if_changed(chip_hr[2], b);
-
-    snprintf(b, sizeof(b), "Min %d", p.spo2_min);  set_if_changed(chip_sp[0], b);
-    snprintf(b, sizeof(b), "Avg %d", p.spo2_avg);  set_if_changed(chip_sp[1], b);
-    set_if_changed(chip_sp[2], p.spo2_min >= 95 ? "Normal" : "Rendah");
-
-    snprintf(b, sizeof(b), "Min %d",  p.glu_min);  set_if_changed(chip_gl[0], b);
-    snprintf(b, sizeof(b), "Maks %d", p.glu_max);  set_if_changed(chip_gl[1], b);
-    snprintf(b, sizeof(b), "PI %.1f", p.pi);       set_if_changed(chip_gl[2], b);
-
-    snprintf(b, sizeof(b), "Sistol %d",  p.sbp_avg); set_if_changed(chip_bp[0], b);
-    snprintf(b, sizeof(b), "Diastol %d", p.dbp_avg); set_if_changed(chip_bp[1], b);
-    /* Tekanan nadi (pulse pressure) = sistol - diastol, dari rata-rata sesi
-     * -- bukan chip generik ketiga seperti "PI" di glukosa, karena angka ini
-     * memang turunan langsung dua kolom di atasnya, bukan fitur kalibrasi. */
-    snprintf(b, sizeof(b), "Nadi %d", p.sbp_avg - p.dbp_avg); set_if_changed(chip_bp[2], b);
-  } else {
-    /* Tanpa cabang ini chip membeku di angka sesi sebelumnya. Paling terasa
-     * saat sensor dimatikan lewat tombol daya: angka utama jadi "--" sementara
-     * "Avg 72" tetap terpampang di bawahnya. Teksnya dikembalikan persis ke
-     * yang dipasang mk_chips() saat layar dibangun. */
-    set_if_changed(chip_hr[0], "Ist. --");
-    set_if_changed(chip_hr[1], "Avg --");
-    set_if_changed(chip_hr[2], "Max --");
-
-    set_if_changed(chip_sp[0], "Min --");
-    set_if_changed(chip_sp[1], "Avg --");
-    set_if_changed(chip_sp[2], "--");
-
-    set_if_changed(chip_gl[0], "Min --");
-    set_if_changed(chip_gl[1], "Maks --");
-    set_if_changed(chip_gl[2], "PI --");
-
-    set_if_changed(chip_bp[0], "Sistol --");
-    set_if_changed(chip_bp[1], "Diastol --");
-    set_if_changed(chip_bp[2], "Nadi --");
-  }
-
-  /* LED "live" hanya berkedip saat pengukuran benar-benar berjalan. */
-  static bool blink = false;
-  blink = !blink;
-  if (p.state == PPG_STABLE)
-    lv_obj_set_style_opa(dot_live, blink ? LV_OPA_COVER : LV_OPA_40, 0);
-  else
-    lv_obj_set_style_opa(dot_live, LV_OPA_20, 0);
-}
-
-/* ================= Tampilan sesi & koneksi =================
- * Daftar keadaan yang wajib punya tampilan ada di dokumen 14. Yang TIDAK
- * diikuti dari sana cuma satu, dan sengaja: dokumen meminta layar menandai
- * "waktu tidak pasti" selama anchor belum terpasang, karena jam acuannya tidak
- * punya RTC dan jam dindingnya memang tebakan. Jam INI punya PCF85063 + NTP,
- * jadi angka jam di layar sudah benar tanpa anchor mana pun dan menandainya
- * "tidak pasti" justru berbohong ke arah sebaliknya. Yang tetap diikuti persis:
- * di KAWAT jam tidak pernah mengirim wall clock -- hanya uptime_s + boot_id --
- * dan flag anchor tetap dilaporkan apa adanya di paket Info & Status.
- */
-static void update_sesi_ui(void) {
-  /* ---- ikon Bluetooth: tiga keadaan ---- */
-  static int last_ble = -1;
-  int c = jam_siap_notifikasi() ? 2 : (jam_terhubung() ? 1 : 0);
-  if (c != last_ble) {
-    last_ble = c;
-    lv_obj_set_style_text_color(
-      lbl_ble, lv_color_hex(c == 2 ? C_BLUE : c == 1 ? C_S4_MUTE : C_S1_DIV), 0);
-  }
-
-  /* ---- entri tertunda ---- */
-  static int last_pending = -1;
-  int pend = jam_tertunda();
-  if (pend != last_pending) {
-    last_pending = pend;
-    if (pend > 0) {
-      lv_label_set_text_fmt(lbl_pending, "%d", pend);
-      lv_obj_clear_flag(lbl_pending, LV_OBJ_FLAG_HIDDEN);
-    } else {
-      lv_obj_add_flag(lbl_pending, LV_OBJ_FLAG_HIDDEN);
-    }
-  }
-
-  /* ---- pindah layar otomatis saat mengukur ----
-   * Sekali-jalan dengan percobaan ulang, bukan dipaksa tiap tick: go() menolak
-   * permintaan yang datang saat animasi pindah layar masih berjalan, jadi satu
-   * panggilan saja bisa hilang begitu saja. Setelah layarnya sampai, keinginan
-   * dilepas -- kalau tidak, pengguna yang membuka menu selagi mengukur akan
-   * ditarik kembali tiap setengah detik. */
-  static bool last_ukur = false;
-  static lv_obj_t *scr_sebelum = NULL;
-  static lv_obj_t *scr_ingin = NULL;
-  static bool punya_lalu[4] = { false, false, false, false };
-  bool ukur = jam_sedang_mengukur();
-  if (ukur != last_ukur) {
-    last_ukur = ukur;
-    if (ukur) {
-      /* Keempat titik dikembalikan abu-abu di AWAL tiap pengukuran. Tanpa ini
-       * titik hijau dari pengukuran sebelumnya terbawa: pengukuran baru mulai
-       * dengan tampilan "semua sudah dapat" padahal belum satu pun. */
-      for (int i = 0; i < 4; i++) {
-        punya_lalu[i] = false;
-        lv_obj_set_style_bg_color(dot_meas[i], lv_color_hex(C_S1_DIV), 0);
-        lv_obj_set_style_text_color(lbl_meas_metrik[i], lv_color_hex(C_S1_MUTED), 0);
-      }
-      scr_sebelum = lv_scr_act();
-      scr_ingin = scr_meas;
-    } else {
-      scr_ingin = (scr_sebelum && scr_sebelum != scr_meas) ? scr_sebelum : scr_home;
-    }
-  }
-  if (scr_ingin) {
-    if (lv_scr_act() == scr_ingin) scr_ingin = NULL;
-    else go(scr_ingin, ukur, ukur ? "sedang mengukur" : "selesai mengukur");
-  }
-
-  /* ---- isi layar pengukuran ---- */
-  if (ukur) {
-    char b[32];
-    /* Judulnya menyebut terus terang pengukuran mana ini. Kedua jenis memakai
-     * layar yang sama persis, jadi baris inilah satu-satunya yang memberi tahu
-     * pengguna apakah angkanya akan sampai ke aplikasi atau tidak. */
-    if (jam_ukur_lokal())           snprintf(b, sizeof(b), "Cek manual");
-    else if (jam_ukur_index() == 0) snprintf(b, sizeof(b), "Pengukuran awal");
-    else snprintf(b, sizeof(b), "Pengukuran ke-%u", (unsigned)jam_ukur_index());
-    set_if_changed(lbl_meas_judul, b);
-    set_if_changed(lbl_meas_sub, jam_ukur_lokal()
-                     ? "Hasil hanya tampil di jam, tidak dikirim"
-                     : "Tempelkan jari, jangan bergerak");
-
-    const bool punya[4] = { jam_ukur_punya_bpm(), jam_ukur_punya_spo2(),
-                            jam_ukur_punya_glukosa(), jam_ukur_punya_tensi() };
-    for (int i = 0; i < 4; i++) {
-      if (punya[i] == punya_lalu[i]) continue;
-      punya_lalu[i] = punya[i];
-      lv_obj_set_style_bg_color(dot_meas[i],
-                                lv_color_hex(punya[i] ? C_GREEN2 : C_S1_DIV), 0);
-      lv_obj_set_style_text_color(lbl_meas_metrik[i],
-                                  lv_color_hex(punya[i] ? C_WHITE : C_S1_MUTED), 0);
-    }
-
-    /* Baris detak jantung membawa cacahannya. Ini baris yang paling lama
-     * menunggu, jadi ia yang harus menjelaskan apa yang sedang ditunggu --
-     * tanpa angka ini, layar diam belasan detik tanpa alasan yang terlihat. */
-    uint16_t dtk = jam_ukur_detak(), perlu = jam_ukur_detak_perlu();
-    if (dtk >= perlu) snprintf(b, sizeof(b), "Detak jantung");
-    else snprintf(b, sizeof(b), "Detak jantung %u/%u", (unsigned)dtk, (unsigned)perlu);
-    set_if_changed(lbl_meas_metrik[0], b);
-
-    /* Bar mengikuti detak, bukan detik: sejak batas waktu dilepas, waktu
-     * berjalan tidak lagi mengukur kemajuan apa pun. */
-    lv_obj_set_width(bar_meas, perlu ? (200 * (int)(dtk > perlu ? perlu : dtk) / (int)perlu) : 0);
-
-    snprintf(b, sizeof(b), "%us", (unsigned)jam_ukur_detik());
-    set_if_changed(lbl_meas_waktu, b);
-  }
-
-  /* ---- pil status sesi di home ----
-   * Pesan penolakan harus menyebut alasannya. "Belum disiapkan aplikasi" untuk
-   * tombol cek manual yang terkunci karena sesi berjalan bukan cuma tidak
-   * membantu -- ia menyesatkan ke arah yang berlawanan. */
-  static uint32_t tolak_sampai_ms = 0;
-  static const char *tolak_teks = "";
-  uint8_t tolak = jam_umpan_balik_ditolak();
-  if (tolak != JAM_TOLAK_TIDAK_ADA) {
-    tolak_sampai_ms = millis() + 2500;
-    switch (tolak) {
-      case JAM_TOLAK_BELUM_ARM:    tolak_teks = "Belum disiapkan aplikasi"; break;
-      case JAM_TOLAK_SESI_AKTIF:   tolak_teks = "Cek manual terkunci saat sesi"; break;
-      case JAM_TOLAK_SESI_BERJALAN: tolak_teks = "Sesi sudah berjalan"; break;
-      case JAM_TOLAK_SEDANG_UKUR:  tolak_teks = "Masih mengukur"; break;
-      case JAM_TOLAK_BATERAI:      tolak_teks = "Baterai terlalu lemah"; break;
-      case JAM_TOLAK_SENSOR:       tolak_teks = "Sensor tidak terdeteksi"; break;
-      default:                     tolak_teks = ""; break;
-    }
-  }
-
-  char b[64];
-  uint32_t warna;
-  if ((int32_t)(millis() - tolak_sampai_ms) < 0) {
-    snprintf(b, sizeof(b), "%s", tolak_teks);
-    warna = C_AMBER;
-  } else if (jam_status() == AW_SESI_ARMED) {
-    snprintf(b, sizeof(b), "Siap " TXT_DOT " tekan setelah makan");
-    warna = C_GREEN2;
-  } else if (jam_status() == AW_SESI_RUNNING) {
-    uint32_t t0 = jam_t0_uptime(), skrg = jam_uptime();
-    uint32_t target = (skrg < t0 + AW_JADWAL_IDX2_S) ? t0 + AW_JADWAL_IDX2_S
-                                                     : t0 + AW_JADWAL_IDX3_S;
-    int ke = (skrg < t0 + AW_JADWAL_IDX2_S) ? 2 : 3;
-    /* Hitung mundur selalu dari uptime_s absolut, tidak pernah dari sisa waktu
-     * yang diakumulasikan sendiri (dokumen 12 & 14). */
-    long sisa = (long)target - (long)skrg;
-    if (sisa < 0) sisa = 0;
-    if (sisa >= 60) snprintf(b, sizeof(b), "Ukur ke-%d dalam %ld mnt", ke, sisa / 60);
-    else            snprintf(b, sizeof(b), "Ukur ke-%d dalam %ld dtk", ke, sisa);
-    warna = C_AMBER;
-  } else {
-    /* IDLE. Pil ini yang memberi tahu peran tombol sekarang -- tanpanya, satu
-     * tombol yang mengerjakan dua hal berbeda hanya bisa dihafal, dan pengguna
-     * yang salah hafal akan mengira cek manualnya terkirim ke aplikasi. */
-    snprintf(b, sizeof(b), "Tekan untuk cek manual");
-    warna = C_S1_MUTED;
-  }
-  if (set_if_changed(lbl_sesi, b))
-    lv_obj_set_style_text_color(lbl_sesi, lv_color_hex(warna), 0);
-}
-
-static void refresh_cb(lv_timer_t *tm) {
-  (void)tm;
-  /* Konteks loop: di sinilah RTC dibaca dan hasil NTP diterapkan. */
-  tm_tick();
-
-  /* ---- halaman 1: jam & tanggal dari RTC/NTP ----
-   * Timer ini 500 ms, tapi label hanya disentuh saat nilainya benar-benar
-   * berubah. lv_label_set_text() selalu meng-invalidate area labelnya, dan
-   * jam itu montserrat_48 -- redraw dua kali per detik tanpa alasan bikin
-   * animasi transisi layar tersendat. */
-  struct tm t;
-  bool have_time = tm_now(&t);
-  if (have_time) {
-    static int last_min = -1, last_mday = -1;
-
-    if (t.tm_min != last_min) {
-      last_min = t.tm_min;
-      lv_label_set_text_fmt(lbl_hh, "%02d", t.tm_hour);
-      lv_label_set_text_fmt(lbl_mm, "%02d", t.tm_min);
-    }
-    /* Hari dan tanggal satu label, jadi satu penulisan. Tetap dikunci ke
-     * perubahan tm_mday: hari dan tanggal selalu berganti bersamaan. */
-    if (t.tm_mday != last_mday) {
-      last_mday = t.tm_mday;
-      lv_label_set_text_fmt(lbl_date, "%s " TXT_DOT " %d %s %d",
-                            tm_day_name(t.tm_wday), t.tm_mday,
-                            tm_month_name(t.tm_mon), t.tm_year + 1900);
-    }
-  }
-
-  /* ---- header: cuaca & suhu dari OpenWeatherMap ---- */
-  weather_t w;
-  weather_get(&w);
-  if (w.valid) {
-    static int  last_temp = -999;
-    static char last_cond[16] = "";
-    if (w.temp_c != last_temp) {
-      last_temp = w.temp_c;
-      lv_label_set_text_fmt(lbl_wthr, "%d" TXT_DEG "C", w.temp_c);
-    }
-    if (strcmp(w.cond, last_cond) != 0) {
-      strncpy(last_cond, w.cond, sizeof(last_cond) - 1);
-      lv_label_set_text(lbl_cond, w.cond);
-    }
-  }
-
-  /* ---- header: baterai ----
-   * Persen saja tidak jujur saat kabel tertancap. Selama mengisi, tegangan sel
-   * dinaikkan oleh arus pengisian dan fase CV menahannya di 4,2 V, jadi kurva
-   * Li-Po membaca hampir 100% jauh sebelum selnya benar-benar penuh. Angkanya
-   * tidak salah hitung; yang salah adalah menampilkannya tanpa memberi tahu
-   * bahwa keadaannya sedang tidak bisa dipakai menaksir sisa daya.
-   *
-   * battery_charging() menilai tren tegangan berbeban 3 menit terakhir, jadi ia
-   * punya dua batas: baru menjawab setelah jam menyala 3 menit, dan tidak
-   * mengenali fase CV di ujung pengisian karena tegangannya sudah rata.
-   * Keduanya hanya menghasilkan ikon yang TIDAK muncul -- tidak pernah klaim
-   * palsu bahwa jam sedang mengisi. */
-  battery_update();
-  if (battery_valid()) {
-    static int last_batt = -1;
-    static int last_chg  = -1;
-    int bp  = battery_percent();
-    int chg = battery_charging() ? 1 : 0;
-    if (bp != last_batt || chg != last_chg) {
-      last_batt = bp;
-      last_chg  = chg;
-      /* Label dirata-kanan ke x=190, jadi ikon petir tumbuh ke KIRI: "100%"
-       * (25 px) menjadi ~38 px dan mulai di x~152 -- masih di kanan garis
-       * pemisah header di x=120. */
-      if (chg) lv_label_set_text_fmt(lbl_batt, LV_SYMBOL_CHARGE " %d%%", bp);
-      else     lv_label_set_text_fmt(lbl_batt, "%d%%", bp);
-      lv_obj_set_style_text_color(lbl_batt,
-                                  lv_color_hex(chg ? C_GREEN2 : C_BATT), 0);
-    }
-  }
-
-  update_health_ui();
-  update_sesi_ui();
-
-  /* Tombol disamakan dengan status sesi yang sebenarnya. Perlu karena status
-   * itu bertahan saat pengguna pindah halaman -- dan karena ia juga berubah
-   * tanpa jari: ARM datang dari aplikasi, dan kembali ke IDLE bisa terjadi
-   * karena timeout 4 jam. Fungsinya sendiri tidak melakukan apa-apa kalau
-   * tidak ada perubahan. */
-  utama_btn_refresh();
-
-  /* Heartbeat tiap 5 s. Sengaja jarang: USB CDC board ini re-enumerate setelah
-   * reset sehingga print di setup() hampir selalu hilang, jadi baris inilah
-   * bukti UI benar-benar jalan -- sekalian statistik touch untuk debug. */
-  static uint8_t n = 0;
-  if (++n >= 10) {
-    n = 0;
-
-    /* Diagnostik boot dicetak di heartbeat PERTAMA, bukan di setup(): USB CDC
-     * board ini re-enumerate setelah reset sehingga apa pun yang dicetak
-     * setup() hampir selalu hilang sebelum host siap menerima. */
-    static bool diag_done = false;
-    if (!diag_done) {
-      diag_done = true;
-      Serial.printf("[diag] PCF85063 terdeteksi: %s\n", rtc_ok() ? "YA" : "TIDAK");
-      Serial.printf("[diag] waktu saat boot: %s\n", tm_boot_info());
-      rtc_scan_bus();
-    }
-
-    static const char *SRC[] = { "none", "rtc", "ntp" };
-    Serial.printf("[hb] %02d:%02d:%02d src=%s wifi=%d ble=%d sesi=%d tunda=%d  "
-                  "cuaca=%s %dC  "
-                  "touch irq=%lu err=%lu evt=%lu  heap=%lu\n",
-                  have_time ? t.tm_hour : 0, have_time ? t.tm_min : 0,
-                  have_time ? t.tm_sec : 0,
-                  SRC[tm_source()], net_connected() ? 1 : 0,
-                  jam_siap_notifikasi() ? 2 : (jam_terhubung() ? 1 : 0),
-                  (int)jam_status(), (int)jam_tertunda(),
-                  w.valid ? w.cond : "--", w.temp_c,
-                  (unsigned long)touch_irq_count, (unsigned long)touch_readerr,
-                  (unsigned long)touch_events, (unsigned long)ESP.getFreeHeap());
-    ppg_data_t pp; ppg_get(&pp);
-    long dir, dred, dthr; uint32_t dn, dp;
-    ppg_diag(&dir, &dred, &dn, &dthr, &dp);
-    Serial.printf("[ppg]  %s%s  bpm=%s%.0f  spo2=%s%.1f  glukosa*=%s%.0f  "
-                  "td*=%s%.0f/%.0f\n",
-                  ppg_state_text(),
-                  pp.held ? " [tahan]" : "",
-                  pp.bpm_valid ? "" : "(-)", pp.bpm,
-                  pp.spo2_valid ? "" : "(-)", pp.spo2,
-                  pp.glu_valid ? "" : "(-)", pp.glucose,
-                  pp.bp_valid ? "" : "(-)", pp.sbp, pp.dbp);
-    /* Baris mentah: ir/red dan sampel. sampel yang diam di satu angka berarti
-     * FIFO tidak menghasilkan apa pun -- biasanya sensor tidak dicatu daya. */
-    Serial.printf("[ppg] mentah ir=%ld red=%ld (ambang %ld)  sampel=%lu  poll=%lu\n",
-                  dir, dred, dthr, (unsigned long)dn, (unsigned long)dp);
-    Serial.printf("[batt] counts=%d/4095  raw=%d mV (sebaran %d mV)  "
-                  "baterai=%d mV  floor=%d mV%s  %d%%\n",
-                  battery_raw_counts(), battery_raw_millivolts(),
-                  battery_spread_mv(), battery_millivolts(),
-                  battery_floor_mv(), battery_charging() ? " [mengisi]" : "",
-                  battery_percent());
-    if (battery_history_count() > 1) {
-      /* 192, bukan 128: riwayat kini 30 titik x 5 karakter = 150. battery_history()
-       * memang memotong dengan aman, tapi 128 akan memangkas sepertiga datanya. */
-      char hb[192];
-      battery_history(hb, sizeof(hb));
-      Serial.printf("[batt] riwayat/menit (mV di pin, tertua dulu): %s\n", hb);
-    }
-  }
-}
-
-/* ================= Tombol PWR: tekan sekali hidup, tekan lagi mati =========
- * Menyalakan board BUKAN pekerjaan firmware dan tidak akan pernah bisa jadi:
- * saat board mati, tidak ada yang berjalan untuk mendengarkan tombol. Itu
- * murni kerja rangkaian -- menekan PWR menyambungkan baterai, board boot, lalu
- * setup() mengunci BAT_EN sehingga jalurnya tidak lagi bergantung pada jari.
- *
- * Yang dikerjakan di sini cuma separuh keduanya: mendengarkan tekanan
- * BERIKUTNYA, lalu melepas latch itu.
- *
- * TEKANAN PERTAMA HARUS DIABAIKAN, dan ini jebakan yang tidak kelihatan sampai
- * dicoba: tekanan yang menyalakan board masih berlangsung saat loop() mulai
- * jalan. Kalau tombol langsung didengarkan, tekanan itu terbaca sebagai
- * "tekan lagi" dan board mematikan dirinya sendiri sepersekian detik setelah
- * menyala -- terlihat persis seperti board yang gagal boot. Karena itu tombol
- * baru aktif setelah pernah terlihat DILEPAS. BSP Waveshare menyelesaikan ini
- * dengan cara yang sama (menunggu di while sebelum memasang handler).
- */
-#define PWR_DEBOUNCE_MS  50   /* level harus stabil selama ini sebelum dipercaya */
-
-static bool     pwr_siap = false;      /* tombol sudah pernah dilepas sejak boot */
-static int      pwr_level_lalu = HIGH;
-static uint32_t pwr_stabil_ms = 0;
-
-static void pwr_matikan(void) {
-  Serial.println("[pwr] tombol PWR ditekan -- mematikan");
-
-  /* Layar dipadamkan lebih dulu: jari pengguna umumnya masih menempel di
-   * tombol pada titik ini, dan layar yang langsung gelap adalah umpan balik
-   * bahwa tekanannya diterima. */
-  ledcWrite(LCD_BL, 0);
-
-  /* Sensor padam + ring buffer dipaksa tersimpan. Harus SEBELUM latch dilepas:
-   * aw_store menunda tulis flash 3 detik, jadi tanpa ini setiap entri dari 3
-   * detik terakhir -- termasuk sampel yang baru saja selesai diukur -- ikut
-   * hilang bersama dayanya. */
-  jam_siap_mati();
-
-  /* Lepas latch. Board TIDAK langsung padam kalau jari masih menekan: selama
-   * itu tombolnya sendiri yang menyambungkan baterai. Padamnya terjadi saat
-   * jari diangkat, dan itu memang perilaku yang benar -- bukan keterlambatan
-   * yang perlu diakali. */
-  digitalWrite(BAT_EN, LOW);
-
-  /* Tidak ada jalan kembali dari sini, jadi jangan biarkan loop() melanjutkan
-   * seolah tidak terjadi apa-apa. */
-  uint32_t t0 = millis();
-  bool dicatat = false;
-  for (;;) {
-    if (!dicatat && (uint32_t)(millis() - t0) >= 2000) {
-      dicatat = true;
-      /* Masih hidup 2 detik setelah latch dilepas berarti dayanya datang dari
-       * USB, bukan baterai -- melepas BAT_EN tidak memutus jalur itu. Board
-       * sengaja dibiarkan gelap dan diam: itu keadaan "mati" paling jujur yang
-       * bisa dicapai selama USB tertancap. Karena itu pengujian tombol ini
-       * HARUS dilakukan dengan USB tercabut. */
-      Serial.println("[pwr] masih hidup setelah latch dilepas -- board dicatu USB, "
-                     "bukan baterai. Cabut USB atau tekan RST.");
-    }
-    delay(100);
-  }
-}
-
-static void pwr_poll(void) {
-  int level = digitalRead(PWR_KEY);      /* LOW = sedang ditekan */
-
-  /* Setiap perubahan level memulai ulang jendela debounce; hanya level yang
-   * sudah diam selama PWR_DEBOUNCE_MS yang dipercaya. */
-  if (level != pwr_level_lalu) {
-    pwr_level_lalu = level;
-    pwr_stabil_ms  = millis();
-    return;
-  }
-  if ((uint32_t)(millis() - pwr_stabil_ms) < PWR_DEBOUNCE_MS) return;
-
-  if (!pwr_siap) {
-    if (level == HIGH) {
-      pwr_siap = true;
-      Serial.println("[pwr] tombol dilepas -- tekan sekali lagi untuk mematikan");
-    }
-    return;
-  }
-
-  if (level == LOW) pwr_matikan();       /* tidak pernah kembali */
-}
-
 /* ---------------- Setup / Loop ---------------- */
 void setup() {
   /* ================= PALING AWAL, sebelum apa pun =================
-   * Selama baris ini belum jalan, board hidup HANYA karena jari pengguna masih
-   * menekan tombol PWR. Semua yang ditaruh di atasnya -- termasuk Serial.begin()
-   * dan delay(200) di bawah -- adalah waktu tambahan yang harus dihabiskan
-   * pengguna sambil menahan tombol. Contoh resmi Waveshare menaruhnya di posisi
-   * yang sama persis, sebagai dua baris pertama setup(). */
+   * Menahan latch baterai adalah syarat board tetap hidup setelah jari lepas
+   * dari tombol PWR. Setiap milidetik sebelum baris ini adalah milidetik saat
+   * board masih bergantung pada jari yang menekan. */
   pinMode(BAT_EN, OUTPUT);
   digitalWrite(BAT_EN, HIGH);
-
-  /* INPUT_PULLUP, bukan INPUT: tombol menarik pin ke GND saat ditekan, jadi
-   * keadaan lepasnya butuh pull-up. Board ini punya pull-up eksternal, tetapi
-   * meminta yang internal juga tidak merugikan dan membuat pin ini tidak pernah
-   * mengambang seandainya rakitannya berbeda. */
   pinMode(PWR_KEY, INPUT_PULLUP);
   pinMode(BOOT_KEY, INPUT_PULLUP);
 
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n[boot] ESP32-C6 LVGL dashboard");
+  Serial.println("\n[boot] AsaWatch -- wajah satu halaman");
 
   /* Backlight: PWM 5 kHz / 8 bit lewat LEDC. Tetap gelap dulu supaya tidak
    * ada flash putih, sekaligus menjaga panel tenang selama kalibrasi touch. */
@@ -2180,31 +849,25 @@ void setup() {
    * CST816T mengkalibrasi baseline kapasitifnya saat start. Kalau gfx->begin()
    * berjalan lebih dulu (toggle LCD_RST + burst SPI ke panel yang menempel di
    * belakang sensor), chip mengunci baseline yang salah dan melaporkan ghost
-   * touch permanen: register beku di finger=1 (~tengah layar) dengan IRQ
-   * membanjir ~80/detik. LVGL lalu tidak pernah melihat transisi press->release
-   * sehingga layar terasa mati total.
+   * touch permanen: register beku di finger=1 dengan IRQ membanjir ~80/detik.
    *
    * Terukur lewat uji A/B terkontrol pada board ini:
    *   touch.begin() -> gfx->begin() : fingers=0, irq/s=0     (bersih, 48 detik)
    *   gfx->begin() -> touch.begin() : fingers=1, irq/s=80    (ghost, konsisten)
-   *
-   * Jangan pula memanggil touch.disableAutoSleep(): tidak menyembuhkan ghost,
-   * dan soft-sleep (reg 0xE5) justru mematikan chip permanen karena pin RST
-   * touch tidak terhubung ke MCU di board ini.
    * ======================================================= */
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setClock(100000);   /* 400k tidak stabil untuk CST816T di board ini */
   pinMode(TOUCH_IRQ, INPUT_PULLUP);
   bool touch_ada = touch.begin(Wire, CST816_SLAVE_ADDRESS, I2C_SDA, I2C_SCL);
   if (!touch_ada) {
-    Serial.println("[err] CST816 tidak terdeteksi -- UI dikendalikan tombol BOOT");
+    Serial.println("[err] CST816 tidak terdeteksi -- wajah ini memang tidak butuh sentuh");
   } else {
     Serial.printf("[ok] touch: %s\n", touch.getModelName());
   }
-  delay(150);              /* beri waktu kalibrasi baseline selesai */
+  delay(150);
   /* IRQ hanya dipasang kalau chipnya benar-benar menjawab. Pada board yang
    * sentuhannya rusak, pin IRQ yang menggantung bisa memicu interupsi liar, dan
-   * setiap satu di antaranya membuat loop() melewati ppg_update() sekali. */
+   * setiap satu di antaranya membuat loop() melewati ppg_update(). */
   if (touch_ada) attachInterrupt(digitalPinToInterrupt(TOUCH_IRQ), touch_isr, FALLING);
 
   if (!gfx->begin()) Serial.println("[err] gfx->begin() gagal");
@@ -2230,10 +893,8 @@ void setup() {
   lv_disp_drv_register(&disp_drv);
 
   /* Indev penunjuk hanya didaftarkan kalau chip sentuhnya menjawab. Chip yang
-   * rusak dan terkunci di "jari menempel" akan membuat LVGL melihat tekanan
-   * abadi -- gejalanya layar yang seolah membeku, persis kasus ghost touch di
-   * catatan urutan init di atas. Tanpa indev, jalur tombol BOOT tetap utuh
-   * karena ia tidak lewat LVGL sama sekali. */
+   * rusak dan terkunci di "jari menempel" membuat LVGL melihat tekanan abadi,
+   * dan gejalanya layar yang seolah membeku. */
   if (touch_ada) {
     lv_indev_drv_init(&indev_drv);
     indev_drv.type = LV_INDEV_TYPE_POINTER;
@@ -2247,49 +908,33 @@ void setup() {
   battery_begin();
   ppg_begin();
 
-  build_home();
-  build_menu();
-  build_hr();
-  build_spo2();
-  build_glu();
-  build_bp();
-  build_meas();
-  lv_scr_load(scr_home);
-
-  scan_build(scr_home);   /* dipindah antar-layar sendiri di scan_anim_cb */
+  build_wajah();
+  lv_scr_load(scr_wajah);
 
   lv_timer_create(refresh_cb, 500, NULL);
-  lv_timer_create(scan_anim_cb, 40, NULL);
 
-  /* Sorotan dipasang SEBELUM gambar pertama, bukan dibiarkan menyusul dari
-   * loop(): kalau tidak, frame pertama tampil tanpa penanda dan outline emasnya
-   * muncul belakangan seperti kedipan. */
-  fokus_ikuti_layar();
+  lv_timer_handler();
+  ledcWrite(LCD_BL, 204);   /* ~80% */
 
-  /* Arming tombol BOOT ditentukan dari keadaan pin, bukan ditunggu sebagai tepi.
-   *
-   * boot_poll() hanya bereaksi pada PERUBAHAN level, jadi tombol yang sudah
-   * dilepas sejak boot tidak pernah menghasilkan tepi apa pun dan armingnya tak
-   * pernah datang -- gejalanya halus: tekanan pertama pengguna terbuang, dan
-   * yang kedua baru bekerja. Yang sebenarnya perlu dijaga cuma satu keadaan,
-   * yaitu tombol yang MASIH ditahan di sini (GPIO9 strapping pin, jadi ini
-   * kejadian normal sehabis flash). Membacanya sekali menjawab keduanya. */
+  /* Arming tombol BOOT ditentukan dari keadaan pin, bukan ditunggu sebagai
+   * tepi. boot_poll() hanya bereaksi pada PERUBAHAN level, jadi tombol yang
+   * sudah dilepas sejak boot tidak pernah menghasilkan tepi apa pun dan
+   * armingnya tak pernah datang -- gejalanya halus: tekanan pertama pengguna
+   * terbuang. Yang sebenarnya perlu dijaga cuma satu keadaan, yaitu tombol yang
+   * MASIH ditahan di sini (GPIO9 strapping pin, jadi ini kejadian normal
+   * sehabis flash). Membacanya sekali menjawab keduanya. */
   boot_stabil_lvl = digitalRead(BOOT_KEY);
   boot_level_lalu = boot_stabil_lvl;
   boot_siap       = (boot_stabil_lvl == HIGH);
   Serial.printf("[boot] tombol BOOT %s\n",
-                boot_siap ? "siap" : "masih ditahan -- lepaskan dulu");
-
-  lv_timer_handler();
-  ledcWrite(LCD_BL, 204);   /* ~80% */
+                boot_siap ? "siap (tekan lama = cek manual / selesai makan)"
+                          : "masih ditahan -- lepaskan dulu");
 
   /* Paling akhir: UI sudah tampil sebelum radio mulai menyita CPU dan heap.
    *
    * AsaWatch dulu, baru Wi-Fi. Urutannya penting untuk heap: init NimBLE
    * meminta blok yang relatif besar sekaligus, dan lebih mudah didapat sebelum
-   * stack Wi-Fi memfragmentasi heap dengan buffer-buffernya. Keduanya memang
-   * berbagi satu radio 2.4 GHz di C6, tapi itu diurus coexistence di lapisan
-   * bawah -- bukan urusan sketch.
+   * stack Wi-Fi memfragmentasi heap dengan buffer-buffernya.
    *
    * jam_mulai() sendiri punya urutan internal yang tidak boleh dibalik
    * (NVS -> boot_id naik -> muat ring -> sesi dipaksa IDLE -> BLE -> event
@@ -2301,22 +946,18 @@ void setup() {
 }
 
 void loop() {
-  touch_poll();          /* tangkap IRQ secepat mungkin, jangan tunggu LVGL */
+  touch_poll();          /* tetap dibaca demi board yang sentuhannya sehat */
   pwr_poll();            /* satu digitalRead; tombol mati harus selalu responsif */
-  boot_poll();           /* kendali pengganti sentuh; aman walau sentuh normal  */
+  boot_poll();
 
   /* PPG ditunda selama masih ada IRQ touch yang belum diproses. Keduanya berbagi
    * bus I2C, dan satu transaksi FIFO MAX30105 (~1 ms di 100 kHz) cukup untuk
-   * menunda pembacaan touch yang datanya hilang hampir seketika setelah IRQ.
-   * Touch selalu menang; PPG cuma mundur satu iterasi (~2 ms) dan FIFO-nya
-   * punya cadangan 320 ms, jadi tidak ada sampel yang hilang. */
+   * menunda pembacaan touch yang datanya hilang hampir seketika setelah IRQ. */
   if (!touch_irq_flag) ppg_update();
 
   /* Logika protokol berjalan di task yang SAMA dengan lv_timer_handler()
-   * (dokumen 13.2). Itu yang membuat callback tombol LVGL boleh memanggil
-   * jam_tekan_tombol() langsung dan pembaca status UI boleh membaca variabel
-   * sesi langsung -- tanpa mutex, tanpa antrean kedua. Yang menyeberang task
-   * tinggal satu: antrean perintah BLE di aw_ble. */
+   * (dokumen 13.2). Yang menyeberang task tinggal satu: antrean perintah BLE
+   * di aw_ble. */
   jam_putar();
 
   lv_timer_handler();
