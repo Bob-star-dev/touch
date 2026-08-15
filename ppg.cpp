@@ -48,8 +48,16 @@ static unsigned long rawContactCandidateSinceMs = 0;
 
 /* Filter DC butuh waktu konvergen dari nilai awal ke nilai sebenarnya. Selama
  * masa ini rasio AC/DC (R, PI) belum representatif -> jangan hitung SpO2 dan
- * glukosa dulu, supaya tidak keluar angka yang mustahil secara fisiologis. */
-static const unsigned long DC_SETTLE_MS = 8000;
+ * glukosa dulu, supaya tidak keluar angka yang mustahil secara fisiologis.
+ *
+ * 3 detik, turun dari 8. Angkanya dihitung, bukan dikira: FIFO mengeluarkan
+ * 100/SAMPLE_AVERAGE = 12,5 sampel per detik, dan EMA dengan DC_ALPHA 0,95 punya
+ * konstanta waktu 1/(1-0,95) = 20 sampel = 1,6 detik. Delapan detik berarti lima
+ * konstanta waktu -- jauh lebih lama daripada yang dibutuhkan, apalagi karena
+ * dcRed/dcIR di-seed dari sampel pertama sehingga transiennya kecil sejak awal.
+ * Tiga detik masih hampir dua konstanta waktu (sisa transien <15%), sementara
+ * lima detik yang dihemat adalah lima detik pengguna menatap layar kosong. */
+static const unsigned long DC_SETTLE_MS = 3000;
 static const byte MIN_STABLE_BEATS = 3;
 static byte stableBeatCount = 0;
 
@@ -122,6 +130,17 @@ static float glucoseHistory[SMOOTH_N];
 static float sbpHistory[SMOOTH_N];
 static float dbpHistory[SMOOTH_N];
 static byte  smoothIndex = 0, smoothCount = 0;
+
+/* Dua gerbang, bukan satu.
+ *
+ *   readingsAwal   - window terakhir menghasilkan angka yang masuk akal.
+ *                    Cukup untuk DITAMPILKAN.
+ *   readingsStable - angka itu juga lahir setelah MIN_STABLE_BEATS detak
+ *                    konsisten. Hanya ini yang boleh DIKIRIM ke aplikasi.
+ *
+ * Dulu keduanya satu bendera, dan akibatnya layar ikut menunggu syarat yang
+ * sebenarnya milik protokol. Lihat ppg.h pada field `awal`. */
+static bool  readingsAwal = false;
 static bool  readingsStable = false;
 
 /* ---------- Deteksi puncak untuk BPM ----------
@@ -143,11 +162,30 @@ static byte   ibiIndex = 0;
 static float  currentBPM = 0;
 static bool   bpmValid = false;
 
-/* ---------- Window AC-RMS untuk SpO2 ---------- */
-static const int SPO2_WINDOW = 100;            /* ~1 detik pada 100 Hz */
+/* ---------- Window AC-RMS untuk SpO2 ----------
+ * Panjang window ditentukan WAKTU, bukan jumlah sampel, dan itu memperbaiki
+ * kekeliruan yang tersembunyi lama: versi sebelumnya memakai 100 sampel dengan
+ * keterangan "~1 detik pada 100 Hz", padahal SAMPLE_AVERAGE = 8 membuat FIFO
+ * mengeluarkan 100/8 = 12,5 sampel per detik. Seratus sampel karena itu bukan 1
+ * detik melainkan DELAPAN. Ditambah settle 8 detik, angka SpO2/glukosa/tensi
+ * pertama baru mungkin muncul di detik ke-16 -- dan sepanjang itu layar
+ * menampilkan "--" tanpa alasan yang bisa dilihat pengguna.
+ *
+ * Satu detik per window berarti tiap window cuma memuat ~1 detak, jadi R-nya
+ * memang lebih berisik dari sebelumnya. Itu justru yang diminta: angka yang
+ * bergerak sambil diukur. Kestabilan tidak diambil dari panjang window lagi,
+ * melainkan dari dua lapis di atasnya yang memang sudah ada -- rata-rata
+ * SMOOTH_N window (push_smoothed) untuk yang tampil, dan rata-rata seluruh sesi
+ * (update_session_stats) untuk yang akhirnya dikirim ke aplikasi.
+ *
+ * MIN masih dijaga: window sependek 1-2 sampel akan menghasilkan RMS yang tidak
+ * berarti apa-apa kalau satu poll kebetulan terlambat. */
+static const unsigned long SPO2_WINDOW_MS  = 1000;
+static const int           SPO2_WINDOW_MIN = 8;
 static double sumSqRed = 0, sumSqIR = 0;
 static double sumDcRed = 0, sumDcIR = 0;
 static int    windowCount = 0;
+static unsigned long windowStartMs = 0;
 static float  currentSpO2 = 0;
 static float  currentPI = 0;
 static float  currentR = 0;
@@ -226,6 +264,7 @@ static void reset_beat_detector(void) {
   beatCount = 0;
   smoothCount = 0;
   smoothIndex = 0;
+  readingsAwal = false;
   readingsStable = false;
 }
 
@@ -357,20 +396,31 @@ static void update_session_stats(void) {
 }
 
 static void accumulate_spo2(double acRed, double acIR, double dRed, double dIR) {
+  if (windowCount == 0) windowStartMs = millis();
   sumSqRed += acRed * acRed;
   sumSqIR  += acIR * acIR;
   sumDcRed += dRed;
   sumDcIR  += dIR;
   windowCount++;
-  if (windowCount < SPO2_WINDOW) return;
+  if (windowCount < SPO2_WINDOW_MIN) return;
+  if ((millis() - windowStartMs) < SPO2_WINDOW_MS) return;
 
   double acRmsRed = sqrt(sumSqRed / windowCount);
   double acRmsIR  = sqrt(sumSqIR / windowCount);
   double meanDcRed = sumDcRed / windowCount;
   double meanDcIR  = sumDcIR / windowCount;
 
-  bool windowGate = (millis() - contactStartMs) >= DC_SETTLE_MS
-                    && bpmValid && stableBeatCount >= MIN_STABLE_BEATS;
+  /* Gerbang untuk MENGHITUNG. Sengaja tidak lagi memuat stableBeatCount:
+   * syarat itu milik pengiriman, bukan perhitungan, dan dipasang di
+   * readingsStable beberapa baris di bawah.
+   *
+   * bpmValid tetap disyaratkan, dan itu bukan sisa lama: model glukosa dan
+   * tekanan darah memakai currentBPM sebagai variabel: dengan BPM masih 0,
+   * estimate_glucose() menghitung suku G2*(0-70) dan menghasilkan angka yang
+   * bukan "sementara" melainkan salah. SpO2 sendiri memang tidak butuh BPM,
+   * tetapi jaraknya cuma satu-dua detak -- tidak sepadan dengan layar yang
+   * memunculkan satu kartu lebih dulu lalu tiga lainnya menyusul. */
+  bool windowGate = (millis() - contactStartMs) >= DC_SETTLE_MS && bpmValid;
 
   if (windowGate && meanDcRed > 0 && meanDcIR > 0 && acRmsIR > 0) {
     double R  = (acRmsRed / meanDcRed) / (acRmsIR / meanDcIR);
@@ -395,13 +445,34 @@ static void accumulate_spo2(double acRed, double acIR, double dRed, double dIR) 
         estimate_glucose();
         estimate_bp();
         push_smoothed(spo2, currentGlucose, currentSBP, currentDBP);
-        readingsStable = true;
-        update_session_stats();
-        /* Jangan panggil capture_hold() di sini: s_state baru ditetapkan setelah
-         * accumulate_spo2() selesai, jadi salinan akan lahir dengan state basi
-         * (PPG_SETTLING pada window pertama) dan bpm_valid-nya false. Cukup
-         * tandai bahwa ada hasil baru; salinannya diambil di process_sample. */
-        s_new_result = true;
+        readingsAwal = true;
+        readingsStable = (stableBeatCount >= MIN_STABLE_BEATS);
+
+        /* Statistik sesi hanya menghimpun window yang sudah stabil. Ia adalah
+         * sumber angka final yang dikirim ke aplikasi (lihat ukur_putar di
+         * aw_jam.cpp), jadi memasukkan window sementara ke sana berarti angka
+         * yang terkirim ikut tercemar oleh detik-detik pertama yang justru
+         * ditandai "belum bisa dipercaya" di layar.
+         *
+         * Yang tidak bisa dipisahkan sepenuhnya: push_smoothed() di atas
+         * merata-ratakan SMOOTH_N window terakhir, jadi window stabil pertama
+         * masih membawa jejak beberapa window sementara sebelumnya. Itu memang
+         * dibiarkan -- keduanya bacaan sungguhan dari sensor yang sama, dan
+         * membuang jejaknya berarti membuang pula peredam yang membuat angka
+         * pertama tidak melonjak. */
+        if (readingsStable) {
+          update_session_stats();
+          /* Jangan panggil capture_hold() di sini: s_state baru ditetapkan
+           * setelah accumulate_spo2() selesai, jadi salinan akan lahir dengan
+           * state basi (PPG_SETTLING pada window pertama) dan bpm_valid-nya
+           * false. Cukup tandai bahwa ada hasil baru; salinannya diambil di
+           * process_sample.
+           *
+           * Salinan juga hanya diambil dari window stabil: yang ditahan setelah
+           * jari diangkat adalah HASIL, dan angka sementara yang membeku di
+           * layar tanpa penanda apa pun tidak bisa dibedakan darinya. */
+          s_new_result = true;
+        }
 
 #if NET_DEBUG
         /* PI & R dicetak supaya bisa dicatat berpasangan dengan hasil
@@ -411,8 +482,9 @@ static void accumulate_spo2(double acRed, double acIR, double dRed, double dIR) 
         static uint32_t lastLog = 0;
         if ((uint32_t)(millis() - lastLog) >= 2000) {
           lastLog = millis();
-          Serial.printf("[ppg] BPM %.1f  SpO2 %.1f%%  Glukosa* %.1f mg/dL  "
+          Serial.printf("[ppg] %sBPM %.1f  SpO2 %.1f%%  Glukosa* %.1f mg/dL  "
                         "TD* %.0f/%.0f mmHg  [PI %.3f  R %.4f]\n",
+                        readingsStable ? "" : "(awal) ",
                         currentBPM, currentSpO2, currentGlucose,
                         currentSBP, currentDBP, currentPI, currentR);
         }
@@ -585,6 +657,10 @@ static void fill_live(ppg_data_t *out) {
   out->sbp      = currentSBP;
   out->dbp      = currentDBP;
 
+  /* Ada angka, tapi belum lolos gerbang kirim. UI menampilkannya (dengan warna
+   * berbeda); aw_jam tidak pernah memanennya. */
+  out->awal = readingsAwal && !readingsStable;
+
   out->pi = currentPI;
   out->r  = currentR;
 
@@ -633,7 +709,10 @@ void ppg_get(ppg_data_t *out) {
    * state sengaja TIDAK diambil dari salinan: ia harus tetap menggambarkan
    * kondisi sensor yang sebenarnya, sehingga titik "live" di layar berhenti
    * berkedip walaupun angkanya masih terbaca. */
-  if (!out->bpm_valid && !out->spo2_valid && s_hold_valid) {
+  /* out->awal ikut menahan salinan: angka sementara ADALAH bacaan langsung, dan
+   * menggantinya dengan hasil pengukuran sebelumnya di tengah pengukuran baru
+   * berarti layar mundur ke angka lama justru saat pengguna sedang menatapnya. */
+  if (!out->bpm_valid && !out->spo2_valid && !out->awal && s_hold_valid) {
     ppg_state_t live_state = out->state;
     *out = s_hold;
     out->state       = live_state;
@@ -704,6 +783,7 @@ void ppg_set_enabled(bool on) {
     reset_session_stats();
 
     bpmValid = false;
+    readingsAwal = false;
     readingsStable = false;
     s_state = PPG_OFF;
     Serial.println("[ppg] sensor DIMATIKAN (LED padam, hemat daya)");

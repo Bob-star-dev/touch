@@ -25,6 +25,25 @@
  * dipindah ke tekan-lama tombol BOOT, yang tidak memakan tempat di layar.
  * Lihat boot_poll().
  *
+ * Tombol itu satu-satunya pemicu SELURUH pengukuran: saat makan selesai, satu
+ * jam sesudahnya, dan dua jam sesudahnya -- ketiganya terkirim ke aplikasi --
+ * ditambah cek manual di luar sesi yang hasilnya berhenti di layar ini. Jam
+ * tidak lagi menyalakan sensornya sendiri saat jadwal jatuh tempo: MAX30105 cuma
+ * menghasilkan angka kalau ada jari menempel, dan pengukuran yang menyala saat
+ * jamnya tergeletak di meja hanya menghasilkan UKUR_GAGAL. Yang dijadwalkan
+ * sekarang adalah panggilannya, bukan sensornya -- lihat UKUR_TUNGGU_TOMBOL_S di
+ * aw_jam.cpp dan status_baris() di bawah.
+ *
+ * SELAMA MENGUKUR keempat kartu menampilkan bacaan langsung yang terus berubah,
+ * termasuk yang belum lolos gerbang kirim (ditandai warna lebih redup). Yang
+ * dikirim ke aplikasi tetap hanya angka yang sudah stabil; lihat field `awal` di
+ * ppg.h untuk pemisahan "boleh ditampilkan" dari "boleh dikirim".
+ *
+ * TOMBOL PWR punya dua arti yang dibedakan dari lamanya tekanan: tahan 3 detik
+ * menyalakan atau mematikan jam sungguhan, klik singkat cuma memadamkan layar
+ * (jam tetap berjalan). Gerbang tiga detik itu berlaku di kedua arah -- lihat
+ * pwr_gerbang_nyala() untuk sisi menyalanya dan pwr_poll() untuk sisi matinya.
+ *
  * YANG HILANG DIBANDING VERSI 7 LAYAR, dan itu memang konsekuensi desain ini:
  * cuaca, ikon Bluetooth, pil status sesi, grafik riwayat, chip statistik, dan
  * layar "sedang mengukur". Yang paling penting di antaranya -- status sesi dan
@@ -229,6 +248,54 @@ static void my_touch_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
   data->state = touch_down ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
 }
 
+/* ================= Layar: hidup / mati =================
+ * Ini yang dilakukan KLIK SINGKAT tombol PWR, dan ia satu-satunya bentuk
+ * "on/off" yang bisa dibolak-balik firmware pada board ini.
+ *
+ * Mematikan jam sungguhan berarti melepas latch BAT_EN, dan itu jalan satu arah:
+ * begitu jalur baterai terputus, tidak ada lagi firmware yang berjalan untuk
+ * menyambungnya kembali -- yang menyalakan board lagi adalah tombol PWR secara
+ * fisik (firmware cuma menilai lamanya, lihat pwr_gerbang_nyala()). Karena itu
+ * on/off sungguhan dipegang tekan-lama 3 detik, dan klik singkat -- yang harus
+ * tetap punya arti pada jam tangan -- dipetakan ke layar.
+ *
+ * Dua-duanya dikerjakan: backlight DAN perintah SLPIN ke panel. Backlight saja
+ * sudah membuat layar gelap, tetapi ST7789-nya tetap menyegarkan 240x280 piksel
+ * sepanjang malam. Urutannya penting di kedua arah: matikan cahaya dulu baru
+ * panel (kalau dibalik, panel yang masuk sleep sempat terlihat berkedip), dan
+ * saat menyalakan, panel dulu -- cahayanya menunggu sampai satu frame utuh
+ * tergambar, lihat s_bl_tunda di loop(). */
+#define LCD_BL_TERANG  204        /* ~80%, sama dengan yang dipakai setup() */
+
+static bool s_layar_nyala = true;
+static bool s_bl_tunda    = false;
+
+/* true setelah latch BAT_EN dilepas tetapi board ternyata masih hidup -- artinya
+ * ia dicatu USB, bukan baterai. Di baterai, baris setelah digitalWrite(BAT_EN,
+ * LOW) tidak pernah dieksekusi. Diletakkan di sini, bukan di dekat pwr_poll(),
+ * karena layar_set() harus melihatnya: jam yang sudah diminta mati tidak boleh
+ * menyalakan layarnya sendiri lagi karena ada pengukuran yang jatuh tempo. */
+static bool pwr_daya_lepas = false;
+
+static void layar_set(bool nyala) {
+  if (nyala && pwr_daya_lepas) return;
+  if (nyala == s_layar_nyala) return;
+  s_layar_nyala = nyala;
+
+  if (nyala) {
+    gfx->displayOn();
+    /* Isi RAM panel tidak dijamin selamat dari SLPIN, jadi seluruh layar
+     * digambar ulang alih-alih mengandalkan apa yang tersisa di sana. */
+    lv_obj_invalidate(lv_scr_act());
+    s_bl_tunda = true;
+  } else {
+    ledcWrite(LCD_BL, 0);
+    gfx->displayOff();
+    s_bl_tunda = false;
+  }
+  Serial.printf("[pwr] layar %s\n", nyala ? "menyala" : "dimatikan");
+}
+
 /* Glyph non-ASCII yang tersedia di lv_font_montserrat_* bawaan LVGL. */
 #define TXT_DEG  "\xC2\xB0"      /* U+00B0 derajat */
 #define TXT_DOT  "\xE2\x80\xA2"  /* U+2022 bullet  */
@@ -272,7 +339,9 @@ static void my_touch_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
  * yang tampil adalah "--", bukan angka contoh. Pada layar kesehatan, angka
  * contoh yang tampak nyata lebih berbahaya daripada tanda hubung.
  *
- *   jam / hari / tanggal   -> RTC PCF85063 + sinkronisasi NTP
+ *   jam / hari / tanggal   -> RTC PCF85063, disinkronkan dari jam HP setiap kali
+ *                             BLE tersambung (ANCHOR_WAKTU) dan dari NTP kalau
+ *                             Wi-Fi ada
  *   persen baterai         -> ADC1 + kurva Li-Po (battery.cpp)
  *   detak, SpO2, glukosa,  -> MAX30105/30102 lewat jam_snapshot()
  *   tekanan darah             glukosa & tekanan EKSPERIMENTAL, lihat ppg.h
@@ -441,12 +510,17 @@ static void build_wajah(void) {
   cincin_gl = mk_cincin(scr_wajah, 16, C_CINCIN_GL);
 
   /* --- baris tanggal / status ---
-   * letter_space 1: tanpa itu "SAB 15 AGU" terbaca merapat jadi satu blok di
-   * montserrat_12, dan desainnya sendiri memang merender baris ini dengan huruf
-   * yang berjarak. x=82, bukan 86, untuk memberi ruang tambahan ke kelompok
-   * baterai di kanan -- cincin berakhir di x=79 jadi 82 masih aman. */
+   * x=82, bukan 86, untuk memberi ruang tambahan ke kelompok baterai di kanan --
+   * cincin berakhir di x=79 jadi 82 masih aman.
+   *
+   * letter_space 0, berbeda dari versi sebelumnya. Jarak 1 px dulu dipakai
+   * supaya "SAB 15 AGU" -- sepuluh huruf kapital rapat -- tidak terbaca sebagai
+   * satu blok. Tanggal sekarang "Wed, 15 Aug 26": empat karakter lebih panjang,
+   * sudah punya koma sebagai jeda, dan huruf kecilnya sendiri yang membentuk
+   * kata. Menahan jarak 1 px di sini berarti 13 piksel tambahan yang persis
+   * jatuh di ruang yang dibutuhkan angka baterai. */
   lbl_status = mk_label(scr_wajah, "--", &lv_font_montserrat_12, C_TANGGAL, 82, 13);
-  lv_obj_set_style_text_letter_space(lbl_status, 1, 0);
+  lv_obj_set_style_text_letter_space(lbl_status, 0, 0);
 
   /* --- kelompok baterai: "94%" lalu ikonnya, tepi kanan dikunci di x=232 ---
    * Posisinya dihitung ulang tiap kali teksnya berubah (lihat batt_tata()),
@@ -493,13 +567,26 @@ static bool set_jika_beda(lv_obj_t *lbl, const char *txt) {
   return true;
 }
 
+/* Satu kartu metrik.
+ *
+ * `sementara` menandai angka yang sudah nyata tetapi belum lolos gerbang kirim
+ * (ppg.h, field `awal`). Ia ditampilkan lebih redup, bukan disembunyikan dan
+ * bukan pula ditulis sama seperti hasil akhir. Menyembunyikannya berarti layar
+ * kosong justru saat sensor paling sibuk; menulisnya sama persis berarti angka
+ * yang masih bergoyang beberapa mg/dL tidak bisa dibedakan dari angka yang
+ * akhirnya tercatat di aplikasi. Redup menjawab keduanya sekaligus, dan tidak
+ * memakan satu piksel pun ruang tambahan -- yang di layar ini memang tidak ada. */
 static void nilai_set(lv_obj_t *lbl, lv_obj_t *satuan, const lv_font_t *fn,
-                      bool sah, const char *fmt, float a, float b) {
+                      bool sah, bool sementara, const char *fmt, float a, float b) {
   char buf[16];
-  if (!sah)                 snprintf(buf, sizeof(buf), "--");
+  if (!sah && !sementara)   snprintf(buf, sizeof(buf), "--");
   else if (b < 0.0f)        snprintf(buf, sizeof(buf), fmt, a);
   else                      snprintf(buf, sizeof(buf), fmt, a, b);
   if (set_jika_beda(lbl, buf)) satuan_sejajar(satuan, lbl, fn);
+
+  uint32_t warna = sementara ? C_TANGGAL : C_PUTIH;
+  if (lv_obj_get_style_text_color(lbl, 0).full != lv_color_hex(warna).full)
+    lv_obj_set_style_text_color(lbl, lv_color_hex(warna), 0);
 }
 
 /* ---- Kelompok baterai: persen + ikon ----
@@ -541,11 +628,12 @@ static void batt_tata(bool mengisi) {
  *   1. Pesan sesaat (2 detik) -- jawaban atas tombol yang baru saja ditekan.
  *      Paling atas karena ini satu-satunya umpan balik yang dimiliki tombol
  *      BOOT; tanpa itu menekan tombol terasa seperti tidak terjadi apa-apa.
- *   2. Kemajuan pengukuran -- pengguna harus diam selama puluhan detik, dan
+ *   2. Kemajuan pengukuran -- pengguna harus diam selama belasan detik, dan
  *      dokumen 14 mewajibkan ia tahu bahwa sesuatu sedang berjalan serta
- *      seberapa jauh. Yang ditampilkan detak tercacah, bukan detik berjalan,
- *      sebab itulah gerbang sebenarnya berakhirnya pengukuran.
- *   3. Tanggal -- keadaan tenang.
+ *      seberapa jauh. Yang ditampilkan perkiraan sisa waktu, dihitung ulang dari
+ *      laju detak yang sungguhan terjadi.
+ *   3. Panggilan pengukuran terjadwal yang menunggu tombol.
+ *   4. Tanggal -- keadaan tenang.
  */
 static uint32_t pesan_sampai_ms = 0;
 static char     pesan_teks[24]  = "";
@@ -567,9 +655,40 @@ static void status_baris(void) {
   pesan_sampai_ms = 0;
 
   if (jam_sedang_mengukur()) {
-    snprintf(buf, sizeof(buf), "MENGUKUR %u/%u",
-             (unsigned)jam_ukur_detak(), (unsigned)jam_ukur_detak_perlu());
+    /* Sisa waktu, bukan cacahan detak. Keduanya menjawab "berapa lama lagi",
+     * tetapi hanya satu yang bisa dijawab pengguna: "12/15" menuntut ia tahu
+     * bahwa detak yang dimaksud adalah detak yang berhasil DIBACA, bukan detak
+     * jantungnya, dan itu tidak pernah jelas dari layar. Angkanya sendiri sama
+     * jujurnya -- ia dihitung ulang dari laju detak yang sungguhan terjadi, jadi
+     * ia memendek saat nadinya ketemu cepat dan memanjang saat susah; lihat
+     * jam_ukur_sisa_detik(). */
+    /* "SISA", bukan "MENGUKUR ... dtk": yang terakhir 113 px dan menabrak angka
+     * baterai, sementara baris ini cuma punya ~100 px (lihat build_wajah()).
+     * Bahwa jam sedang mengukur toh sudah terbaca dari keempat kartu yang
+     * angkanya bergerak. */
+    snprintf(buf, sizeof(buf), "SISA %u dtk", (unsigned)jam_ukur_sisa_detik());
     if (set_jika_beda(lbl_status, buf))
+      lv_obj_set_style_text_color(lbl_status, lv_color_hex(C_ISI), 0);
+    return;
+  }
+
+  /* Pengukuran terjadwal yang menunggu tombol. Ini SATU-SATUNYA cara pengguna
+   * tahu bahwa satu jam sudah lewat dan sekarang giliran jarinya -- sensor tidak
+   * lagi menyala sendiri (lihat UKUR_TUNGGU_TOMBOL_S di aw_jam.cpp), jadi tanpa
+   * baris ini panggilannya tidak pernah sampai dan sesi berakhir kosong.
+   * Warnanya sama dengan warna "sedang mengukur" karena keduanya sama-sama
+   * berarti "sensor sedang menyangkut pada Anda". */
+  uint8_t jatuh_tempo = jam_index_jatuh_tempo();
+  if (jatuh_tempo) {
+    /* Dua kalimat bergantian tiap 2 detik, bukan satu kalimat panjang. Baris ini
+     * hanya punya ~100 px sebelum menabrak angka baterai -- kira-kira 14 huruf
+     * di montserrat_12 -- dan "UKUR 1 JAM, TEKAN TOMBOL" tidak muat dengan cara
+     * apa pun. Yang perlu disampaikan memang dua hal berbeda (pengukuran yang
+     * mana, dan apa yang harus dilakukan), jadi keduanya diberi giliran. */
+    const char *teks = ((millis() / 2000UL) & 1UL)
+                         ? "TEKAN TOMBOL"
+                         : (jatuh_tempo == 2 ? "UKUR 1 JAM" : "UKUR 2 JAM");
+    if (set_jika_beda(lbl_status, teks))
       lv_obj_set_style_text_color(lbl_status, lv_color_hex(C_ISI), 0);
     return;
   }
@@ -580,12 +699,18 @@ static void status_baris(void) {
       lv_obj_set_style_text_color(lbl_status, lv_color_hex(C_TANGGAL), 0);
     return;
   }
-  /* "SAB 15 AGU": tiga huruf pertama nama hari dan bulan. Dalam bahasa
-   * Indonesia potongan itu selalu jatuh benar (SABTU->SAB, AGUSTUS->AGU,
-   * SEPTEMBER->SEP), jadi tidak perlu tabel singkatan terpisah. */
+  /* "Wed, 1 Jan 26" -- singkatan bahasa Inggris, tanggal tanpa nol di depan,
+   * tahun dua digit. Tabel singkatannya ada di time_manager.cpp, jadi di sini
+   * tidak ada pemotongan "%.3s" lagi.
+   *
+   * Tahunnya muat karena letter_space baris ini dinolkan (lihat build_wajah()):
+   * "Wed, 15 Aug 26" berakhir sekitar x=168, sementara kelompok baterai paling
+   * lebar ("100%" + ikon) baru mulai di sekitar x=183. Kalau format ini
+   * diperpanjang lagi, itulah 15 piksel yang tersisa. */
   const char *hari  = tm_day_name(t.tm_wday);
   const char *bulan = tm_month_name(t.tm_mon);
-  snprintf(buf, sizeof(buf), "%.3s %d %.3s", hari, t.tm_mday, bulan);
+  snprintf(buf, sizeof(buf), "%s, %d %s %02d", hari, t.tm_mday, bulan,
+           (t.tm_year + 1900) % 100);
   if (set_jika_beda(lbl_status, buf))
     lv_obj_set_style_text_color(lbl_status, lv_color_hex(C_TANGGAL), 0);
 }
@@ -608,6 +733,16 @@ static void refresh_cb(lv_timer_t *tm) {
   }
 
   status_baris();
+
+  /* ---- panggilan pengukuran membangunkan layar ----
+   * Hanya pada TRANSISI menjadi jatuh tempo, bukan selama ia menunggu: kalau
+   * tidak, layar yang baru saja dimatikan pengguna menyala lagi setengah detik
+   * kemudian dan tidak bisa dimatikan sampai pengukurannya dikerjakan. Satu kali
+   * menyala adalah pemberitahuan; menyala terus adalah tombol yang rusak. */
+  static uint8_t jatuh_tempo_lalu = 0;
+  uint8_t jatuh_tempo_kini = jam_index_jatuh_tempo();
+  if (jatuh_tempo_kini && !jatuh_tempo_lalu) layar_set(true);
+  jatuh_tempo_lalu = jatuh_tempo_kini;
 
   /* ---- baterai ----
    * Persen saja tidak jujur saat kabel tertancap. Selama mengisi, tegangan sel
@@ -642,14 +777,24 @@ static void refresh_cb(lv_timer_t *tm) {
   ppg_data_t p;
   jam_snapshot(&p);
 
-  nilai_set(lbl_hr, sat_hr, &lv_font_montserrat_30, p.bpm_valid,  "%.0f", p.bpm, -1.0f);
-  nilai_set(lbl_sp, sat_sp, &lv_font_montserrat_30, p.spo2_valid, "%.0f", p.spo2, -1.0f);
-  nilai_set(lbl_gl, sat_gl, &lv_font_montserrat_30, p.glu_valid,  "%.0f", p.glucose, -1.0f);
-  nilai_set(lbl_bp, NULL,   &lv_font_montserrat_26, p.bp_valid,   "%.0f/%.0f", p.sbp, p.dbp);
+  /* p.awal: angka sudah nyata, gerbang kirim belum terlewati. Kartu menampilkan
+   * keduanya (yang sementara lebih redup) supaya layar bergerak selama sensor
+   * bekerja. Yang dikirim ke aplikasi tidak ikut berubah sedikit pun -- itu
+   * diputuskan aw_jam.cpp dari p.*_valid, bukan dari apa yang tampil di sini. */
+  bool sementara = p.awal;
 
-  cincin_set(cincin_hr, p.bpm_valid,  p.bpm,     HR_MIN, HR_MAKS);
-  cincin_set(cincin_sp, p.spo2_valid, p.spo2,    SP_MIN, SP_MAKS);
-  cincin_set(cincin_gl, p.glu_valid,  p.glucose, GL_MIN, GL_MAKS);
+  nilai_set(lbl_hr, sat_hr, &lv_font_montserrat_30, p.bpm_valid,  sementara,
+            "%.0f", p.bpm, -1.0f);
+  nilai_set(lbl_sp, sat_sp, &lv_font_montserrat_30, p.spo2_valid, sementara,
+            "%.0f", p.spo2, -1.0f);
+  nilai_set(lbl_gl, sat_gl, &lv_font_montserrat_30, p.glu_valid,  sementara,
+            "%.0f", p.glucose, -1.0f);
+  nilai_set(lbl_bp, NULL,   &lv_font_montserrat_26, p.bp_valid,   sementara,
+            "%.0f/%.0f", p.sbp, p.dbp);
+
+  cincin_set(cincin_hr, p.bpm_valid || sementara,  p.bpm,     HR_MIN, HR_MAKS);
+  cincin_set(cincin_sp, p.spo2_valid || sementara, p.spo2,    SP_MIN, SP_MAKS);
+  cincin_set(cincin_gl, p.glu_valid || sementara,  p.glucose, GL_MIN, GL_MAKS);
 
   /* ================= Heartbeat serial, tiap 5 detik =================
    * Ini satu-satunya jendela ke dalam jam sekarang: wajah barunya tidak punya
@@ -672,7 +817,7 @@ static void refresh_cb(lv_timer_t *tm) {
     rtc_scan_bus();
   }
 
-  static const char *SRC[] = { "none", "rtc", "ntp" };
+  static const char *SRC[] = { "none", "rtc", "ntp", "ble" };
   Serial.printf("[hb] %02d:%02d:%02d src=%s wifi=%d ble=%d sesi=%d tunda=%d  "
                 "touch irq=%lu err=%lu evt=%lu  heap=%lu\n",
                 have_time ? t.tm_hour : 0, have_time ? t.tm_min : 0,
@@ -685,9 +830,10 @@ static void refresh_cb(lv_timer_t *tm) {
 
   long dir, dred, dthr; uint32_t dn, dp;
   ppg_diag(&dir, &dred, &dn, &dthr, &dp);
-  Serial.printf("[ppg]  %s%s  bpm=%s%.0f  spo2=%s%.1f  glukosa*=%s%.0f  "
+  Serial.printf("[ppg]  %s%s%s  bpm=%s%.0f  spo2=%s%.1f  glukosa*=%s%.0f  "
                 "td*=%s%.0f/%.0f\n",
                 ppg_state_text(), p.held ? " [tahan]" : "",
+                p.awal ? " [awal]" : "",
                 p.bpm_valid  ? "" : "(-)", p.bpm,
                 p.spo2_valid ? "" : "(-)", p.spo2,
                 p.glu_valid  ? "" : "(-)", p.glucose,
@@ -710,28 +856,107 @@ static void refresh_cb(lv_timer_t *tm) {
   }
 }
 
-/* ================= Tombol PWR: tekan sekali hidup, tekan lagi mati ========= */
-#define PWR_DEBOUNCE_MS  50
+/* ================= Tombol PWR: tahan 3 detik = on/off =====================
+ * Satu gerbang yang sama untuk kedua arah, persis seperti tombol daya HP:
+ *
+ *   tahan >= 3 dtk saat mati    -> menyala   (lihat pwr_gerbang_nyala())
+ *   tahan >= 3 dtk saat menyala -> mati      (latch BAT_EN dilepas)
+ *   klik singkat                -> layar mati / hidup. Jam tetap berjalan:
+ *                                  sensor, sesi, BLE, dan ring buffer tidak
+ *                                  tersentuh sama sekali.
+ *
+ * Kenapa harus digerbang di KEDUA arah. Tanpa gerbang menyala, jam yang
+ * tersenggol di dalam tas akan menyala sendiri -- board ini menyambungkan
+ * baterainya secara perangkat keras selama tombol ditekan, jadi senggolan
+ * sepersekian detik sudah cukup untuk menjalankan firmware, dan firmware itu
+ * yang lalu menahan latch-nya sendiri sampai baterainya habis. Tanpa gerbang
+ * mati, satu senggolan yang sama mengakhiri sesi dua jam yang sedang berjalan
+ * dan sesi itu tidak bisa dimulai ulang dari jam.
+ *
+ * Tiga detik dipilih pengguna perangkat ini. Ia juga angka yang wajar: cukup
+ * lama untuk tidak pernah terjadi di dalam tas, cukup pendek untuk tidak terasa
+ * seperti jam yang menolak perintah.
+ *
+ * Aksi tekan-lama dijalankan saat ambangnya terlewati, bukan saat jari dilepas,
+ * supaya layar yang padam menjadi jawaban atas tekanan itu sendiri -- dengan
+ * begitu pengguna tidak menahan sambil menebak apakah sudah cukup lama. */
+#define PWR_DEBOUNCE_MS   50
+#define PWR_LAMA_MS     3000
 
 static bool     pwr_siap = false;      /* tombol sudah pernah dilepas sejak boot */
-static int      pwr_level_lalu = HIGH;
-static uint32_t pwr_stabil_ms = 0;
+static int      pwr_level_lalu  = HIGH;
+static int      pwr_stabil_lvl  = HIGH;
+static uint32_t pwr_stabil_ms   = 0;
+static uint32_t pwr_tekan_ms    = 0;
+static bool     pwr_lama_jalan  = false;
+
+/* Gerbang MENYALA, dipanggil dari setup() tepat setelah latch dipasang.
+ *
+ * Board ini menyambungkan baterainya secara perangkat keras selama PWR ditekan,
+ * jadi firmware tidak punya cara menolak dijalankan -- yang bisa dilakukannya
+ * cuma memutuskan apakah ia MELANJUTKAN. Di sinilah keputusan itu: selama tombol
+ * masih ditahan, tunggu sampai tiga detik penuh; kalau jarinya lepas lebih awal,
+ * latch dilepas lagi dan board mati persis seperti sebelum tersenggol.
+ *
+ * Ambangnya diukur dari millis(), bukan dari saat fungsi ini mulai. millis()
+ * menghitung sejak CPU menyala, jadi ~300 ms yang dihabiskan bootloader ikut
+ * terhitung -- dan yang dirasakan pengguna memang lama JARINYA menekan, bukan
+ * lama firmware berjalan.
+ *
+ * Tombol yang sudah terlepas saat fungsi ini dijalankan bukan urusannya: itu
+ * berarti board menyala karena sebab lain (kabel USB ditancapkan, tombol RST,
+ * atau flash baru selesai), dan tidak ada tekanan tombol yang perlu dinilai.
+ *
+ * Mengembalikan false hanya pada satu keadaan: tombol dilepas terlalu cepat
+ * TETAPI board tetap hidup -- artinya ia dicatu USB, dan pelepasan latch tidak
+ * berefek apa-apa. Pemanggil memakainya untuk mencetak keterangan itu; boot
+ * tetap dilanjutkan, karena kalau tidak, setiap sesi pengembangan lewat USB akan
+ * berakhir di board yang diam tanpa penjelasan. */
+static bool pwr_gerbang_nyala(void) {
+  if (digitalRead(PWR_KEY) != LOW) return true;   /* bukan dinyalakan dari tombol */
+
+  while (millis() < PWR_LAMA_MS) {
+    if (digitalRead(PWR_KEY) != LOW) {
+      digitalWrite(BAT_EN, LOW);    /* di baterai: board berhenti tepat di sini */
+      delay(50);
+      digitalWrite(BAT_EN, HIGH);   /* masih hidup -> USB; pasang lagi dan lanjut */
+      return false;
+    }
+    delay(10);
+  }
+  return true;
+}
 
 static void pwr_matikan(void) {
-  Serial.println("[pwr] tombol PWR ditekan -- mematikan");
-  ledcWrite(LCD_BL, 0);
-  jam_siap_mati();
-  digitalWrite(BAT_EN, LOW);
-  uint32_t t0 = millis();
-  bool dicatat = false;
-  for (;;) {
-    if (!dicatat && (uint32_t)(millis() - t0) >= 2000) {
-      dicatat = true;
-      Serial.println("[pwr] masih hidup setelah latch dilepas -- board dicatu USB, "
-                     "bukan baterai. Cabut USB atau tekan RST.");
-    }
-    delay(100);
-  }
+  Serial.println("[pwr] tombol PWR ditahan -- mematikan");
+  layar_set(false);
+  jam_siap_mati();               /* sensor padam, ring buffer dipaksa ke NVS */
+  digitalWrite(BAT_EN, LOW);     /* di baterai: board berhenti tepat di sini */
+
+  /* Sampai di sini berarti masih ada daya dari USB. Versi sebelumnya menjawab
+   * keadaan itu dengan for(;;) delay(100) -- board yang layarnya hidup tapi
+   * tidak menjawab tombol apa pun, tidak bisa dibedakan dari firmware yang
+   * hang, dan hanya bisa dipulihkan lewat tombol RST. Sekarang ia cuma diam
+   * dengan layar mati, dan klik berikutnya menghidupkannya lagi. */
+  pwr_daya_lepas = true;
+  Serial.println("[pwr] latch dilepas. Kalau board masih hidup, ia dicatu USB: "
+                 "tahan PWR 3 dtk lagi untuk menyalakan kembali.");
+}
+
+static void pwr_hidupkan_lagi(void) {
+  digitalWrite(BAT_EN, HIGH);
+  pwr_daya_lepas = false;
+  layar_set(true);
+  Serial.println("[pwr] latch dipasang lagi -- jam menyala kembali");
+}
+
+/* Klik singkat. Saat jam sudah diminta mati (dan cuma bertahan karena USB),
+ * klik sengaja tidak berbuat apa pun: menyalakan harus lewat gerbang tiga detik
+ * yang sama seperti mematikan, kalau tidak "off" jadi keadaan yang bisa
+ * dibatalkan sentuhan tak sengaja. */
+static void pwr_klik(void) {
+  if (pwr_daya_lepas) return;
+  layar_set(!s_layar_nyala);
 }
 
 static void pwr_poll(void) {
@@ -739,36 +964,61 @@ static void pwr_poll(void) {
   if (level != pwr_level_lalu) {
     pwr_level_lalu = level;
     pwr_stabil_ms  = millis();
-    return;
-  }
-  if ((uint32_t)(millis() - pwr_stabil_ms) < PWR_DEBOUNCE_MS) return;
-  if (!pwr_siap) {
-    if (level == HIGH) {
+  } else if ((uint32_t)(millis() - pwr_stabil_ms) >= PWR_DEBOUNCE_MS &&
+             level != pwr_stabil_lvl) {
+    pwr_stabil_lvl = level;              /* tepi yang sudah bersih */
+    if (level == LOW) {
+      pwr_tekan_ms   = millis();
+      pwr_lama_jalan = false;
+    } else if (!pwr_siap) {
+      /* Tombol PWR memang MASIH ditahan saat board menyala -- begitulah cara
+       * board ini dinyalakan. Tekanan itu bukan perintah dan tidak dihitung. */
       pwr_siap = true;
-      Serial.println("[pwr] tombol dilepas -- tekan sekali lagi untuk mematikan");
+      Serial.println("[pwr] tombol dilepas -- klik = layar, tahan 3 dtk = mati");
+    } else if (!pwr_lama_jalan) {
+      pwr_klik();                        /* dilepas sebelum ambang tekan-lama */
     }
-    return;
   }
-  if (level == LOW) pwr_matikan();       /* tidak pernah kembali */
+
+  if (pwr_siap && pwr_stabil_lvl == LOW && !pwr_lama_jalan &&
+      (uint32_t)(millis() - pwr_tekan_ms) >= PWR_LAMA_MS) {
+    pwr_lama_jalan = true;
+    /* Gerbang yang sama, dua arah. Cabang "menyala" hanya terpakai pada board
+     * yang dicatu USB: di baterai, pwr_matikan() memang tidak pernah kembali. */
+    if (pwr_daya_lepas) pwr_hidupkan_lagi();
+    else                pwr_matikan();
+  }
 }
 
-/* ================= Tombol BOOT: satu-satunya kendali =================
- * Perannya persis peran tombol utama di versi 7 layar, dan percabangannya sama:
+/* ================= Tombol BOOT: tombol pengukuran =================
+ * SATU tombol, SATU arti: "ukur sekarang". Yang diukur ditentukan keadaan sesi,
+ * bukan cara menekannya:
  *
- *   IDLE            -> cek manual. Hasilnya berhenti di layar jam: tidak ada
- *                      entri sampel, tidak ada event, tidak ada satu byte pun
- *                      yang dikirim ke aplikasi.
- *   ARMED / RUNNING -> "Selesai Makan", yaitu SUMBER TUNGGAL t0 (dokumen 3).
+ *   IDLE    -> cek manual. Hasilnya berhenti di layar jam: tidak ada entri
+ *              sampel, tidak ada event, tidak ada satu byte pun yang dikirim ke
+ *              aplikasi. Inilah "ngukur di luar sesi".
+ *   ARMED   -> "Selesai Makan": t0 lahir (SUMBER TUNGGAL, dokumen 3) dan
+ *              pengukuran index 1 langsung berjalan.
+ *   RUNNING -> pengukuran terjadwal yang sudah jatuh tempo: satu jam setelah
+ *              makan (index 2) dan dua jam setelah makan (index 3). Ketiganya --
+ *              index 1, 2, 3 -- karena itu lahir dari tombol yang sama, dan
+ *              ketiganya terkirim ke aplikasi lewat BLE.
  *
- * Hanya tekan-lama yang dihitung, dan itu bukan gaya-gayaan: tombol ini juga
- * strapping pin yang dipakai untuk masuk mode download, jadi ia gampang
- * tersenggol saat menancapkan kabel. Salah satu perannya memulai sesi dua jam
- * yang tidak bisa dibatalkan dari jam, jadi ambang 700 ms jauh lebih murah
- * daripada sesi yang lahir karena senggolan.
+ * Klik singkat dan tekan-lama melakukan hal yang sama, dan itu disengaja. Versi
+ * sebelumnya menuntut tahan 700 ms karena pin ini juga strapping pin mode
+ * download sehingga gampang tersenggol saat kabel ditancapkan. Alasan itu
+ * dibayar terlalu mahal di pemakaian sehari-hari: menahan tombol sambil menahan
+ * jari yang lain diam di sensor selama belasan detik adalah dua hal yang tidak
+ * bisa dilakukan sekaligus dengan nyaman, sementara senggolan kabel cuma terjadi
+ * di meja kerja. Tekan-lama dipertahankan supaya kebiasaan lama tetap bekerja,
+ * bukan sebagai syarat.
  *
- * Aksinya dijalankan saat ambang terlewati, bukan saat jari dilepas: kalau
- * menunggu pelepasan, pengguna menahan sambil menebak apakah sudah cukup lama,
- * dan tebakan itu satu-satunya umpan balik yang ada. */
+ * Aksi tekan-lama dijalankan saat ambang terlewati, bukan saat jari dilepas:
+ * kalau menunggu pelepasan, pengguna menahan sambil menebak apakah sudah cukup
+ * lama, dan tebakan itu satu-satunya umpan balik yang ada. Klik singkat, karena
+ * definisinya "dilepas sebelum ambang", memang baru bisa dinilai saat dilepas --
+ * penjaga boot_sudah_jalan yang memastikan satu tekanan tidak dihitung dua
+ * kali. */
 #define BOOT_DEBOUNCE_MS   30
 #define BOOT_LAMA_MS      700
 
@@ -781,22 +1031,31 @@ static bool      boot_sudah_jalan = false;
 
 /* Umpan balik penolakan wajib spesifik. "Tidak terjadi apa-apa" adalah cara
  * tercepat membuat pengguna menyimpulkan jamnya rusak, padahal jam menolak
- * karena alasan yang benar. */
+ * karena alasan yang benar. true kalau tekanan itu ditolak -- pemanggil memakai
+ * itu untuk memilih pesan keberhasilannya sendiri. */
+static bool boot_umpan_balik_tolak(void) {
+  switch (jam_umpan_balik_ditolak()) {
+    case JAM_TOLAK_SEDANG_UKUR:   status_pesan("SEDANG MENGUKUR");   return true;
+    case JAM_TOLAK_BATERAI:       status_pesan("BATERAI LEMAH");     return true;
+    case JAM_TOLAK_SENSOR:        status_pesan("SENSOR TIDAK ADA");  return true;
+    case JAM_TOLAK_SESI_AKTIF:    status_pesan("SESI SEDANG JALAN"); return true;
+    case JAM_TOLAK_SESI_BERJALAN: status_pesan("SESI SUDAH MULAI");  return true;
+    case JAM_TOLAK_BELUM_JATUH_TEMPO: status_pesan("BELUM WAKTUNYA"); return true;
+    case JAM_TOLAK_BELUM_ARM:     status_pesan("BELUM DISIAPKAN");   return true;
+    default: return false;
+  }
+}
+
 static void boot_aktifkan(void) {
   bool idle = (jam_status() == AW_SESI_IDLE);
+  bool jatuh_tempo = jam_index_jatuh_tempo() != 0;
   if (idle) jam_cek_manual();
   else      jam_tekan_tombol();
 
-  switch (jam_umpan_balik_ditolak()) {
-    case JAM_TOLAK_SEDANG_UKUR: status_pesan("SEDANG MENGUKUR");   return;
-    case JAM_TOLAK_BATERAI:     status_pesan("BATERAI LEMAH");     return;
-    case JAM_TOLAK_SENSOR:      status_pesan("SENSOR TIDAK ADA");  return;
-    case JAM_TOLAK_SESI_AKTIF:  status_pesan("SESI SEDANG JALAN"); return;
-    case JAM_TOLAK_SESI_BERJALAN: status_pesan("SESI SUDAH MULAI"); return;
-    case JAM_TOLAK_BELUM_ARM:   status_pesan("BELUM DISIAPKAN");   return;
-    default: break;
-  }
-  status_pesan(idle ? "CEK MANUAL" : "SELESAI MAKAN");
+  if (boot_umpan_balik_tolak()) return;
+  if (idle)        status_pesan("CEK MANUAL");
+  else if (jatuh_tempo) status_pesan("MULAI UKUR");
+  else             status_pesan("SELESAI MAKAN");
 }
 
 static void boot_poll(void) {
@@ -810,9 +1069,15 @@ static void boot_poll(void) {
     if (level == LOW) {
       boot_tekan_ms    = millis();
       boot_sudah_jalan = false;
+      /* Layar dibangunkan pada TEKANAN, bukan pada aksinya: pengukuran yang
+       * dimulai di layar gelap tidak punya cara memberi tahu kemajuannya, dan
+       * kemajuan itulah satu-satunya alasan pengguna mau menahan jari diam. */
+      if (!s_layar_nyala) layar_set(true);
     } else if (!boot_siap) {
       boot_siap = true;
       Serial.println("[boot] tombol dilepas -- siap dipakai");
+    } else if (!boot_sudah_jalan) {
+      boot_aktifkan();                          /* dilepas sebelum ambang lama */
     }
   }
 
@@ -834,9 +1099,18 @@ void setup() {
   pinMode(PWR_KEY, INPUT_PULLUP);
   pinMode(BOOT_KEY, INPUT_PULLUP);
 
+  /* Gerbang menyala: tombol harus ditahan sampai 3 detik, kalau tidak jam mati
+   * lagi sebelum sempat menampilkan apa pun. Dijalankan tepat setelah latch
+   * dipasang, karena latch itulah yang membuat kita punya daya untuk menghitung
+   * tiga detiknya sama sekali. */
+  bool nyala_disengaja = pwr_gerbang_nyala();
+
   Serial.begin(115200);
   delay(200);
   Serial.println("\n[boot] AsaWatch -- wajah satu halaman");
+  if (!nyala_disengaja)
+    Serial.println("[pwr] tombol dilepas sebelum 3 dtk -- board tetap jalan "
+                   "karena dicatu USB, bukan baterai");
 
   /* Backlight: PWM 5 kHz / 8 bit lewat LEDC. Tetap gelap dulu supaya tidak
    * ada flash putih, sekaligus menjaga panel tenang selama kalibrasi touch. */
@@ -914,7 +1188,19 @@ void setup() {
   lv_timer_create(refresh_cb, 500, NULL);
 
   lv_timer_handler();
-  ledcWrite(LCD_BL, 204);   /* ~80% */
+  ledcWrite(LCD_BL, LCD_BL_TERANG);
+
+  /* Arming tombol PWR persis sealasan dengan arming tombol BOOT di bawah, dan
+   * di sini keliru diamnya lebih mahal: tanpa baris ini, board yang menyala
+   * dengan tombol PWR sudah terlepas -- yaitu setiap kali ia dicatu USB -- tidak
+   * pernah melihat tepi apa pun, pwr_siap tidak pernah menjadi true, dan tombol
+   * PWR mati total sampai reset. */
+  pwr_stabil_lvl = digitalRead(PWR_KEY);
+  pwr_level_lalu = pwr_stabil_lvl;
+  pwr_siap       = (pwr_stabil_lvl == HIGH);
+  Serial.printf("[pwr] tombol PWR %s\n",
+                pwr_siap ? "siap (klik = layar on/off, tahan 3 dtk = mati)"
+                         : "masih ditahan -- lepaskan dulu");
 
   /* Arming tombol BOOT ditentukan dari keadaan pin, bukan ditunggu sebagai
    * tepi. boot_poll() hanya bereaksi pada PERUBAHAN level, jadi tombol yang
@@ -927,7 +1213,8 @@ void setup() {
   boot_level_lalu = boot_stabil_lvl;
   boot_siap       = (boot_stabil_lvl == HIGH);
   Serial.printf("[boot] tombol BOOT %s\n",
-                boot_siap ? "siap (tekan lama = cek manual / selesai makan)"
+                boot_siap ? "siap (klik = ukur yang jatuh tempo, tekan lama = "
+                            "cek manual / selesai makan)"
                           : "masih ditahan -- lepaskan dulu");
 
   /* Paling akhir: UI sudah tampil sebelum radio mulai menyita CPU dan heap.
@@ -961,5 +1248,16 @@ void loop() {
   jam_putar();
 
   lv_timer_handler();
+
+  /* Backlight menyala setelah frame pertama selesai digambar, bukan di dalam
+   * layar_set(): membangunkan panel di tengah lv_timer callback lalu memanggil
+   * lv_timer_handler() dari sana berarti LVGL masuk ke dirinya sendiri. Menunda
+   * satu iterasi loop juga yang membuat layar tidak pernah memperlihatkan sisa
+   * frame lama sepersekian detik sebelum digambar ulang. */
+  if (s_bl_tunda) {
+    s_bl_tunda = false;
+    ledcWrite(LCD_BL, LCD_BL_TERANG);
+  }
+
   delay(2);
 }

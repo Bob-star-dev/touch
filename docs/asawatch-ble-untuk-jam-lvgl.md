@@ -112,6 +112,14 @@ anchor = (boot_id, uptime_s saat perintah diterima, epoch_s dari aplikasi)
 `boot_id` disertakan supaya jam bisa mem-NAK bila ia sempat reboot antara handshake dan write —
 tanpa itu, anchor bisa terpasang pada garis waktu yang salah.
 
+**Perintah yang sama juga menyetel jam dinding di layar jam.** Epoch UTC di dalamnya adalah jam HP,
+dan HP-lah yang paling sering ada di dekat jam tangan — jauh lebih sering daripada Wi-Fi rumah yang
+dibutuhkan NTP. Karena itu firmware LVGL menerapkannya ke RTC PCF85063 (setelah digeser ke zona
+waktu perangkat) begitu perintah ini masuk, jadi jam tangan ikut benar tanpa Wi-Fi. Sisi aplikasi
+tidak perlu berubah sedikit pun: ia sudah mengirim perintah ini pada setiap koneksi. Kedua peran
+anchor tetap terpisah di dalam firmware — pemetaan `uptime_s → epoch` untuk entri buffer tidak
+bergantung pada jam dinding, dan sebaliknya.
+
 Konversi di aplikasi, untuk entri apa pun:
 
 ```
@@ -637,14 +645,29 @@ lama untuk menjatuhkan frame. Yang perlu dijaga adalah godaan menulis setiap per
   `t0.uptime_s + 3600` dan index 3 pada `+ 7200`.
 - Sampel index 3 terkirim → IDLE. Sampel yang belum di-ack tetap di buffer.
 
+**Jadwal menyalakan panggilan, bukan sensor.** Firmware LVGL tidak menyalakan MAX30105 sendiri saat
+index 2 dan 3 jatuh tempo: ia menandai pengukuran itu "menunggu tombol", menampilkannya di baris
+status, dan pengukuran baru berjalan saat pengguna menekan tombol — dengan jarinya sudah menempel di
+sensor. Sensor optik tidak menghasilkan apa pun tanpa kulit, jadi pengukuran yang menyala sendiri
+saat jam tergeletak di meja hanya menghasilkan `UKUR_GAGAL` setelah 90 detik menunggu kontak.
+
+Yang berubah hanya **pemicunya**; kawatnya tidak. Index, `sesiId`, jenis entri, dan urutan sampel
+tetap persis seperti di tabel-tabel di atas, dan `UKUR` dari aplikasi tetap dilayani kapan pun.
+Masa tunggunya dibatasi supaya sesi tidak menggantung: index 2 hangus saat index 3 jatuh tempo,
+index 3 hangus satu jam setelah jatuh tempo, dan **keduanya dicatat `UKUR_GAGAL` dengan payload
+index** — sama seperti pengukuran yang berjalan lalu gagal total, karena bagi aplikasi keduanya
+memang peristiwa yang sama: index itu tidak punya sampel dan tidak akan pernah punya. Index 3 yang
+hangus menutup sesi persis seperti sampel index 3 yang terkirim.
+
 Dua hal yang wajib dipegang:
 
 **1. Jadwal dihitung dari `uptime_s` absolut milik `t0`, tidak pernah dari "sisa waktu".** Sisa waktu
 yang diakumulasikan akan hanyut setiap kali ada penundaan.
 
 ```cpp
-if (!(index_selesai & (1 << 2)) && sekarang >= t0_uptime + 3600) ukur(2);
-if (!(index_selesai & (1 << 3)) && sekarang >= t0_uptime + 7200) { ukur(3); ke_idle(); }
+if (!(index_selesai & (1 << 2)) && sekarang >= t0_uptime + 3600) menunggu_tombol = 2;
+if (!(index_selesai & (1 << 3)) && sekarang >= t0_uptime + 7200) menunggu_tombol = 3;
+// tombol ditekan -> ukur(menunggu_tombol); sampel/hangusnya index 3 -> ke_idle()
 ```
 
 **2. Reboot saat RUNNING mengakhiri sesi.** `uptime_s` kembali nol dan `t0` lama tidak bisa

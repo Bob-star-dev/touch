@@ -4,12 +4,15 @@
 #include "rtc.h"
 #include "config.h"
 
+/* Singkatan bahasa Inggris, huruf besar-kecil seperti lazimnya ("Wed", bukan
+ * "WED"). Baris tanggal memakainya apa adanya; lihat status_baris() di
+ * touch.ino. */
 static const char *HARI[7] = {
-  "MINGGU", "SENIN", "SELASA", "RABU", "KAMIS", "JUMAT", "SABTU"
+  "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
 };
 static const char *BULAN[12] = {
-  "JANUARI", "FEBRUARI", "MARET", "APRIL", "MEI", "JUNI",
-  "JULI", "AGUSTUS", "SEPTEMBER", "OKTOBER", "NOVEMBER", "DESEMBER"
+  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
 };
 
 /* Basis interpolasi: waktu pada saat basis diambil + nilai millis() saat itu. */
@@ -104,6 +107,39 @@ void tm_submit_ntp(const struct tm *local_time) {
   portEXIT_CRITICAL(&s_mux);
 }
 
+/* Waktu dari HP. Dipanggil aw_jam.cpp saat opcode ANCHOR_WAKTU dijalankan --
+ * yaitu di konteks loop, tempat menulis RTC lewat I2C memang aman.
+ *
+ * Perhatikan bahwa nilai yang masuk adalah epoch UTC (dokumen 5), sedangkan
+ * seluruh berkas ini bekerja dengan "epoch lokal": epoch yang sudah digeser
+ * TZ_OFFSET_SEC lalu dipecah gmtime_r. Pergeseran itu dilakukan di sini, satu
+ * kali, supaya tidak ada pemanggil yang perlu tahu konvensi tersebut.
+ *
+ * Besar loncatannya ikut dicetak: kalau jam tangan terlihat "melompat" setiap
+ * kali HP tersambung, angka itulah yang memberi tahu berapa jauh dan ke arah
+ * mana. Selisih yang selalu kelipatan satu jam berarti TZ_OFFSET_SEC salah,
+ * bukan RTC yang rusak. */
+void tm_terapkan_epoch_utc(uint32_t epoch_utc) {
+  time_t lokal = (time_t)epoch_utc + TZ_OFFSET_SEC;
+  struct tm t;
+  gmtime_r(&lokal, &t);
+
+  long selisih = 0;
+  if (s_src != TIME_SRC_NONE) {
+    time_t sekarang = s_base_epoch + (time_t)((uint32_t)(millis() - s_base_ms) / 1000UL);
+    selisih = (long)(lokal - sekarang);
+  }
+
+  rebase(&t, TIME_SRC_BLE);
+  rtc_write(&t);                   /* tetap benar setelah HP pergi maupun reboot */
+  s_last_rtc_ms = millis();
+
+  Serial.printf("[time] disinkronkan dari HP: %04d-%02d-%02d %02d:%02d:%02d "
+                "(geser %+ld dtk)\n",
+                t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+                t.tm_hour, t.tm_min, t.tm_sec, selisih);
+}
+
 void tm_tick(void) {
   /* 1. Terapkan hasil NTP kalau ada titipan dari task jaringan. */
   if (s_ntp_pending) {
@@ -127,9 +163,11 @@ void tm_tick(void) {
     s_last_rtc_ms = millis();
     struct tm t;
     if (rtc_read(&t)) {
-      /* Jangan turunkan derajat sumber: kalau sudah pernah NTP, RTC memang
-       * sudah memuat hasil NTP itu, jadi statusnya tetap TIME_SRC_NTP. */
-      rebase(&t, s_src == TIME_SRC_NTP ? TIME_SRC_NTP : TIME_SRC_RTC);
+      /* Jangan turunkan derajat sumber: kalau sudah pernah NTP atau disetel dari
+       * HP, RTC memang sudah memuat hasil itu -- ia ditulis balik di kedua jalur
+       * -- jadi statusnya tetap seperti semula. */
+      rebase(&t, (s_src == TIME_SRC_NTP || s_src == TIME_SRC_BLE)
+                   ? s_src : TIME_SRC_RTC);
     }
   }
 }

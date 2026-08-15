@@ -7,6 +7,7 @@
 #include "aw_store.h"
 #include "ppg.h"
 #include "battery.h"
+#include "time_manager.h"
 
 /* ---------------- Parameter pengukuran ================================
  * Pengukuran selesai karena DATANYA cukup, bukan karena waktunya habis.
@@ -25,14 +26,26 @@
  * adalah rata-rata 4 interval terakhir, jadi dengan 3 detak satu interval yang
  * salah baca menggeser hasilnya puluhan bpm.
  *
- * Karena itu gerbangnya sekarang jumlah detak. 15 dipilih, bukan diambil dari
- * udara: pada 60-100 bpm itu 9-15 detik MENCACAH -- di atas 8 detik penenangan
- * DC, jadi total 17-23 detik per pengukuran. Cukup panjang untuk membuat
- * rata-rata IBI berarti dan beberapa window SpO2 terkumpul, masih cukup pendek
- * untuk menahan jari diam. Naikkan kalau hasilnya masih goyang; turunkan kalau
- * pengguna mengeluh kelamaan.
+ * Karena itu gerbangnya jumlah detak, bukan detik. Yang berubah cuma angkanya:
+ * 10, turun dari 15. Pada 60-100 bpm itu 6-10 detik MENCACAH, di atas 3 detik
+ * penenangan DC (ppg.cpp menurunkannya dari 8) dan satu-dua detak pertama yang
+ * hanya dipakai membentuk IBI -- jadi sekitar 11-16 detik per pengukuran ketika
+ * nadinya mudah ditemukan.
+ *
+ * Panjangnya karena itu TIDAK tetap, dan memang tidak boleh tetap: nadi yang
+ * susah terbaca (jari longgar, tangan dingin, kulit gelap, gerakan) menghasilkan
+ * detak lebih jarang, dan pengukuran ikut memanjang sendiri sampai gerbangnya
+ * terpenuhi. Pengukuran berhenti karena DATANYA cukup, bukan karena hitungan
+ * mundur habis -- lihat jam_ukur_sisa_detik() untuk perkiraan yang ditampilkan
+ * ke pengguna, yang ikut memendek begitu detaknya datang cepat.
+ *
+ * UKUR_MIN_MS adalah lantainya. Tanpa itu, nadi cepat (100+ bpm) memenuhi 10
+ * detak dalam 6 detik, dan seluruh hasil akan lahir dari dua-tiga window SpO2
+ * saja. Sepuluh detik memastikan rata-rata sesi punya cukup window untuk
+ * berarti, berapa pun cepatnya jantung yang diukur.
  */
-#define UKUR_MIN_DETAK  15
+#define UKUR_MIN_DETAK  10
+#define UKUR_MIN_MS     10000UL
 
 /* Tidak ada batas waktu selama jari masih menempel: pengukuran menunggu sampai
  * datanya lengkap, apa pun lamanya. Dua penjaga di bawah ini bukan batas
@@ -45,12 +58,41 @@
 #define UKUR_TANPA_KONTAK_MS  90000UL    /* 90 dtk tanpa kulit menempel   */
 #define UKUR_BATAS_KERAS_MS  300000UL    /* 5 menit, apa pun keadaannya   */
 
+/* ---------------- Pengukuran terjadwal menunggu tombol ================
+ * Dokumen 12 menyuruh jam menjalankan sendiri index 2 pada t0+1 jam dan index 3
+ * pada t0+2 jam. Wire protocol-nya tidak berubah sedikit pun di sini -- index,
+ * sesiId, jenis entri, semuanya tetap -- yang berubah cuma APA yang memicu
+ * pengukuran itu: jatuh tempo tidak lagi langsung menyalakan sensor, melainkan
+ * menandai pengukuran sebagai "menunggu tombol".
+ *
+ * Alasannya fisik, bukan selera. MAX30105 hanya menghasilkan angka kalau ada
+ * jari menempel di sensor. Pengukuran yang menyala sendiri satu jam setelah
+ * makan hampir selalu menyala saat jamnya tergeletak di meja atau tangannya
+ * sedang dipakai: 90 detik kemudian ia menyerah lewat UKUR_TANPA_KONTAK_MS dan
+ * mencatat UKUR_GAGAL, dan itulah yang tersimpan di aplikasi -- bukan karena
+ * sensornya gagal, melainkan karena tidak ada seorang pun yang tahu bahwa saat
+ * itu ia harus menempelkan jari.
+ *
+ * Dengan menunggu tombol, pengukuran selalu dimulai oleh orang yang jarinya
+ * sudah menempel. Yang hilang adalah pengukuran yang tepat waktu ke detik; yang
+ * didapat adalah pengukuran yang benar-benar berisi angka.
+ *
+ * Masa tunggunya tetap dibatasi supaya sesi tidak menggantung selamanya bila
+ * tombolnya tidak pernah ditekan: index 2 hangus saat index 3 jatuh tempo, dan
+ * index 3 hangus satu jam setelah jatuh tempo. Keduanya dicatat UKUR_GAGAL --
+ * jujur, karena pengukurannya memang tidak pernah terjadi. */
+#define UKUR_TUNGGU_TOMBOL_S  3600UL     /* batas menunggu tombol untuk index 3 */
+
 /* ---------------- Keadaan sesi ---------------- */
 static uint8_t  s_status = AW_SESI_IDLE;
 static uint8_t  s_sesi_id[16];
 static uint32_t s_arm_uptime = 0;
 static uint32_t s_t0_uptime  = 0;
 static uint8_t  s_index_selesai = 0;      /* bitmask index yang sudah dijadwalkan */
+
+/* Index yang sudah jatuh tempo dan sedang menunggu tombol: 0, 2, atau 3. Hanya
+ * satu pada satu waktu -- index 2 sudah hangus saat index 3 jatuh tempo. */
+static uint8_t  s_index_menunggu = 0;
 
 /* ---------------- Keadaan pengukuran ---------------- */
 static bool     s_ukur_aktif = false;
@@ -60,6 +102,7 @@ static uint32_t s_ukur_mulai_ms = 0;
 static uint32_t s_ukur_uptime_s = 0;
 static uint32_t s_ukur_kontak_ms = 0;   /* terakhir kali kulit terdeteksi */
 static uint16_t s_ukur_detak = 0;       /* detak yang sudah tercacah      */
+static uint32_t s_ukur_detak1_ms = 0;   /* saat detak PERTAMA tercacah    */
 
 /* Cek manual: pengukuran yang hasilnya HANYA untuk layar jam.
  *
@@ -178,6 +221,7 @@ static void ukur_mulai(uint8_t index, const uint8_t *sesi_id, bool lokal) {
   s_ukur_kontak_ms = millis();
   s_ukur_uptime_s = aw_uptime_s();
   s_ukur_detak = 0;
+  s_ukur_detak1_ms = 0;
   s_acc_gula = 0; s_acc_bpm = 0; s_acc_sis = 0; s_acc_dia = 0; s_acc_spo2 = 0;
 
   /* Hasil lama dibuang SEBELUM LED menyala. Tanpa ini, ppg_get() masih
@@ -271,6 +315,7 @@ static void ukur_selesai(bool lengkap) {
     memset(s_sesi_id, 0, 16);
     s_t0_uptime = 0;
     s_index_selesai = 0;
+    s_index_menunggu = 0;
     aw_ble_atur_interval(false);
   }
   kirim_status();
@@ -290,6 +335,7 @@ static void ukur_putar(void) {
   /* held=true berarti angkanya salinan hasil terakhir, bukan bacaan langsung.
    * Selama satu pengukuran hanya bacaan langsung yang boleh dipanen. */
   if (!p.held) {
+    if (!s_ukur_detak1_ms && p.beats > 0) s_ukur_detak1_ms = skrg;
     s_ukur_detak = p.beats;
     if (p.bpm_valid  && !s_acc_bpm)  s_acc_bpm  = klem_u8(p.bpm);
     if (p.spo2_valid && !s_acc_spo2) s_acc_spo2 = klem_u8(p.spo2);
@@ -300,19 +346,26 @@ static void ukur_putar(void) {
     }
   }
 
-  /* Selesai hanya kalau KEEMPAT metrik sudah ada DAN detaknya sudah cukup.
-   * Akumulator di atas tetap mengunci nilai pertama supaya keempat titik di
-   * layar menyala satu per satu -- itu yang memperlihatkan kemajuan -- tetapi
-   * nilai yang akhirnya dikirim diambil ulang di bawah, setelah 15 detak. */
+  /* Selesai hanya kalau KEEMPAT metrik sudah ada, detaknya sudah cukup, DAN
+   * pengukurannya sudah berjalan minimal UKUR_MIN_MS.
+   *
+   * Akumulator di atas mengunci nilai sah pertama tiap metrik; ia bukan yang
+   * tampil di layar (layar memakai bacaan langsung lewat jam_snapshot) melainkan
+   * penanda "metrik ini sudah pernah lolos gerbang kirim". Nilai yang akhirnya
+   * dikirim diambil ulang di bawah dari rata-rata sesi. */
   bool punya_semua = s_acc_bpm && s_acc_spo2 && s_acc_gula && s_acc_sis;
   bool cukup_detak = s_ukur_detak >= UKUR_MIN_DETAK;
+  bool cukup_lama  = (uint32_t)(skrg - s_ukur_mulai_ms) >= UKUR_MIN_MS;
 
-  if (punya_semua && cukup_detak) {
+  if (punya_semua && cukup_detak && cukup_lama) {
     /* Angka final diambil dari rata-rata sesi, bukan dari nilai pertama yang
-     * sempat terlihat belasan detik lalu. Rata-rata itulah alasan menunggu 15
-     * detak: kalau hasilnya toh diambil dari window pertama, menunggu tidak
-     * memperbaiki apa pun. Glukosa tidak punya rata-rata di statistik sesi,
-     * jadi ia memakai nilai terkini yang sudah dihaluskan push_smoothed(). */
+     * sempat terlihat belasan detik lalu. Rata-rata itulah alasan menunggu
+     * UKUR_MIN_DETAK detak: kalau hasilnya toh diambil dari window pertama,
+     * menunggu tidak memperbaiki apa pun. Statistik itu sendiri hanya menghimpun
+     * window yang sudah stabil (lihat accumulate_spo2 di ppg.cpp), jadi angka
+     * sementara yang sempat tampil di layar tidak pernah ikut terkirim. Glukosa
+     * tidak punya rata-rata di statistik sesi, jadi ia memakai nilai terkini
+     * yang sudah dihaluskan push_smoothed(). */
     if (p.stats_valid) {
       if (p.bpm_avg  > 0) s_acc_bpm  = klem_u8((float)p.bpm_avg);
       if (p.spo2_avg > 0) s_acc_spo2 = klem_u8((float)p.spo2_avg);
@@ -346,16 +399,69 @@ static void ke_idle(void) {
   s_t0_uptime = 0;
   s_arm_uptime = 0;
   s_index_selesai = 0;
+  s_index_menunggu = 0;
   aw_ble_atur_interval(false);
+  kirim_status();
+}
+
+/* Pengukuran terjadwal yang menunggu tombol, dimulai oleh tekanan tombol BOOT.
+ * Pemeriksaannya sama persis dengan halangan_ukur() yang dipakai perintah dari
+ * aplikasi -- baterai kritis dan sensor hilang menolak keduanya dengan alasan
+ * yang sama -- hanya saja jawabannya di sini pesan di layar, bukan NAK. */
+static void mulai_index_menunggu(void) {
+  uint8_t index = s_index_menunggu;
+  if (s_ukur_aktif)     { s_tolak = JAM_TOLAK_SEDANG_UKUR; return; }
+  if (!ppg_present())   { s_tolak = JAM_TOLAK_SENSOR;      return; }
+  if (baterai_kritis()) { s_tolak = JAM_TOLAK_BATERAI;     return; }
+
+  s_index_menunggu = 0;
+  s_index_selesai |= (uint8_t)(1 << index);
+  Serial.printf("[sesi] tombol ditekan -- mulai pengukuran index %u\n",
+                (unsigned)index);
+  ukur_mulai(index, s_sesi_id, false);
+}
+
+/* Pengukuran yang jatuh temponya lewat tanpa tombol pernah ditekan. Dicatat
+ * sebagai UKUR_GAGAL dengan payload index, sama seperti pengukuran yang berjalan
+ * lalu tidak menghasilkan apa pun: dari sisi aplikasi keduanya memang peristiwa
+ * yang sama -- index itu tidak punya sampel dan tidak akan pernah punya. */
+static void lewatkan_index(uint8_t index) {
+  aw_ring_tambah_event(AW_EV_UKUR_GAGAL, s_sesi_id, index, aw_uptime_s());
+  s_index_selesai |= (uint8_t)(1 << index);
+  s_index_menunggu = 0;
+  Serial.printf("[sesi] index %u hangus -- tombol tidak pernah ditekan\n",
+                (unsigned)index);
+
+  if (index == 3) {
+    /* Index 3 hangus menutup sesi, persis seperti sampel index 3 yang terkirim.
+     * Kalau tidak, sesi RUNNING menggantung selamanya dengan interval koneksi
+     * rapat yang terus menguras baterai. */
+    s_status = AW_SESI_IDLE;
+    memset(s_sesi_id, 0, 16);
+    s_t0_uptime = 0;
+    s_index_selesai = 0;
+    aw_ble_atur_interval(false);
+  }
   kirim_status();
 }
 
 void jam_tekan_tombol(void) {
   if (s_status == AW_SESI_RUNNING) {
-    /* Sesi sudah berjalan: t0 hanya boleh lahir sekali, dan menekan tombol lagi
-     * bukan permintaan yang punya arti. Dipisahkan dari cabang di bawah supaya
-     * pesannya benar -- "belum disiapkan aplikasi" justru salah di sini. */
-    s_tolak = JAM_TOLAK_SESI_BERJALAN;
+    /* Diperiksa sebelum apa pun: pengukuran yang sedang berjalan adalah jawaban
+     * yang lebih tepat daripada "belum waktunya" di bawah, dan itu justru
+     * keadaan yang paling mungkin saat tombol ditekan dua kali berturut-turut. */
+    if (s_ukur_aktif) { s_tolak = JAM_TOLAK_SEDANG_UKUR; return; }
+
+    /* Selama sesi berjalan, tombol ini berganti arti: ia tidak lagi melahirkan
+     * t0 (itu hanya boleh sekali) melainkan MEMULAI pengukuran terjadwal yang
+     * sudah jatuh tempo -- inilah tekanan tombol satu jam dan dua jam setelah
+     * makan. */
+    if (s_index_menunggu) { mulai_index_menunggu(); return; }
+
+    /* Sesi berjalan tetapi belum ada yang jatuh tempo. Pesannya dibedakan dari
+     * "sesi sudah mulai" karena yang perlu diketahui pengguna bukan status sesi
+     * melainkan bahwa ia cuma perlu menunggu. */
+    s_tolak = JAM_TOLAK_BELUM_JATUH_TEMPO;
     return;
   }
   if (s_status != AW_SESI_ARMED) {
@@ -439,15 +545,33 @@ static void putar_sesi(void) {
 
   /* Jadwal dihitung dari uptime_s ABSOLUT milik t0, tidak pernah dari "sisa
    * waktu" yang diakumulasikan sendiri -- sisa waktu akan hanyut setiap kali
-   * ada penundaan (dokumen 12). */
-  if (!(s_index_selesai & (1 << 2)) && skrg >= s_t0_uptime + AW_JADWAL_IDX2_S) {
-    s_index_selesai |= (1 << 2);
-    ukur_mulai(2, s_sesi_id, false);
+   * ada penundaan (dokumen 12). Yang dijadwalkan sekarang adalah SAAT TOMBOL
+   * MULAI BERARTI, bukan saat sensor menyala; lihat UKUR_TUNGGU_TOMBOL_S. */
+
+  /* Yang hangus diperiksa lebih dulu, supaya index 2 yang tidak pernah ditekan
+   * sudah tercatat gagal sebelum index 3 mengambil giliran menunggu. */
+  if (!(s_index_selesai & (1 << 2)) && skrg >= s_t0_uptime + AW_JADWAL_IDX3_S) {
+    lewatkan_index(2);
+  }
+  if (s_index_menunggu == 3 &&
+      skrg >= s_t0_uptime + AW_JADWAL_IDX3_S + UKUR_TUNGGU_TOMBOL_S) {
+    lewatkan_index(3);           /* ini juga menutup sesi */
     return;
   }
-  if (!(s_index_selesai & (1 << 3)) && skrg >= s_t0_uptime + AW_JADWAL_IDX3_S) {
-    s_index_selesai |= (1 << 3);
-    ukur_mulai(3, s_sesi_id, false);
+
+  if (!(s_index_selesai & (1 << 2)) && s_index_menunggu != 2 &&
+      skrg >= s_t0_uptime + AW_JADWAL_IDX2_S &&
+      skrg <  s_t0_uptime + AW_JADWAL_IDX3_S) {
+    s_index_menunggu = 2;
+    Serial.println("[sesi] index 2 jatuh tempo (t0+1 jam) -- menunggu tombol");
+    kirim_status();
+    return;
+  }
+  if (!(s_index_selesai & (1 << 3)) && s_index_menunggu != 3 &&
+      skrg >= s_t0_uptime + AW_JADWAL_IDX3_S) {
+    s_index_menunggu = 3;
+    Serial.println("[sesi] index 3 jatuh tempo (t0+2 jam) -- menunggu tombol");
+    kirim_status();
   }
 }
 
@@ -482,6 +606,20 @@ static void jalankan_perintah(const aw_perintah_t *p) {
        * waktu yang salah (dokumen 2.2). */
       if (bid != aw_boot_id()) { nak(AW_NAK_BOOT_ID_TIDAK_COCOK); return; }
       aw_simpan_anchor(aw_uptime_s(), epoch);
+
+      /* Perintah yang sama juga menyetel jam dinding di layar.
+       *
+       * Anchor sudah membawa persis apa yang dibutuhkan -- epoch UTC dari HP,
+       * dikirim pada SETIAP koneksi tepat setelah handshake (dokumen 2.2) --
+       * jadi tidak ada opcode baru yang perlu ditambahkan, dan sisi Flutter yang
+       * sudah diuji tidak perlu berubah satu baris pun. Inilah yang membuat jam
+       * ikut benar begitu HP tersambung, tanpa Wi-Fi dan tanpa NTP.
+       *
+       * Dua peran anchor ini sengaja tidak digabung menjadi satu variabel:
+       * aw_simpan_anchor() memetakan uptime_s -> epoch untuk entri buffer dan
+       * harus tetap utuh walau jam dinding meleset, sementara yang di bawah cuma
+       * urusan tampilan. */
+      tm_terapkan_epoch_utc(epoch);
       ack(op);
       kirim_status();
       return;
@@ -529,6 +667,9 @@ static void jalankan_perintah(const aw_perintah_t *p) {
       if (halangan) { nak(halangan); return; }
       ack(op);
       s_index_selesai |= (uint8_t)(1 << index);
+      /* Aplikasi mendahului tombol: index yang tadinya menunggu ditekan sudah
+       * diukur sekarang, jadi panggilan di layar harus ikut hilang. */
+      if (s_index_menunggu == index) s_index_menunggu = 0;
       ukur_mulai(index, s_sesi_id, false);
       return;
     }
@@ -665,6 +806,7 @@ void jam_mulai(void) {
   s_t0_uptime = 0;
   s_arm_uptime = 0;
   s_index_selesai = 0;
+  s_index_menunggu = 0;
 
   aw_ble_begin();
 
@@ -743,6 +885,8 @@ bool     jam_terhubung(void)         { return aw_ble_terhubung(); }
 bool     jam_siap_notifikasi(void)   { return aw_ble_siap_notifikasi(); }
 bool     jam_ada_anchor(void)        { return aw_anchor_boot_ini(); }
 
+uint8_t  jam_index_jatuh_tempo(void) { return s_index_menunggu; }
+
 uint8_t  jam_ukur_index(void)        { return s_ukur_index; }
 uint16_t jam_ukur_detak(void)        { return s_ukur_detak; }
 uint16_t jam_ukur_detak_perlu(void)  { return UKUR_MIN_DETAK; }
@@ -768,18 +912,78 @@ void jam_snapshot(ppg_data_t *out) {
    * adanya, karena keduanya hanya berarti selama sensor sungguhan mencacah. */
   ppg_get(out);
 
-  uint16_t gula = s_ukur_aktif ? s_acc_gula : s_hasil_gula;
-  uint8_t  bpm  = s_ukur_aktif ? s_acc_bpm  : s_hasil_bpm;
-  uint8_t  sis  = s_ukur_aktif ? s_acc_sis  : s_hasil_sis;
-  uint8_t  dia  = s_ukur_aktif ? s_acc_dia  : s_hasil_dia;
-  uint8_t  spo2 = s_ukur_aktif ? s_acc_spo2 : s_hasil_spo2;
-  if (!s_ukur_aktif && !s_hasil_ada) return;
+  /* SELAMA MENGUKUR, yang tampil adalah bacaan langsung -- apa adanya, termasuk
+   * angka yang masih ditandai sementara (ppg.h, field `awal`).
+   *
+   * Versi sebelumnya menimpanya dengan akumulator s_acc_*, dan itu keliru dengan
+   * dua cara sekaligus. Pertama, akumulator MENGUNCI nilai sah pertama dan tidak
+   * pernah memperbaruinya lagi, jadi layar membeku di angka detik-detik pertama
+   * selama sisa pengukuran -- persis kebalikan dari tanda "sedang bekerja" yang
+   * dibutuhkan pengguna yang sedang menahan jarinya diam. Kedua, sebelum ada
+   * satu pun nilai sah, akumulatornya nol, sehingga keempat kartu menampilkan
+   * "--" justru pada saat sensor paling sibuk.
+   *
+   * Akumulator tetap ada dan tetap memegang perannya yang sesungguhnya: ia yang
+   * dikirim ke aplikasi, dan ia hanya menerima bacaan yang sudah lolos gerbang
+   * stabil. Layar dan protokol memang tidak perlu melihat hal yang sama. */
+  if (s_ukur_aktif) return;
 
-  out->bpm_valid  = bpm  != 0;  out->bpm     = bpm;
-  out->spo2_valid = spo2 != 0;  out->spo2    = spo2;
-  out->glu_valid  = gula != 0;  out->glucose = gula;
-  out->bp_valid   = sis  != 0;  out->sbp     = sis;  out->dbp = dia;
-  out->held = !s_ukur_aktif;
+  if (!s_hasil_ada) return;
+
+  out->bpm_valid  = s_hasil_bpm  != 0;  out->bpm     = s_hasil_bpm;
+  out->spo2_valid = s_hasil_spo2 != 0;  out->spo2    = s_hasil_spo2;
+  out->glu_valid  = s_hasil_gula != 0;  out->glucose = s_hasil_gula;
+  out->bp_valid   = s_hasil_sis  != 0;  out->sbp     = s_hasil_sis;
+  out->dbp        = s_hasil_dia;
+  out->awal = false;      /* hasil akhir, bukan angka yang masih bergerak */
+  out->held = true;
+}
+
+/* Perkiraan sisa waktu pengukuran, dalam detik.
+ *
+ * Bukan hitung mundur: tidak ada durasi tetap yang bisa dihitung mundur, karena
+ * yang mengakhiri pengukuran adalah jumlah detak (lihat UKUR_MIN_DETAK). Yang
+ * dikembalikan di sini adalah perkiraan yang DIHITUNG ULANG dari laju detak yang
+ * sebenarnya terjadi -- jadi ia memendek sendiri saat nadinya ketemu cepat, dan
+ * memanjang saat detaknya jarang. Itulah yang membuat angkanya jujur: ia
+ * mencerminkan keadaan sensor, bukan janji yang dibuat di awal.
+ *
+ * Sebelum ada dua detak, lajunya belum bisa diukur sama sekali, dan yang dipakai
+ * adalah tebakan awal 30 detik -- sengaja pesimistis, karena perkiraan yang
+ * memanjang di tengah jalan terasa jauh lebih buruk daripada yang memendek. */
+#define UKUR_TEBAKAN_AWAL_MS  30000UL
+
+uint16_t jam_ukur_sisa_detik(void) {
+  if (!s_ukur_aktif) return 0;
+
+  uint32_t jalan = (uint32_t)(millis() - s_ukur_mulai_ms);
+  uint32_t sisa;
+
+  if (s_ukur_detak >= 2 && s_ukur_detak1_ms) {
+    /* Laju diukur dari detak PERTAMA, bukan dari awal pengukuran: beberapa detik
+     * pertama habis untuk penenangan DC dan tidak menghasilkan detak sama
+     * sekali, jadi memasukkannya akan membuat setiap nadi terlihat lebih lambat
+     * daripada sebenarnya. */
+    uint32_t rentang = (uint32_t)(millis() - s_ukur_detak1_ms);
+    uint32_t per_detak = rentang / (s_ukur_detak - 1);
+    uint16_t kurang = (s_ukur_detak >= UKUR_MIN_DETAK)
+                        ? 0 : (uint16_t)(UKUR_MIN_DETAK - s_ukur_detak);
+    sisa = kurang * per_detak;
+  } else {
+    sisa = (jalan < UKUR_TEBAKAN_AWAL_MS) ? (UKUR_TEBAKAN_AWAL_MS - jalan) : 5000;
+  }
+
+  /* Lantai waktu minimum ikut dihormati, kalau tidak angkanya sempat menyentuh
+   * nol sementara pengukurannya masih berjalan. */
+  if (jalan < UKUR_MIN_MS && sisa < (UKUR_MIN_MS - jalan)) sisa = UKUR_MIN_MS - jalan;
+
+  /* Keempat metrik juga harus ada. Selama belum, jangan pernah menjanjikan nol:
+   * yang ditunggu bukan lagi detak melainkan window SpO2 yang masuk akal, dan
+   * itu tidak punya perkiraan yang bisa dipercaya. */
+  if (!(s_acc_bpm && s_acc_spo2 && s_acc_gula && s_acc_sis) && sisa < 3000) sisa = 3000;
+
+  if (sisa > 300000UL) sisa = 300000UL;      /* batas keras pengukuran */
+  return (uint16_t)((sisa + 999) / 1000);
 }
 
 uint8_t jam_umpan_balik_ditolak(void) {

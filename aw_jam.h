@@ -37,9 +37,26 @@ void jam_putar(void);
  * memang sudah dirancang: boot_id yang naik pada koneksi berikutnya. */
 void jam_siap_mati(void);
 
-/* Dari lv_event_cb tombol "Selesai Makan". Di IDLE ia sengaja tidak
- * menghasilkan apa-apa selain umpan balik -- lihat jam_umpan_balik_ditolak(). */
+/* Tombol utama jam. Artinya bergantung status sesi, dan ketiga arti itu memang
+ * satu tombol yang sama karena jam ini cuma punya satu:
+ *
+ *   IDLE     -> tidak menghasilkan apa-apa selain umpan balik "belum di-ARM"
+ *   ARMED    -> "Selesai Makan", sumber tunggal t0, lalu ukur index 1
+ *   RUNNING  -> memulai pengukuran terjadwal yang sudah jatuh tempo (index 2
+ *               pada t0+1 jam, index 3 pada t0+2 jam). Bila belum ada yang
+ *               jatuh tempo, ditolak dengan JAM_TOLAK_BELUM_JATUH_TEMPO.
+ *
+ * Lihat jam_umpan_balik_ditolak() untuk cara membaca penolakannya. */
 void jam_tekan_tombol(void);
+
+/* Index pengukuran yang jatuh temponya sudah lewat dan sedang menunggu tombol:
+ * 0 = tidak ada, 2 = pengukuran satu jam, 3 = pengukuran dua jam.
+ *
+ * Dipakai UI untuk dua hal: memberi tahu pengguna bahwa sekarang saatnya
+ * menempelkan jari, dan menentukan apakah klik singkat tombol BOOT punya arti.
+ * Jam TIDAK menyalakan sensor sendiri saat jatuh tempo -- alasannya panjang dan
+ * ada di aw_jam.cpp, di dekat UKUR_TUNGGU_TOMBOL_S. */
+uint8_t jam_index_jatuh_tempo(void);
 
 /* Dari lv_event_cb tombol "Cek manual". Menjalankan pengukuran yang hasilnya
  * HANYA muncul di layar jam: tidak ada entri sampel, tidak ada event, tidak ada
@@ -76,6 +93,12 @@ uint16_t jam_ukur_detik(void);         /* lama pengukuran berjalan              
  * pengguna harus angka ini, bukan detik yang berjalan. */
 uint16_t jam_ukur_detak(void);
 uint16_t jam_ukur_detak_perlu(void);
+
+/* Perkiraan sisa waktu pengukuran dalam detik, dihitung ulang dari laju detak
+ * yang sebenarnya terjadi -- memendek saat nadi mudah ditemukan, memanjang saat
+ * susah. 0 kalau tidak sedang mengukur. Ini PERKIRAAN, bukan hitung mundur:
+ * yang mengakhiri pengukuran tetap kecukupan data. */
+uint16_t jam_ukur_sisa_detik(void);
 bool     jam_ukur_punya_bpm(void);
 bool     jam_ukur_punya_spo2(void);
 bool     jam_ukur_punya_glukosa(void);
@@ -104,6 +127,7 @@ typedef enum {
   JAM_TOLAK_BELUM_ARM,      /* "Selesai Makan" ditekan selagi IDLE      */
   JAM_TOLAK_SESI_AKTIF,     /* cek manual ditekan selagi ARMED/RUNNING  */
   JAM_TOLAK_SESI_BERJALAN,  /* tombol sesi ditekan lagi selagi RUNNING  */
+  JAM_TOLAK_BELUM_JATUH_TEMPO, /* RUNNING, tapi belum ada yang perlu diukur */
   JAM_TOLAK_SEDANG_UKUR,
   JAM_TOLAK_BATERAI,
   JAM_TOLAK_SENSOR,

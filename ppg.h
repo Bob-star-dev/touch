@@ -85,6 +85,23 @@ typedef struct {
   int   dbp_min, dbp_avg, dbp_max;
   bool  stats_valid;
 
+  /* ---- Angka SEMENTARA ----------------------------------------------------
+   * true kalau kelima angka di atas sudah berisi bacaan sungguhan dari window
+   * terakhir TETAPI belum melewati gerbang stabil (3 detak konsisten). Saat itu
+   * semua *_valid di atas masih false.
+   *
+   * Ini bukan pelonggaran gerbang, melainkan pemisahan dua pertanyaan yang dulu
+   * dijawab satu bendera: "boleh ditampilkan?" dan "boleh dikirim ke aplikasi?".
+   * Menahan layar sampai gerbang kedua terpenuhi membuat pengguna menatap "--"
+   * belasan detik sambil menahan jari diam, tanpa satu pun tanda bahwa sensornya
+   * bekerja -- dan itu satu-satunya umpan balik yang ia punya untuk tahu jarinya
+   * sudah pas atau belum.
+   *
+   * Angkanya REAL, bukan contoh: ia keluar dari window AC/RMS yang sama dengan
+   * angka final, hanya dari lebih sedikit detak sehingga masih bergoyang. Yang
+   * dikirim ke aplikasi tetap HANYA yang *_valid. */
+  bool  awal;
+
   /* true = angka ini salinan hasil terakhir, bukan bacaan langsung (sensor
    * sudah diangkat). Nilainya tetap valid untuk ditampilkan; penandanya ada
    * supaya UI bisa membedakan "sedang mengukur" dari "hasil terakhir". */
