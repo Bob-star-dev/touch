@@ -73,6 +73,27 @@ typedef struct {
   const char *name;     /* untuk log serial */
 } nav_target_t;
 
+/* Sasaran yang bisa disorot tombol BOOT. Ada di sini karena alasan yang sama
+ * dengan nav_target_t di atas, dan ini bukan teori: menaruhnya di dekat
+ * pemakaiannya membuat kompilasi gagal dengan "'fokus_layar_t' does not name a
+ * type" pada prototipe yang tidak pernah ditulis siapa pun. Penjelasan
+ * lengkapnya menyertai kodenya, di bawah daftar NAV_*. */
+#define FOKUS_MAKS_LAYAR  8
+#define FOKUS_MAKS_ITEM   6
+
+typedef struct {
+  lv_obj_t           *obj;
+  const nav_target_t *nav;    /* NULL = tombol utama halaman home */
+  bool                balik;  /* tombol back di header */
+} fokus_item_t;
+
+typedef struct {
+  lv_obj_t     *layar;
+  fokus_item_t  item[FOKUS_MAKS_ITEM];
+  uint8_t       n;
+  uint8_t       i;            /* sasaran yang sedang disorot */
+} fokus_layar_t;
+
 /* ---------------- Pin map ESP32-C6-Touch-LCD-1.69 ---------------- */
 #define LCD_SCK    1
 #define LCD_DIN    2
@@ -105,6 +126,19 @@ typedef struct {
  * jangan pakai pad GPIO18 untuk hal lain -- ia berbagi jalur dengan tombol. */
 #define BAT_EN    15
 #define PWR_KEY   18
+
+/* ---- Tombol BOOT: kendali pengganti layar sentuh ----
+ * Nomor pin dari contoh Arduino resmi Waveshare 02_button_example.ino untuk
+ * board ini, yang menamainya "BOOT Button" dan memakai OneButton(pin, true) --
+ * artinya aktif LOW, sama seperti PWR_KEY.
+ *
+ * Ini juga strapping pin: DITAHAN SAAT RESET, chip masuk mode download alih-alih
+ * menjalankan sketch. Saat runtime itu tidak berlaku, jadi aman dibaca di
+ * loop() -- tapi ia sebabnya boot_poll() memakai trik "arming" yang sama dengan
+ * pwr_poll(): tombol harus terlihat dilepas sekali sebelum tekanan pertama
+ * dihitung, supaya jari yang masih menempel setelah flash tidak langsung
+ * menggeser fokus. */
+#define BOOT_KEY   9
 
 #define SCREEN_W 240
 #define SCREEN_H 280
@@ -661,6 +695,79 @@ static const nav_target_t NAV_SPO2 = { &scr_spo2, true,  "spo2" };
 static const nav_target_t NAV_GLU  = { &scr_glu,  true,  "glukosa" };
 static const nav_target_t NAV_BP   = { &scr_bp,   true,  "tekanan darah" };
 
+/* ================= Fokus: kendali satu tombol =================
+ * Board kedua tidak punya layar sentuh yang berfungsi, jadi seluruh kendali
+ * harus muat di satu tombol BOOT. Polanya standar untuk kendali satu tombol:
+ *
+ *   tekan sebentar  -> pindah sorotan ke sasaran berikutnya di layar ini
+ *   tekan lama      -> jalankan sasaran yang sedang disorot
+ *
+ * Yang penting bukan pola itu, melainkan DARI MANA daftar sasarannya datang:
+ * pendaftaran menumpang di mk_tap_nav() dan di tombol utama, yaitu dua tempat
+ * yang sudah dipakai untuk memasang sentuhan. Jadi daftar ini tidak bisa
+ * ketinggalan zaman -- setiap objek yang bisa disentuh otomatis bisa dijangkau
+ * tombol, dan sasaran baru yang ditambahkan nanti ikut terdaftar tanpa siapa pun
+ * harus ingat menambahkannya di sini. Daftar terpisah yang disalin dengan tangan
+ * akan menyimpang pada perubahan pertama.
+ *
+ * Sorotannya WAJIB ada dan wajib terlihat: tanpa penanda, tekanan lama adalah
+ * tebakan. Ia digambar sebagai outline emas, bukan perubahan warna latar, supaya
+ * tidak bentrok dengan warna kartu yang sudah membawa arti sendiri.
+ *
+ * Layar sentuh sengaja TIDAK dilepas. Kedua jalur hidup berdampingan, jadi satu
+ * firmware yang sama jalan di board yang sentuhannya baik maupun yang rusak.
+ *
+ * fokus_item_t dan fokus_layar_t sendiri terpaksa didefinisikan jauh di atas,
+ * bersama nav_target_t, karena prototipe otomatis Arduino. */
+static fokus_layar_t fokus_tab[FOKUS_MAKS_LAYAR];
+static uint8_t       fokus_n_layar = 0;
+
+static fokus_layar_t *fokus_cari(lv_obj_t *layar, bool buat) {
+  for (uint8_t k = 0; k < fokus_n_layar; k++)
+    if (fokus_tab[k].layar == layar) return &fokus_tab[k];
+  if (!buat || fokus_n_layar >= FOKUS_MAKS_LAYAR) return NULL;
+  fokus_layar_t *f = &fokus_tab[fokus_n_layar++];
+  f->layar = layar;
+  f->n = 0;
+  f->i = 0;
+  return f;
+}
+
+/* nav == NULL berarti tombol utama halaman home; aksinya bercabang di
+ * boot_aktifkan(), bukan di sini. */
+static void fokus_daftar(lv_obj_t *o, const nav_target_t *nav, bool balik) {
+  fokus_layar_t *f = fokus_cari(lv_obj_get_screen(o), true);
+  if (!f || f->n >= FOKUS_MAKS_ITEM) {
+    /* Diam-diam gagal berarti sebuah kendali jadi tidak terjangkau di board
+     * tanpa sentuh -- persis kegagalan yang tidak akan terlihat sampai ada yang
+     * mencoba memakainya. Jadi ia berisik. */
+    Serial.println("[fokus] daftar penuh, sebuah sasaran tidak terjangkau tombol");
+    return;
+  }
+  f->item[f->n].obj   = o;
+  f->item[f->n].nav   = nav;
+  f->item[f->n].balik = balik;
+  f->n++;
+}
+
+static void fokus_sorot(lv_obj_t *o, bool aktif) {
+  lv_obj_set_style_outline_width(o, aktif ? 2 : 0, 0);
+  if (!aktif) return;
+  lv_obj_set_style_outline_color(o, lv_color_hex(C_GOLD), 0);
+  lv_obj_set_style_outline_opa(o, LV_OPA_COVER, 0);
+  lv_obj_set_style_outline_pad(o, 2, 0);
+}
+
+/* Sorotan awal jatuh ke sasaran pertama yang BUKAN tombol back. Di layar detail
+ * back adalah satu-satunya sasaran sehingga ia tetap terpilih; di menu kesehatan
+ * aturan ini melewatinya, karena membuka kartu adalah alasan orang membuka menu
+ * -- dan back tetap terjangkau satu putaran kemudian. */
+static uint8_t fokus_awal(const fokus_layar_t *f) {
+  for (uint8_t k = 0; k < f->n; k++)
+    if (!f->item[k].balik) return k;
+  return 0;
+}
+
 static int16_t tap_x0, tap_y0;
 
 static void tap_press_cb(lv_event_t *e) {
@@ -686,6 +793,12 @@ static void mk_tap_nav(lv_obj_t *o, int ext, const nav_target_t *t) {
   mk_touchable(o, ext);
   lv_obj_add_event_cb(o, tap_press_cb,   LV_EVENT_PRESSED,  (void *)t);
   lv_obj_add_event_cb(o, tap_release_cb, LV_EVENT_RELEASED, (void *)t);
+  /* Sasaran mundur dikenali dari t->forward, bukan dari daftar terpisah. Kedua
+   * hal itu memang satu konsep yang sama: arah animasi geser ditentukan oleh
+   * apakah perpindahannya masuk lebih dalam atau keluar, dan "keluar" persis
+   * arti tombol back. Target baru yang forward=false akan diperlakukan sebagai
+   * back, dan itu memang yang diinginkan. */
+  fokus_daftar(o, t, !t->forward);
 }
 
 /* Header standar halaman 2..5: tombol back + judul. */
@@ -772,6 +885,105 @@ static void utama_release_cb(lv_event_t *e) {
   utama_btn_refresh();
 }
 
+/* ================= Tombol BOOT: baca, sorot, jalankan =================
+ * Diletakkan di sini, bukan di dekat pendaftaran fokus, karena bagian ini butuh
+ * utama_btn_refresh() dan percabangan peran tombol utama yang baru selesai
+ * didefinisikan di atas. */
+#define BOOT_DEBOUNCE_MS   30
+#define BOOT_LAMA_MS      600   /* ambang "tekan lama" */
+
+static bool      boot_siap        = false;  /* pernah terlihat dilepas sejak boot */
+static int       boot_level_lalu  = HIGH;   /* level mentah, untuk debounce      */
+static int       boot_stabil_lvl  = HIGH;   /* level yang sudah lolos debounce   */
+static uint32_t  boot_stabil_ms   = 0;
+static uint32_t  boot_tekan_ms    = 0;
+static bool      boot_sudah_jalan = false;
+static lv_obj_t *fokus_layar_lalu = NULL;
+
+/* Pindahkan sorotan mengikuti layar yang sedang tampil.
+ *
+ * Sengaja dibuat sebagai pengamat lv_scr_act(), bukan dipanggil dari dalam go().
+ * Layar tidak hanya berpindah karena tombol: sentuhan masih bisa memindahkannya
+ * di board yang sentuhannya baik, dan refresh_cb memindahkan sendiri ke layar
+ * "sedang mengukur" tanpa lewat go() sama sekali. Mengamati keadaan akhir
+ * menangkap ketiganya; memanggil dari go() hanya menangkap satu. */
+static void fokus_ikuti_layar(void) {
+  lv_obj_t *akt = lv_scr_act();
+  if (akt == fokus_layar_lalu) return;
+
+  fokus_layar_t *lama = fokus_cari(fokus_layar_lalu, false);
+  if (lama && lama->n) fokus_sorot(lama->item[lama->i].obj, false);
+  fokus_layar_lalu = akt;
+
+  fokus_layar_t *baru = fokus_cari(akt, false);
+  if (!baru || !baru->n) return;   /* layar "sedang mengukur": memang tanpa kendali */
+  baru->i = fokus_awal(baru);
+  fokus_sorot(baru->item[baru->i].obj, true);
+}
+
+static void boot_geser(void) {
+  fokus_layar_t *f = fokus_cari(lv_scr_act(), false);
+  if (!f || f->n == 0) {
+    /* Layar "sedang mengukur" memang tidak punya kendali -- pengukuran berhenti
+     * sendiri saat detaknya cukup, dan membatalkannya bukan fitur yang ada. */
+    Serial.println("[boot] layar ini tidak punya kendali");
+    return;
+  }
+  fokus_sorot(f->item[f->i].obj, false);
+  f->i = (uint8_t)((f->i + 1) % f->n);
+  fokus_sorot(f->item[f->i].obj, true);
+  Serial.printf("[boot] sorot %u/%u: %s\n", (unsigned)(f->i + 1), (unsigned)f->n,
+                f->item[f->i].nav ? f->item[f->i].nav->name : "tombol utama");
+}
+
+static void boot_aktifkan(void) {
+  fokus_layar_t *f = fokus_cari(lv_scr_act(), false);
+  if (!f || f->n == 0) return;
+  const fokus_item_t *it = &f->item[f->i];
+  if (it->nav) {
+    go(*it->nav->target, it->nav->forward, it->nav->name);
+    return;
+  }
+  /* Tombol utama. Percabangan perannya sama persis dengan utama_release_cb(),
+   * tetapi TANPA pemeriksaan TAP_SLOP: yang diukur di sana adalah pergeseran
+   * jari di kaca, dan di jalur ini tidak ada jari sama sekali. aw_jam tetap
+   * memeriksa syaratnya sendiri, jadi baris ini soal maksud, bukan keamanan. */
+  if (jam_status() == AW_SESI_IDLE) jam_cek_manual();
+  else                              jam_tekan_tombol();
+  utama_btn_refresh();
+}
+
+static void boot_poll(void) {
+  fokus_ikuti_layar();
+
+  int level = digitalRead(BOOT_KEY);            /* LOW = sedang ditekan */
+  if (level != boot_level_lalu) {
+    boot_level_lalu = level;
+    boot_stabil_ms  = millis();
+  } else if ((uint32_t)(millis() - boot_stabil_ms) >= BOOT_DEBOUNCE_MS &&
+             level != boot_stabil_lvl) {
+    boot_stabil_lvl = level;                    /* tepi yang sudah bersih */
+    if (level == LOW) {
+      boot_tekan_ms    = millis();
+      boot_sudah_jalan = false;
+    } else if (!boot_siap) {
+      boot_siap = true;
+      Serial.println("[boot] tombol dilepas -- siap dipakai");
+    } else if (!boot_sudah_jalan) {
+      boot_geser();                             /* dilepas sebelum ambang lama */
+    }
+  }
+
+  /* Tekan lama dijalankan saat ambangnya terlewati, bukan saat jari dilepas.
+   * Kalau menunggu pelepasan, pengguna menahan tombol sambil menebak apakah
+   * sudah cukup lama -- dan tebakan itu satu-satunya umpan balik yang ada. */
+  if (boot_siap && boot_stabil_lvl == LOW && !boot_sudah_jalan &&
+      (uint32_t)(millis() - boot_tekan_ms) >= BOOT_LAMA_MS) {
+    boot_sudah_jalan = true;
+    boot_aktifkan();
+  }
+}
+
 /* ================= Halaman 1 : Home ================= */
 static void build_home(void) {
   scr_home = lv_obj_create(NULL);
@@ -818,7 +1030,12 @@ static void build_home(void) {
   /* Kelompok baterai. Angkanya dirata-kanan ke x=190 supaya jarak 7 px ke ikon
    * tetap sama walau lebarnya berubah ("9%" vs "100%"). Ukuran font mengikuti
    * mockup: kapital 8 px / lebar 25 px = montserrat_12, sepasang dengan "29C". */
-  lbl_batt = mk_label(hdr, "82%", &lv_font_montserrat_12, C_BATT, 0, 5);
+  /* "--%", bukan "82%". Angka awal yang tampak masuk akal adalah angka karangan,
+   * persis yang dihindari di seluruh layar kesehatan: kalau sebuah nilai belum
+   * tersedia, labelnya "--". Biasanya ia cuma tampil ~500 ms sampai refresh_cb
+   * pertama, tetapi kalau ADC bermasalah dan battery_valid() tidak pernah true,
+   * "82%" akan bertahan selamanya sebagai laporan palsu tentang sisa daya. */
+  lbl_batt = mk_label(hdr, "--%", &lv_font_montserrat_12, C_BATT, 0, 5);
   lv_obj_set_width(lbl_batt, 190);
   lv_obj_set_style_text_align(lbl_batt, LV_TEXT_ALIGN_RIGHT, 0);
 
@@ -877,6 +1094,7 @@ static void build_home(void) {
   mk_touchable(btn_utama, 14);          /* target sentuh efektif jadi ~74x74 */
   lv_obj_add_event_cb(btn_utama, tap_press_cb,     LV_EVENT_PRESSED,  NULL);
   lv_obj_add_event_cb(btn_utama, utama_release_cb, LV_EVENT_RELEASED, NULL);
+  fokus_daftar(btn_utama, NULL, false);   /* nav NULL = "jalankan tombol utama" */
 
   ic_utama = mk_label(btn_utama, LV_SYMBOL_POWER, &lv_font_montserrat_22,
                       C_S1_LINE, 0, 0);
@@ -1742,13 +1960,34 @@ static void refresh_cb(lv_timer_t *tm) {
     }
   }
 
+  /* ---- header: baterai ----
+   * Persen saja tidak jujur saat kabel tertancap. Selama mengisi, tegangan sel
+   * dinaikkan oleh arus pengisian dan fase CV menahannya di 4,2 V, jadi kurva
+   * Li-Po membaca hampir 100% jauh sebelum selnya benar-benar penuh. Angkanya
+   * tidak salah hitung; yang salah adalah menampilkannya tanpa memberi tahu
+   * bahwa keadaannya sedang tidak bisa dipakai menaksir sisa daya.
+   *
+   * battery_charging() menilai tren tegangan berbeban 3 menit terakhir, jadi ia
+   * punya dua batas: baru menjawab setelah jam menyala 3 menit, dan tidak
+   * mengenali fase CV di ujung pengisian karena tegangannya sudah rata.
+   * Keduanya hanya menghasilkan ikon yang TIDAK muncul -- tidak pernah klaim
+   * palsu bahwa jam sedang mengisi. */
   battery_update();
   if (battery_valid()) {
     static int last_batt = -1;
-    int bp = battery_percent();
-    if (bp != last_batt) {
+    static int last_chg  = -1;
+    int bp  = battery_percent();
+    int chg = battery_charging() ? 1 : 0;
+    if (bp != last_batt || chg != last_chg) {
       last_batt = bp;
-      lv_label_set_text_fmt(lbl_batt, "%d%%", bp);
+      last_chg  = chg;
+      /* Label dirata-kanan ke x=190, jadi ikon petir tumbuh ke KIRI: "100%"
+       * (25 px) menjadi ~38 px dan mulai di x~152 -- masih di kanan garis
+       * pemisah header di x=120. */
+      if (chg) lv_label_set_text_fmt(lbl_batt, LV_SYMBOL_CHARGE " %d%%", bp);
+      else     lv_label_set_text_fmt(lbl_batt, "%d%%", bp);
+      lv_obj_set_style_text_color(lbl_batt,
+                                  lv_color_hex(chg ? C_GREEN2 : C_BATT), 0);
     }
   }
 
@@ -1924,6 +2163,7 @@ void setup() {
    * meminta yang internal juga tidak merugikan dan membuat pin ini tidak pernah
    * mengambang seandainya rakitannya berbeda. */
   pinMode(PWR_KEY, INPUT_PULLUP);
+  pinMode(BOOT_KEY, INPUT_PULLUP);
 
   Serial.begin(115200);
   delay(200);
@@ -1955,13 +2195,17 @@ void setup() {
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setClock(100000);   /* 400k tidak stabil untuk CST816T di board ini */
   pinMode(TOUCH_IRQ, INPUT_PULLUP);
-  if (!touch.begin(Wire, CST816_SLAVE_ADDRESS, I2C_SDA, I2C_SCL)) {
-    Serial.println("[err] CST816 tidak terdeteksi (UI tetap jalan tanpa sentuh)");
+  bool touch_ada = touch.begin(Wire, CST816_SLAVE_ADDRESS, I2C_SDA, I2C_SCL);
+  if (!touch_ada) {
+    Serial.println("[err] CST816 tidak terdeteksi -- UI dikendalikan tombol BOOT");
   } else {
     Serial.printf("[ok] touch: %s\n", touch.getModelName());
   }
   delay(150);              /* beri waktu kalibrasi baseline selesai */
-  attachInterrupt(digitalPinToInterrupt(TOUCH_IRQ), touch_isr, FALLING);
+  /* IRQ hanya dipasang kalau chipnya benar-benar menjawab. Pada board yang
+   * sentuhannya rusak, pin IRQ yang menggantung bisa memicu interupsi liar, dan
+   * setiap satu di antaranya membuat loop() melewati ppg_update() sekali. */
+  if (touch_ada) attachInterrupt(digitalPinToInterrupt(TOUCH_IRQ), touch_isr, FALLING);
 
   if (!gfx->begin()) Serial.println("[err] gfx->begin() gagal");
   gfx->fillScreen(RGB565_BLACK);
@@ -1985,10 +2229,17 @@ void setup() {
   disp_drv.draw_buf = &draw_buf;
   lv_disp_drv_register(&disp_drv);
 
-  lv_indev_drv_init(&indev_drv);
-  indev_drv.type = LV_INDEV_TYPE_POINTER;
-  indev_drv.read_cb = my_touch_read;
-  lv_indev_drv_register(&indev_drv);
+  /* Indev penunjuk hanya didaftarkan kalau chip sentuhnya menjawab. Chip yang
+   * rusak dan terkunci di "jari menempel" akan membuat LVGL melihat tekanan
+   * abadi -- gejalanya layar yang seolah membeku, persis kasus ghost touch di
+   * catatan urutan init di atas. Tanpa indev, jalur tombol BOOT tetap utuh
+   * karena ia tidak lewat LVGL sama sekali. */
+  if (touch_ada) {
+    lv_indev_drv_init(&indev_drv);
+    indev_drv.type = LV_INDEV_TYPE_POINTER;
+    indev_drv.read_cb = my_touch_read;
+    lv_indev_drv_register(&indev_drv);
+  }
 
   /* RTC berbagi bus I2C dengan touch, dan Wire sudah di-begin di atas. */
   rtc_begin();
@@ -2009,6 +2260,25 @@ void setup() {
 
   lv_timer_create(refresh_cb, 500, NULL);
   lv_timer_create(scan_anim_cb, 40, NULL);
+
+  /* Sorotan dipasang SEBELUM gambar pertama, bukan dibiarkan menyusul dari
+   * loop(): kalau tidak, frame pertama tampil tanpa penanda dan outline emasnya
+   * muncul belakangan seperti kedipan. */
+  fokus_ikuti_layar();
+
+  /* Arming tombol BOOT ditentukan dari keadaan pin, bukan ditunggu sebagai tepi.
+   *
+   * boot_poll() hanya bereaksi pada PERUBAHAN level, jadi tombol yang sudah
+   * dilepas sejak boot tidak pernah menghasilkan tepi apa pun dan armingnya tak
+   * pernah datang -- gejalanya halus: tekanan pertama pengguna terbuang, dan
+   * yang kedua baru bekerja. Yang sebenarnya perlu dijaga cuma satu keadaan,
+   * yaitu tombol yang MASIH ditahan di sini (GPIO9 strapping pin, jadi ini
+   * kejadian normal sehabis flash). Membacanya sekali menjawab keduanya. */
+  boot_stabil_lvl = digitalRead(BOOT_KEY);
+  boot_level_lalu = boot_stabil_lvl;
+  boot_siap       = (boot_stabil_lvl == HIGH);
+  Serial.printf("[boot] tombol BOOT %s\n",
+                boot_siap ? "siap" : "masih ditahan -- lepaskan dulu");
 
   lv_timer_handler();
   ledcWrite(LCD_BL, 204);   /* ~80% */
@@ -2033,6 +2303,7 @@ void setup() {
 void loop() {
   touch_poll();          /* tangkap IRQ secepat mungkin, jangan tunggu LVGL */
   pwr_poll();            /* satu digitalRead; tombol mati harus selalu responsif */
+  boot_poll();           /* kendali pengganti sentuh; aman walau sentuh normal  */
 
   /* PPG ditunda selama masih ada IRQ touch yang belum diproses. Keduanya berbagi
    * bus I2C, dan satu transaksi FIFO MAX30105 (~1 ms di 100 kHz) cukup untuk
