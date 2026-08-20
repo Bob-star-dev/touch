@@ -26,6 +26,7 @@
 #include <BLEUtils.h>
 #include <BLESecurity.h>
 #include <BLEAdvertising.h>
+#include <host/ble_store.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <esp_mac.h>
@@ -54,29 +55,41 @@ static volatile bool     s_langganan_sampel = false;
 static volatile bool     s_langganan_peristiwa = false;
 static volatile bool     s_siap_baru = false;
 
-/* Interval iklan: 100 ms selama 60 detik pertama, lalu 1000 ms (dokumen 3.2).
+/* ---- Interval iklan: dibaca dari BOND, bukan dari timer boot (dokumen 3.3) ----
+ *
+ *   tidak punya bond                       -> 100 ms, TERUS-MENERUS tanpa batas
+ *   punya bond, 30 dtk sesudah boot/putus  -> 100 ms
+ *   punya bond, sesudah itu                -> 1000 ms
+ *
+ * Baris pertama yang paling penting dan yang paling mudah salah. Versi
+ * sebelumnya memberi 100 ms selama 60 detik sesudah boot lalu turun ke 1000 ms
+ * TANPA melihat apakah jam sudah pernah dipasangkan. Akibatnya jam yang belum
+ * pernah tersandingkan ikut melambat setelah semenit -- dan karena Android
+ * hanya bisa menyambung pada jendela iklan, setiap percobaan connect jadi
+ * memakan detik demi detik dan sering kehabisan waktu. Di layar itu terbaca
+ * sebagai "pemasangan pertama selalu sulit", bukan sebagai iklan yang lambat.
+ * Jam yang belum dipasangkan toh tidak sedang mengerjakan apa-apa, jadi tidak
+ * ada baterai yang perlu dihemat di sana.
+ *
+ * Jendela 30 detik di baris kedua melayani hal yang berbeda: jam yang baru saja
+ * terputus dan masih membawa sampel di buffer-nya. Ponsel yang kembali mendekat
+ * menemukannya dalam hitungan detik, dengan biaya 30 detik iklan cepat per
+ * peristiwa putus.
+ *
+ * Keputusannya DIBACA ULANG dari jumlah bond, tidak disimpan. Itu yang membuat
+ * jam yang bond-nya dihapus dari Pengaturan Bluetooth ponsel otomatis kembali
+ * mengiklan cepat, tanpa perlu rutin khusus dan tanpa menunggu boot berikutnya.
+ *
  * Satuan BLE 0,625 ms. */
-#define ADV_CEPAT      160    /* 100 ms  */
-#define ADV_LAMBAT    1600    /* 1000 ms */
-#define ADV_CEPAT_MS 60000UL
+#define ADV_CEPAT       160     /* 100 ms  */
+#define ADV_LAMBAT     1600     /* 1000 ms */
+#define ADV_JENDELA_MS 30000UL
 
-/* ---- Iklan gesit selama masih ada entri yang belum sampai ke aplikasi ----
- * Dokumen 3.2 menentukan 100 ms selama 60 detik lalu 1000 ms, dan itu benar
- * untuk keadaan biasa: jam yang tidak memegang apa-apa tidak perlu berteriak.
- * Tetapi keadaan yang paling penting justru kebalikannya -- pengukuran selesai
- * saat HP tidak ada, hasilnya menunggu di buffer, dan pada saat itulah jam
- * paling perlu mudah ditemukan. Dengan iklan 1000 ms, HP bisa perlu beberapa
- * detik hanya untuk melihatnya.
- *
- * Karena itu selama masih ada entri tertunda, iklannya dikembalikan ke 100 ms.
- * Ini TIDAK mengubah satu byte pun di kawat -- isi paket iklannya sama persis,
- * yang berubah cuma seberapa sering ia dipancarkan.
- *
- * Dibatasi 10 menit sejak entri BARU terakhir masuk, bukan selama entrinya ada:
- * jam yang ditinggal seharian dengan hasil yang tidak pernah diambil akan
- * mengiklan 10x lebih sering sepanjang hari, dan itu baterai yang terbuang untuk
- * HP yang memang tidak datang. Setiap entri baru menyalakan lagi jendela itu. */
-#define ADV_GESIT_MS (10UL * 60UL * 1000UL)
+/* Evaluasi ulang dijadwalkan, bukan tiap iterasi loop: loop() berputar tiap
+ * ~2 ms dan menanyakan jumlah bond ke stack sesering itu adalah pekerjaan yang
+ * tidak menghasilkan apa pun. Satu detik sudah jauh lebih cepat daripada
+ * kejadian yang dipantaunya (orang menghapus bond dari menu Bluetooth). */
+#define ADV_EVAL_MS     1000UL
 
 /* Daya pancar. Bawaan controller +3 dBm; dinaikkan ke +9 dBm.
  *
@@ -92,13 +105,13 @@ static volatile bool     s_siap_baru = false;
  * ESP_PWR_LVL_P12 langkah berikutnya yang masuk akal. */
 #define AW_DAYA_PANCAR  ESP_PWR_LVL_P9
 
-static uint32_t s_adv_cepat_sampai = 0;
-static bool     s_adv_sedang_cepat = false;
+static uint32_t s_adv_jendela_sampai = 0;   /* akhir jendela cepat 30 detik  */
+static uint16_t s_adv_itvl          = 0;   /* 0 = iklan belum pernah dipasang */
+static uint32_t s_adv_eval_ms       = 0;
 static volatile bool s_perlu_iklan_ulang = false;
 
 /* Jumlah entri yang belum di-ACK aplikasi, dititipkan aw_jam tiap putaran. */
 static uint8_t  s_tertunda      = 0;
-static uint32_t s_gesit_sampai  = 0;
 
 /* Kapan terakhir keaktifan iklan diperiksa -- lihat penjaga di aw_ble_putar(). */
 static uint32_t s_periksa_iklan_ms = 0;
@@ -232,7 +245,7 @@ class StatusCB : public BLECharacteristicCallbacks {
 };
 
 /* ---------------- Iklan ---------------- */
-static void setel_iklan(bool cepat) {
+static void setel_iklan(uint16_t itvl) {
   BLEAdvertising *adv = BLEDevice::getAdvertising();
   adv->stop();
 
@@ -267,12 +280,36 @@ static void setel_iklan(bool cepat) {
   adv->setAdvertisementData(data_iklan);
   adv->setScanResponseData(data_scan);
   adv->setScanResponse(true);
-  adv->setMinInterval(cepat ? ADV_CEPAT : ADV_LAMBAT);
-  adv->setMaxInterval(cepat ? ADV_CEPAT : ADV_LAMBAT);
+  adv->setMinInterval(itvl);
+  adv->setMaxInterval(itvl);
   adv->start();
 
-  s_adv_sedang_cepat = cepat;
-  if (cepat) s_adv_cepat_sampai = millis() + ADV_CEPAT_MS;
+  s_adv_itvl = itvl;
+}
+
+/* Jumlah bond, ditanyakan langsung ke penyimpan NimBLE. Pustaka BLE bawaan
+ * Arduino tidak mengekspos getNumBonds(), tetapi API host di bawahnya ada. */
+static bool adv_ada_bond(void) {
+  int n = 0;
+  return ble_store_util_count(BLE_STORE_OBJ_TYPE_OUR_SEC, &n) == 0 && n > 0;
+}
+
+/* Alasannya ikut dicetak, bukan cuma angkanya. Tanpa itu, "1000 ms" saat
+ * menguji pemasangan pertama tidak bisa dibedakan dari bug -- keduanya terlihat
+ * sama persis di serial. */
+static void perbarui_interval_iklan(bool paksa) {
+  bool     ada_bond = adv_ada_bond();
+  bool     jendela  = (int32_t)(millis() - s_adv_jendela_sampai) < 0;
+  uint16_t mau      = (!ada_bond || jendela) ? ADV_CEPAT : ADV_LAMBAT;
+
+  if (!paksa && mau == s_adv_itvl) return;
+  setel_iklan(mau);
+
+  if (!ada_bond)     Serial.println("[ble] iklan 100 ms (tanpa bond, tanpa batas waktu)");
+  else if (jendela)  Serial.printf("[ble] iklan 100 ms (jendela %lu dtk lagi)\n",
+                                   (unsigned long)((s_adv_jendela_sampai - millis()) / 1000UL));
+  else               Serial.printf("[ble] iklan 1000 ms (ber-bond, hemat)%s\n",
+                                   s_tertunda ? " -- catatan: masih ada entri tertunda" : "");
 }
 
 /* ---------------- Init ---------------- */
@@ -299,14 +336,23 @@ void aw_ble_begin(void) {
 
   /* Bonding + LE Secure Connections + Just Works, persis dokumen 10.
    *
-   * Catatan supaya tidak terlihat seperti salah ketik: MITM diminta true
-   * sementara IO capability-nya NO_INPUT_OUTPUT, yang secara definisi tidak
-   * bisa memberi perlindungan MITM -- pairing akan turun ke Just Works. Itu
-   * memang yang diinginkan: jam tidak punya layar pairing, dan satu-satunya
-   * passkey yang bisa dipakai adalah angka yang dipatok di firmware, yang bukan
-   * perlindungan melainkan tampilannya saja. Kombinasi ini yang tertulis di
-   * dokumen dan sudah diuji, jadi jangan "dirapikan". */
-  BLESecurity::setAuthenticationMode(true, true, true);
+   * MITM sengaja false, dan itu BUKAN pelonggaran keamanan. Dengan IO
+   * capability NO_INPUT_OUTPUT, MITM tidak akan pernah tercapai apa pun yang
+   * diminta -- jam tidak punya layar pairing, jadi satu-satunya passkey yang
+   * bisa dipakai adalah angka yang dipatok di firmware, dan angka seperti itu
+   * tertulis di firmware, di dokumen, dan di setiap salinan keduanya. Ia
+   * tampilan, bukan perlindungan.
+   *
+   * Memintanya true berarti menuntut jaminan yang tidak bisa dipenuhi, dan
+   * yang didapat bukan keamanan tambahan melainkan risiko pairing DITOLAK --
+   * gejala "pairing kadang gagal" yang mahal dilacak karena tidak deterministik.
+   *
+   * Yang benar-benar melindungi data kesehatan di sini adalah enkripsi tautan
+   * dan bonding, dan keduanya tetap menyala di baris yang sama. Jangan
+   * mengembalikannya ke true karena "kelihatannya lebih aman". Peninjauan ulang
+   * hanya masuk akal kalau kelak jam menampilkan passkey ACAK di layarnya;
+   * passkey tetap justru lebih buruk daripada Just Works, bukan lebih baik. */
+  BLESecurity::setAuthenticationMode(true, false, true);
   BLESecurity::setCapability(BLE_HS_IO_NO_INPUT_OUTPUT);
 
   s_server = BLEDevice::createServer();
@@ -360,7 +406,8 @@ void aw_ble_begin(void) {
    * sendiri begitu sebuah karakteristik punya properti notify, dan menambahkan
    * yang kedua justru ditolak. */
 
-  setel_iklan(true);
+  s_adv_jendela_sampai = millis() + ADV_JENDELA_MS;
+  perbarui_interval_iklan(true);
   Serial.printf("[ble] \"%s\" mengiklan, serial %02X%02X%02X%02X%02X%02X\n",
                 s_nama, s_serial[0], s_serial[1], s_serial[2],
                 s_serial[3], s_serial[4], s_serial[5]);
@@ -368,12 +415,15 @@ void aw_ble_begin(void) {
 
 /* ---------------- Putaran ---------------- */
 void aw_ble_tertunda(uint8_t n) {
-  /* Entri BARU (bukan sekadar "masih ada") yang menyalakan jendela gesit. Tanpa
-   * perbandingan ini, jendelanya tidak akan pernah diperbarui dan hasil yang
-   * lahir sepuluh menit setelah entri pertama akan menunggu di iklan lambat. */
-  static uint8_t lalu = 0;
-  if (n > lalu) s_gesit_sampai = millis() + ADV_GESIT_MS;
-  lalu = n;
+  /* Dulu angka ini memaksa iklan cepat selama 10 menit sejak entri baru masuk.
+   * Itu dihapus di v1.2: dokumen 3.3 sudah menimbang kasus yang sama persis dan
+   * membatasinya pada jendela 30 detik per peristiwa putus, karena jam yang
+   * ditinggal seharian dengan hasil yang tidak pernah diambil akan mengiklan
+   * 10x lebih sering sepanjang hari demi HP yang memang tidak datang.
+   *
+   * Angkanya tetap disimpan -- ia dipakai baris log perbarui_interval_iklan()
+   * supaya "1000 ms padahal ada entri menunggu" terlihat saat menguji, bukan
+   * jadi tebakan. */
   s_tertunda = n;
 }
 
@@ -392,7 +442,10 @@ void aw_ble_putar(void) {
 
   if (s_perlu_iklan_ulang) {
     s_perlu_iklan_ulang = false;
-    setel_iklan(true);          /* 60 detik cepat lagi setelah putus */
+    /* Jendela 30 detik dibuka lagi: jam yang baru putus adalah jam yang paling
+     * mungkin masih memegang sampel dan paling perlu cepat ditemukan lagi. */
+    s_adv_jendela_sampai = millis() + ADV_JENDELA_MS;
+    perbarui_interval_iklan(true);
     return;
   }
   if (s_terhubung) return;
@@ -411,22 +464,17 @@ void aw_ble_putar(void) {
     s_periksa_iklan_ms = millis();
     if (!ble_gap_adv_active()) {
       Serial.println("[ble] iklan tidak aktif padahal tidak tersambung -- dinyalakan ulang");
-      setel_iklan(s_adv_sedang_cepat);
+      setel_iklan(s_adv_itvl ? s_adv_itvl : ADV_CEPAT);
       return;
     }
   }
 
-  bool gesit = (s_tertunda > 0) && ((int32_t)(millis() - s_gesit_sampai) < 0);
-
-  if (gesit && !s_adv_sedang_cepat) {
-    Serial.printf("[ble] %u entri menunggu -- iklan dipercepat lagi\n",
-                  (unsigned)s_tertunda);
-    setel_iklan(true);
-    return;
-  }
-  if (!gesit && s_adv_sedang_cepat &&
-      (int32_t)(millis() - s_adv_cepat_sampai) >= 0) {
-    setel_iklan(false);
+  /* Keputusan interval dibaca ulang dari jumlah bond, dijadwalkan sedetik
+   * sekali. Inilah yang membuat penghapusan bond dari menu Bluetooth ponsel
+   * langsung mengembalikan jam ke iklan cepat tanpa rutin khusus apa pun. */
+  if ((uint32_t)(millis() - s_adv_eval_ms) >= ADV_EVAL_MS) {
+    s_adv_eval_ms = millis();
+    perbarui_interval_iklan(false);
   }
 }
 

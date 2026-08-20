@@ -309,7 +309,7 @@ static void layar_set(bool nyala) {
 #define C_KARTU_BRD 0x23262D
 #define C_PUTIH     0xFFFFFF   /* angka besar & jam    */
 #define C_TANGGAL   0xB9C1D0   /* baris tanggal        */
-#define C_REDUP     0x8E96A6   /* judul kartu, satuan, persen baterai */
+#define C_REDUP     0x8E96A6   /* judul kartu, satuan, ikon baterai   */
 #define C_ISI       0xA2E32B   /* petir "sedang mengisi" */
 #define C_TRACK     0x2E3444   /* jalur gelap di belakang cincin */
 #define C_CINCIN_HR 0xFF3B5C
@@ -333,6 +333,52 @@ static void layar_set(bool nyala) {
 #define CINCIN_CY 49
 #define CINCIN_W  7
 
+/* ---- Ikon baterai berkotak ----
+ * Bentuknya mengikuti images (2).jpeg. Proporsinya diukur dari gambar itu, di
+ * garis tengah badannya: garis 17, jarak 8, lalu kotak 60 - celah 12 - kotak 60
+ * - celah 12 - kotak 60, jarak 8, garis 17 -- total badan 254 px.
+ *
+ * Yang penting dari angka-angka itu bukan nilainya, tapi PERBANDINGANNYA:
+ * celah selebar seperlima kotak, dan kotak tidak menempel ke garis badan.
+ * Percobaan pertama mengabaikan keduanya (badan 24 px, celah 1 px, kotak
+ * mengisi rongga sampai mepet garis) dan hasilnya ketiga kotak melebur jadi
+ * satu blok -- jumlahnya tidak bisa dihitung mata, yang menghapus seluruh
+ * gunanya. Badan dilebarkan ke 28 px supaya celah 2 px dan jarak 1 px muat.
+ *
+ * TIGA kotak, bukan empat atau lima, dan itu keputusan soal kejujuran bukan
+ * soal ruang. Persen dari tegangan Li-Po hanya bisa dipercaya sampai sekitar
+ * +-5..10% (lihat battery.h). Lima kotak berarti tiap kotak bernilai 20% --
+ * lebih halus daripada yang benar-benar diketahui, sehingga kotak paling bawah
+ * akan berkedip-kedip mengikuti derau, bukan mengikuti daya. Tiga kotak
+ * membuat satu langkah bernilai ~33%, nyaman di atas ambang kesalahan itu:
+ * setiap perubahan yang terlihat di layar adalah perubahan yang nyata.
+ *
+ * Tepi kanan dikunci di x=232 supaya sejajar dengan tepi kanan kartu di
+ * bawahnya -- sama seperti angka persen yang digantikannya. */
+#define BATT_N_KOTAK 3
+#define BATT_KANAN   232                     /* tepi kanan tonjolan          */
+#define BATT_BRD     2                       /* tebal garis badan            */
+#define BATT_PAD     1                       /* jarak kotak ke garis badan   */
+#define BATT_KOTAK_W 6
+#define BATT_KOTAK_H 8
+#define BATT_CELAH   2                       /* celah antar kotak            */
+#define BATT_KOTAK_D (BATT_KOTAK_W + BATT_CELAH)             /* langkah      */
+#define BATT_NUB_W   3
+#define BATT_NUB_H   7
+
+/* Badan dihitung DARI ISINYA, bukan sebaliknya. Menetapkan lebar badan lebih
+ * dulu lalu membagi rongganya bertiga tidak pernah habis dibagi rata, dan sisa
+ * satu piksel itu selalu jatuh di salah satu celah sehingga ketiga kotak
+ * terlihat tidak sama jaraknya. Dengan arah hitung dibalik, ukuran badan
+ * dijamin pas: 3x6 kotak + 2x2 celah + 2x1 jarak + 2x2 garis = 28. */
+#define BATT_W  (BATT_N_KOTAK * BATT_KOTAK_W + (BATT_N_KOTAK - 1) * BATT_CELAH \
+                 + 2 * BATT_PAD + 2 * BATT_BRD)                       /* 28 */
+#define BATT_H  (BATT_KOTAK_H + 2 * BATT_PAD + 2 * BATT_BRD)          /* 14 */
+#define BATT_X  (BATT_KANAN - BATT_NUB_W - BATT_W)                    /* 201 */
+#define BATT_Y  14                           /* pusatnya sejajar teks header */
+#define BATT_KOTAK_X (BATT_X + BATT_BRD + BATT_PAD)                   /* 204 */
+#define BATT_KOTAK_Y (BATT_Y + BATT_BRD + BATT_PAD)                   /* 17  */
+
 /* ================= SUMBER DATA =================
  * Tidak ada angka yang dikarang di layar ini. Kalau sebuah nilai belum
  * tersedia -- jari tidak menempel, sensor tidak terpasang, ADC belum stabil --
@@ -352,7 +398,12 @@ static lv_obj_t *scr_wajah;
 
 static lv_obj_t *lbl_jam_hh, *lbl_jam_mm;   /* "14" dan "35"                  */
 static lv_obj_t *lbl_status;                /* baris tanggal / status         */
-static lv_obj_t *lbl_batt, *lbl_ikon_batt;
+/* Ikon baterai digambar sendiri dari objek LVGL, bukan glyph LV_SYMBOL_*.
+ * Sebabnya bukan selera: lambang baterai di font hanya punya lima tingkat
+ * tetap dan tidak bisa diberi tahu berapa kotak yang boleh menyala, jadi
+ * satu-satunya cara menampilkan tepat tiga kotak adalah menggambarnya. */
+static lv_obj_t *batt_cangkang, *batt_nub, *batt_petir;
+static lv_obj_t *batt_kotak[BATT_N_KOTAK];
 
 static lv_obj_t *cincin_hr, *cincin_sp, *cincin_gl;
 
@@ -706,18 +757,49 @@ static void build_wajah(void) {
    * supaya "SAB 15 AGU" -- sepuluh huruf kapital rapat -- tidak terbaca sebagai
    * satu blok. Tanggal sekarang "Wed, 15 Aug 26": empat karakter lebih panjang,
    * sudah punya koma sebagai jeda, dan huruf kecilnya sendiri yang membentuk
-   * kata. Menahan jarak 1 px di sini berarti 13 piksel tambahan yang persis
-   * jatuh di ruang yang dibutuhkan angka baterai. */
+   * kata. Menahan jarak 1 px di sini berarti 13 piksel tambahan yang mendorong
+   * tanggal terpanjang sampai menyentuh ikon baterai di kanan. */
   lbl_status = mk_label(scr_wajah, "--", &lv_font_montserrat_12, C_TANGGAL, 82, 13);
   lv_obj_set_style_text_letter_space(lbl_status, 0, 0);
 
-  /* --- kelompok baterai: "94%" lalu ikonnya, tepi kanan dikunci di x=232 ---
-   * Posisinya dihitung ulang tiap kali teksnya berubah (lihat batt_tata()),
-   * sebab "9%" dan "100%" berbeda belasan piksel sedangkan tepi kanannya harus
-   * tetap sejajar dengan tepi kanan kartu di bawahnya. */
-  lbl_batt      = mk_label(scr_wajah, "--%", &lv_font_montserrat_12, C_REDUP, 190, 13);
-  lbl_ikon_batt = mk_label(scr_wajah, LV_SYMBOL_BATTERY_EMPTY, &lv_font_montserrat_12,
-                           C_REDUP, 221, 13);
+  /* --- ikon baterai berkotak, tepi kanan dikunci di x=232 ---
+   * Seluruhnya statis: badan, tonjolan, dan tiga kotak dibuat sekali di sini,
+   * dan yang berubah saat runtime cuma warna serta bendera HIDDEN tiap kotak.
+   * Tidak ada lagi hitung-ulang posisi seperti pada versi berangka, karena
+   * tidak ada lagi teks yang lebarnya berubah -- "9%" dan "100%" dulu berbeda
+   * belasan piksel dan itulah yang memaksa penataan ulang setiap kali.
+   *
+   * Badan digambar sebagai objek bergaris tanpa isi, bukan lewat mk_box():
+   * mk_box() selalu memasang latar rapat, sedangkan yang dibutuhkan di sini
+   * justru rongga tembus pandang supaya kotak-kotak di dalamnya -- yang dibuat
+   * SESUDAH badan, jadi tergambar di atasnya -- benar-benar terlihat. */
+  batt_cangkang = lv_obj_create(scr_wajah);
+  lv_obj_remove_style_all(batt_cangkang);
+  lv_obj_set_pos(batt_cangkang, BATT_X, BATT_Y);
+  lv_obj_set_size(batt_cangkang, BATT_W, BATT_H);
+  lv_obj_set_style_bg_opa(batt_cangkang, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(batt_cangkang, BATT_BRD, 0);
+  lv_obj_set_style_border_color(batt_cangkang, lv_color_hex(C_REDUP), 0);
+  lv_obj_set_style_border_opa(batt_cangkang, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(batt_cangkang, 3, 0);
+  lv_obj_clear_flag(batt_cangkang, LV_OBJ_FLAG_SCROLLABLE);
+
+  batt_nub = mk_box(scr_wajah, BATT_X + BATT_W, BATT_Y + (BATT_H - BATT_NUB_H) / 2,
+                    BATT_NUB_W, BATT_NUB_H, C_REDUP, 1);
+
+  for (int i = 0; i < BATT_N_KOTAK; i++)
+    batt_kotak[i] = mk_box(scr_wajah, BATT_KOTAK_X + i * BATT_KOTAK_D, BATT_KOTAK_Y,
+                           BATT_KOTAK_W, BATT_KOTAK_H, C_REDUP, 1);
+
+  batt_petir = mk_label(scr_wajah, LV_SYMBOL_CHARGE, &lv_font_montserrat_12,
+                        C_ISI, 0, 0);
+  lv_obj_update_layout(scr_wajah);
+  lv_obj_align_to(batt_petir, batt_cangkang, LV_ALIGN_OUT_LEFT_MID, -3, 0);
+
+  /* Mulai dari keadaan "belum ada bacaan": badan kosong, warna peringatan.
+   * Bukan tiga kotak penuh -- ikon penuh sebelum ADC sempat mengukur adalah
+   * angka karangan dalam bentuk gambar. */
+  batt_gambar(0, false);
 
   /* --- jam besar ---
    * font_digits_48 punya 9 px kosong di atas ink digit, jadi label di y=33
@@ -782,36 +864,71 @@ static void nilai_set(lv_obj_t *lbl, lv_obj_t *satuan, const lv_font_t *fn,
     lv_obj_set_style_text_color(lbl, lv_color_hex(warna), 0);
 }
 
-/* ---- Kelompok baterai: persen + ikon ----
- * Ikonnya BUKAN gambar tetap. Ia mengikuti persen yang sama dengan angkanya,
- * jadi dua penanda itu tidak akan pernah saling bertentangan -- ikon penuh di
- * sebelah tulisan "20%" adalah persis jenis kebohongan kecil yang membuat
- * seluruh tampilan tidak bisa dipercaya.
+/* ---- Ikon baterai: tiga kotak, tanpa angka persen ----
  *
- * Saat mengisi, ikonnya BERGANTI jadi petir alih-alih menambah lambang ketiga
- * di sebelahnya. Itu bukan sekadar selera: baris ini cuma punya ~50 px di
- * kanan tanggal, dan lambang tambahan akan menabrak "SAB 15 AGU" pada tanggal
- * yang namanya panjang. Petir menggantikan tempat, bukan meminta tempat baru.
+ * Angka persen sengaja DIHILANGKAN, bukan sekadar disembunyikan karena kurang
+ * muat. Persen dari tegangan Li-Po hanya bisa dipercaya sampai sekitar
+ * +-5..10% (alasannya panjang, ada di battery.h dan battery.cpp): kurvanya
+ * datar sekali di tengah, hambatan dalam sel berubah menurut suhu dan umur,
+ * dan beban board sendiri melompat ratusan mA saat radio atau LED PPG menyala.
+ * Menulis "73%" di layar menjanjikan ketelitian satu persen yang alatnya tidak
+ * punya. Tiga kotak menjanjikan sepertiga -- dan janji itu bisa ditepati.
  *
- * Ambangnya sengaja tidak rata: yang penting dibedakan adalah ujung bawah
- * (baterai hampir habis), bukan ujung atas. */
-static const char *batt_ikon(int persen, bool mengisi) {
-  if (mengisi)     return LV_SYMBOL_CHARGE;
-  if (persen >= 90) return LV_SYMBOL_BATTERY_FULL;
-  if (persen >= 65) return LV_SYMBOL_BATTERY_3;
-  if (persen >= 40) return LV_SYMBOL_BATTERY_2;
-  if (persen >= 15) return LV_SYMBOL_BATTERY_1;
-  return LV_SYMBOL_BATTERY_EMPTY;
+ * Ambang naik dan ambang turun DIPISAH. Tanpa itu, persen yang menggantung
+ * tepat di satu ambang akan membuat kotak terakhir berkedip tiap kali nilainya
+ * bergeser satu digit -- gejala yang paling merusak kepercayaan, karena
+ * kedipannya terlihat seperti baterai yang bermasalah padahal itu cuma derau
+ * ADC. Jaraknya 6%, sedikit di atas riak yang tersisa setelah median + EMA +
+ * minimum jendela 3 menit di battery.cpp.
+ *
+ * Ambangnya juga tidak rata jaraknya. Yang benar-benar perlu dibedakan adalah
+ * ujung bawah -- "masih bisa dipakai" versus "cari charger sekarang" -- bukan
+ * ujung atas, di mana beda 90% dan 100% tidak mengubah apa pun yang dilakukan
+ * pemakai. */
+static const int BATT_TURUN[BATT_N_KOTAK] = { 12, 42, 67 };  /* kotak ke-n padam di bawah ini */
+static const int BATT_NAIK [BATT_N_KOTAK] = { 18, 48, 73 };  /* kotak ke-n menyala di atas ini */
+
+static int batt_hitung_kotak(int persen, int lalu) {
+  /* Tampilan pertama belum punya riwayat, jadi histeresis tidak bisa dipakai:
+   * memulai dari 0 kotak akan membuat baterai penuh tampil sebagai 2 kotak
+   * sampai persen menyentuh 73%. Titik tengah kedua ambang adalah tebakan
+   * netral yang tidak condong ke atas maupun ke bawah. */
+  if (lalu < 0) {
+    int n = 0;
+    while (n < BATT_N_KOTAK && persen >= (BATT_TURUN[n] + BATT_NAIK[n]) / 2) n++;
+    return n;
+  }
+  int n = lalu;
+  while (n < BATT_N_KOTAK && persen >= BATT_NAIK[n]) n++;
+  while (n > 0            && persen <  BATT_TURUN[n - 1]) n--;
+  return n;
 }
 
-static void batt_tata(bool mengisi) {
-  /* Lebar label baru sah setelah tata letaknya dihitung ulang; tanpa ini
-   * lv_obj_get_width() masih mengembalikan lebar teks yang lama. */
-  lv_obj_update_layout(scr_wajah);
-  lv_obj_set_pos(lbl_ikon_batt, 232 - lv_obj_get_width(lbl_ikon_batt), 13);
-  lv_obj_align_to(lbl_batt, lbl_ikon_batt, LV_ALIGN_OUT_LEFT_MID, -4, 0);
-  lv_obj_set_style_text_color(lbl_ikon_batt,
-                              lv_color_hex(mengisi ? C_ISI : C_REDUP), 0);
+/* Warna memikul satu-satunya peringatan yang tersisa setelah angka dibuang.
+ * Nol kotak berarti badan baterai kosong melompong -- tanpa warna merah, layar
+ * yang kosong itu tidak bisa dibedakan dari ikon yang belum sempat digambar. */
+static void batt_gambar(int kotak, bool mengisi) {
+  uint32_t warna = mengisi ? C_ISI : (kotak == 0 ? C_CINCIN_HR : C_REDUP);
+
+  lv_obj_set_style_border_color(batt_cangkang, lv_color_hex(warna), 0);
+  lv_obj_set_style_bg_color(batt_nub, lv_color_hex(warna), 0);
+
+  for (int i = 0; i < BATT_N_KOTAK; i++) {
+    if (i < kotak) {
+      lv_obj_set_style_bg_color(batt_kotak[i], lv_color_hex(warna), 0);
+      lv_obj_clear_flag(batt_kotak[i], LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(batt_kotak[i], LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+
+  /* Petir muncul di kiri badan, bukan menggantikan isinya. Versi sebelumnya
+   * harus menukar lambang karena baris ini cuma menyisakan ~50 px di kanan
+   * tanggal; sekarang angka persen sudah pergi dan ruangnya cukup, jadi
+   * "sedang mengisi" bisa ditandai dua kali -- warna DAN lambang -- tanpa
+   * mengorbankan jumlah kotak yang terbaca. */
+  if (mengisi) lv_obj_clear_flag(batt_petir, LV_OBJ_FLAG_HIDDEN);
+  else         lv_obj_add_flag(batt_petir, LV_OBJ_FLAG_HIDDEN);
 }
 
 /* ---- Baris tanggal yang merangkap baris status ----
@@ -865,27 +982,6 @@ static void status_baris(void) {
     return;
   }
 
-  /* Pengukuran terjadwal yang menunggu tombol. Ini SATU-SATUNYA cara pengguna
-   * tahu bahwa satu jam sudah lewat dan sekarang giliran jarinya -- sensor tidak
-   * lagi menyala sendiri (lihat UKUR_TUNGGU_TOMBOL_S di aw_jam.cpp), jadi tanpa
-   * baris ini panggilannya tidak pernah sampai dan sesi berakhir kosong.
-   * Warnanya sama dengan warna "sedang mengukur" karena keduanya sama-sama
-   * berarti "sensor sedang menyangkut pada Anda". */
-  uint8_t jatuh_tempo = jam_index_jatuh_tempo();
-  if (jatuh_tempo) {
-    /* Dua kalimat bergantian tiap 2 detik, bukan satu kalimat panjang. Baris ini
-     * hanya punya ~100 px sebelum menabrak angka baterai -- kira-kira 14 huruf
-     * di montserrat_12 -- dan "UKUR 1 JAM, TEKAN TOMBOL" tidak muat dengan cara
-     * apa pun. Yang perlu disampaikan memang dua hal berbeda (pengukuran yang
-     * mana, dan apa yang harus dilakukan), jadi keduanya diberi giliran. */
-    const char *teks = ((millis() / 2000UL) & 1UL)
-                         ? "TEKAN TOMBOL"
-                         : (jatuh_tempo == 2 ? "UKUR 1 JAM" : "UKUR 2 JAM");
-    if (set_jika_beda(lbl_status, teks))
-      lv_obj_set_style_text_color(lbl_status, lv_color_hex(C_ISI), 0);
-    return;
-  }
-
   struct tm t;
   if (!tm_now(&t)) {
     if (set_jika_beda(lbl_status, "--"))
@@ -932,18 +1028,27 @@ static void refresh_cb(lv_timer_t *tm) {
    * wajah jam kembali seperti desainnya. */
   tepi_set(jam_sedang_mengukur() ? (int)jam_ukur_persen() : 0);
 
-  /* ---- panggilan pengukuran membangunkan layar ----
-   * Hanya pada TRANSISI menjadi jatuh tempo, bukan selama ia menunggu: kalau
-   * tidak, layar yang baru saja dimatikan pengguna menyala lagi setengah detik
-   * kemudian dan tidak bisa dimatikan sampai pengukurannya dikerjakan. Satu kali
-   * menyala adalah pemberitahuan; menyala terus adalah tombol yang rusak. */
-  static uint8_t jatuh_tempo_lalu = 0;
-  uint8_t jatuh_tempo_kini = jam_index_jatuh_tempo();
-  if (jatuh_tempo_kini && !jatuh_tempo_lalu) layar_set(true);
-  jatuh_tempo_lalu = jatuh_tempo_kini;
+  /* ---- pengukuran sesi yang menyala sendiri membangunkan layar ----
+   * Sejak v1.2 jam menyalakan sensor sendiri di t0+1 jam dan t0+2 jam, tanpa
+   * menunggu tombol. Tanpa baris ini, LED menyala pada jam yang layarnya gelap
+   * dan pengguna tidak punya cara apa pun mengetahui bahwa SEKARANG saatnya
+   * menempelkan jari -- pengukurannya lalu menyerah setelah 90 detik tanpa
+   * kontak dan sesi berakhir kosong.
+   *
+   * Hanya pada TRANSISI mulai-mengukur, bukan selama pengukurannya berjalan:
+   * kalau tidak, layar yang baru saja dimatikan pengguna menyala lagi setengah
+   * detik kemudian dan tidak bisa dimatikan sampai pengukurannya selesai. Satu
+   * kali menyala adalah pemberitahuan; menyala terus adalah tombol yang rusak.
+   *
+   * Cek manual dikecualikan: ia dimulai oleh tekanan tombol, jadi layarnya sudah
+   * pasti menyala dan pemakainya sudah pasti sedang melihat. */
+  static bool ukur_lalu = false;
+  bool ukur_kini = jam_sedang_mengukur();
+  if (ukur_kini && !ukur_lalu && !jam_ukur_lokal()) layar_set(true);
+  ukur_lalu = ukur_kini;
 
   /* ---- baterai ----
-   * Persen saja tidak jujur saat kabel tertancap. Selama mengisi, tegangan sel
+   * Kotak saja tidak jujur saat kabel tertancap. Selama mengisi, tegangan sel
    * dinaikkan oleh arus pengisian dan fase CV menahannya di 4,2 V, jadi kurva
    * Li-Po membaca hampir 100% jauh sebelum selnya benar-benar penuh.
    *
@@ -954,16 +1059,14 @@ static void refresh_cb(lv_timer_t *tm) {
    * bahwa jam sedang mengisi. */
   battery_update();
   if (battery_valid()) {
-    static int batt_lalu = -1;
-    static int isi_lalu  = -1;
-    int bp  = battery_percent();
-    int chg = battery_charging() ? 1 : 0;
-    if (bp != batt_lalu || chg != isi_lalu) {
-      batt_lalu = bp;
-      isi_lalu  = chg;
-      lv_label_set_text_fmt(lbl_batt, "%d%%", bp);
-      lv_label_set_text(lbl_ikon_batt, batt_ikon(bp, chg != 0));
-      batt_tata(chg != 0);
+    static int kotak_lalu = -1;
+    static int isi_lalu   = -1;
+    int kotak = batt_hitung_kotak(battery_percent(), kotak_lalu);
+    int chg   = battery_charging() ? 1 : 0;
+    if (kotak != kotak_lalu || chg != isi_lalu) {
+      kotak_lalu = kotak;
+      isi_lalu   = chg;
+      batt_gambar(kotak, chg != 0);
     }
   }
 
@@ -1238,22 +1341,23 @@ static bool boot_umpan_balik_tolak(void) {
     case JAM_TOLAK_SENSOR:        status_pesan("SENSOR TIDAK ADA");  return true;
     case JAM_TOLAK_SESI_AKTIF:    status_pesan("SESI SEDANG JALAN"); return true;
     case JAM_TOLAK_SESI_BERJALAN: status_pesan("SESI SUDAH MULAI");  return true;
-    case JAM_TOLAK_BELUM_JATUH_TEMPO: status_pesan("BELUM WAKTUNYA"); return true;
     case JAM_TOLAK_BELUM_ARM:     status_pesan("BELUM DISIAPKAN");   return true;
     default: return false;
   }
 }
 
 static void boot_aktifkan(void) {
+  /* Dua arti saja sekarang, turun dari tiga. Arti ketiga -- "mulai pengukuran
+   * terjadwal yang sudah jatuh tempo" -- hilang bersama mekanisme menunggu
+   * tombol: sejak v1.2 index 2 dan 3 menyala sendiri di jadwalnya, jadi selama
+   * sesi berjalan tombol ini memang tidak punya pekerjaan lagi dan
+   * jam_tekan_tombol() menolaknya dengan JAM_TOLAK_SESI_BERJALAN. */
   bool idle = (jam_status() == AW_SESI_IDLE);
-  bool jatuh_tempo = jam_index_jatuh_tempo() != 0;
   if (idle) jam_cek_manual();
   else      jam_tekan_tombol();
 
   if (boot_umpan_balik_tolak()) return;
-  if (idle)        status_pesan("CEK MANUAL");
-  else if (jatuh_tempo) status_pesan("MULAI UKUR");
-  else             status_pesan("SELESAI MAKAN");
+  status_pesan(idle ? "CEK MANUAL" : "SELESAI MAKAN");
 }
 
 static void boot_poll(void) {

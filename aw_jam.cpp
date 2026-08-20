@@ -58,44 +58,48 @@
 #define UKUR_TANPA_KONTAK_MS  90000UL    /* 90 dtk tanpa kulit menempel   */
 #define UKUR_BATAS_KERAS_MS  300000UL    /* 5 menit, apa pun keadaannya   */
 
-/* ---------------- Pengukuran terjadwal menunggu tombol ================
- * Dokumen 12 menyuruh jam menjalankan sendiri index 2 pada t0+1 jam dan index 3
- * pada t0+2 jam. Wire protocol-nya tidak berubah sedikit pun di sini -- index,
- * sesiId, jenis entri, semuanya tetap -- yang berubah cuma APA yang memicu
- * pengukuran itu: jatuh tempo tidak lagi langsung menyalakan sensor, melainkan
- * menandai pengukuran sebagai "menunggu tombol".
+/* ---------------- Jadwal titik ukur sesi (dokumen 12 & 12.1) ==========
+ * Jam menjalankan sendiri index 2 pada t0+1 jam dan index 3 pada t0+2 jam.
+ * Tidak ada lagi "menunggu tombol": jatuh tempo langsung menyalakan sensor.
  *
- * Alasannya fisik, bukan selera. MAX30105 hanya menghasilkan angka kalau ada
- * jari menempel di sensor. Pengukuran yang menyala sendiri satu jam setelah
- * makan hampir selalu menyala saat jamnya tergeletak di meja atau tangannya
- * sedang dipakai: 90 detik kemudian ia menyerah lewat UKUR_TANPA_KONTAK_MS dan
- * mencatat UKUR_GAGAL, dan itulah yang tersimpan di aplikasi -- bukan karena
- * sensornya gagal, melainkan karena tidak ada seorang pun yang tahu bahwa saat
- * itu ia harus menempelkan jari.
+ * Versi sebelumnya menunda pengukuran sampai tombol ditekan, dengan alasan
+ * fisik yang masih benar -- MAX30102 hanya menghasilkan angka kalau ada jari
+ * menempel, jadi pengukuran yang menyala saat jamnya tergeletak di meja akan
+ * menyerah lewat UKUR_TANPA_KONTAK_MS dan mencatat UKUR_GAGAL. Konsekuensi itu
+ * TIDAK hilang; ia diterima. Dokumen v1.2 bersifat normatif dan sisi Flutter-nya
+ * sudah diuji terhadapnya, dan UKUR_GAGAL memang cara protokol ini menyatakan
+ * "titik itu tidak punya sampel" -- aplikasi sudah tahu membacanya.
  *
- * Dengan menunggu tombol, pengukuran selalu dimulai oleh orang yang jarinya
- * sudah menempel. Yang hilang adalah pengukuran yang tepat waktu ke detik; yang
- * didapat adalah pengukuran yang benar-benar berisi angka.
+ * Tiga aturan dari dokumen 12.1 yang membentuk kode di bawah:
  *
- * Masa tunggunya tetap dibatasi supaya sesi tidak menggantung selamanya bila
- * tombolnya tidak pernah ditekan: index 2 hangus saat index 3 jatuh tempo, dan
- * index 3 hangus satu jam setelah jatuh tempo. Keduanya dicatat UKUR_GAGAL --
- * jujur, karena pengukurannya memang tidak pernah terjadi. */
-#define UKUR_TUNGGU_TOMBOL_S  3600UL     /* batas menunggu tombol untuk index 3 */
+ *   1. Jadwal dibandingkan dengan uptime_s ABSOLUT milik t0, tidak pernah dari
+ *      sisa waktu yang diakumulasikan sendiri -- sisa waktu hanyut tiap kali
+ *      ada penundaan.
+ *   2. Bitmask index baru menyala SESUDAH pengukuran tuntas, bukan saat ia
+ *      dimulai. Kalau dinyalakan di awal, titik yang terpotong ditandai "sudah"
+ *      dan tidak pernah diulang.
+ *   3. Ada penjaga "sedang mengukur" di depan seluruh jadwal, jadi titik ukur
+ *      yang bertabrakan dengan UKUR_SEKARANG DITUNDA, bukan dibatalkan. Titik
+ *      ukur sesi selalu menang karena ia tidak bisa diulang -- t0+1 jam cuma
+ *      terjadi sekali -- sementara pindai atas permintaan bisa diminta lagi
+ *      kapan saja. Asimetri nilai, bukan asimetri teknis.
+ */
 
 /* ---------------- Keadaan sesi ---------------- */
 static uint8_t  s_status = AW_SESI_IDLE;
 static uint8_t  s_sesi_id[16];
 static uint32_t s_arm_uptime = 0;
 static uint32_t s_t0_uptime  = 0;
-static uint8_t  s_index_selesai = 0;      /* bitmask index yang sudah dijadwalkan */
-
-/* Index yang sudah jatuh tempo dan sedang menunggu tombol: 0, 2, atau 3. Hanya
- * satu pada satu waktu -- index 2 sudah hangus saat index 3 jatuh tempo. */
-static uint8_t  s_index_menunggu = 0;
+static uint8_t  s_index_selesai = 0;      /* bitmask index yang sudah TUNTAS diukur */
 
 /* ---------------- Keadaan pengukuran ---------------- */
 static bool     s_ukur_aktif = false;
+
+/* true kalau pengukuran yang sedang berjalan adalah TITIK UKUR SESI, yaitu yang
+ * boleh menyalakan bitmask index saat selesai. Dipakai untuk memisahkannya dari
+ * UKUR_SEKARANG, yang memakai sesiId 16 byte nol dan menurut dokumen 5 tidak
+ * boleh menggeser jadwal maupun menghabiskan index sesi mana pun. */
+static bool     s_ukur_titik_sesi = false;
 static uint8_t  s_ukur_index = 0;
 static uint8_t  s_ukur_sesi[16];
 static uint32_t s_ukur_mulai_ms = 0;
@@ -218,6 +222,22 @@ static void kirim_status(void) {
 
 /* ================= Pengukuran ================= */
 static void ukur_mulai(uint8_t index, const uint8_t *sesi_id, bool lokal) {
+  /* Penjaga terakhir (dokumen 12.1): tidak ada pengukuran yang boleh menabrak
+   * pengukuran lain. Seluruh pemanggil sudah memeriksa lebih dulu -- perintah
+   * aplikasi lewat halangan_ukur(), jadwal sesi lewat penjaga di putar_sesi(),
+   * cek manual lewat pemeriksaannya sendiri -- jadi baris ini seharusnya tidak
+   * pernah menyala. Kalau ia menyala, berarti ada jalur baru yang lupa
+   * memeriksa, dan mencetaknya di sini jauh lebih murah daripada mengejar
+   * pengukuran yang hasilnya tertukar. */
+  if (s_ukur_aktif) {
+    Serial.printf("[ukur] BUG: index %u diminta saat index %u masih berjalan -- diabaikan\n",
+                  (unsigned)index, (unsigned)s_ukur_index);
+    return;
+  }
+
+  /* sesiId 16 byte nol = UKUR_SEKARANG, yang bukan titik ukur sesi. */
+  s_ukur_titik_sesi = !lokal && sesi_id && memcmp(sesi_id, SESI_NOL, 16) != 0;
+
   s_ukur_aktif    = true;
   s_ukur_lokal    = lokal;
   s_ukur_index    = index;
@@ -292,6 +312,13 @@ static void ukur_selesai(bool lengkap) {
     return;
   }
 
+  /* Bitmask index baru menyala DI SINI, sesudah pengukurannya tuntas -- bukan
+   * saat ia dimulai (dokumen 12.1 aturan 2). Ia menyala pada KEDUA cabang di
+   * bawah, berhasil maupun gagal total: index yang sudah dicoba dan gagal
+   * memang tidak boleh dicoba lagi, kalau tidak putar_sesi() akan mengulangnya
+   * tanpa henti sampai sesinya berakhir. */
+  if (s_ukur_titik_sesi) s_index_selesai |= (uint8_t)(1 << s_ukur_index);
+
   if (!ada) {
     /* Bila SEMUA metrik gagal, jangan kirim sampel -- catat UKUR_GAGAL dengan
      * payload index (dokumen 16). Sampel berisi lima nol tidak membawa
@@ -320,7 +347,6 @@ static void ukur_selesai(bool lengkap) {
     memset(s_sesi_id, 0, 16);
     s_t0_uptime = 0;
     s_index_selesai = 0;
-    s_index_menunggu = 0;
   }
   kirim_status();
 }
@@ -403,67 +429,15 @@ static void ke_idle(void) {
   s_t0_uptime = 0;
   s_arm_uptime = 0;
   s_index_selesai = 0;
-  s_index_menunggu = 0;
-  kirim_status();
-}
-
-/* Pengukuran terjadwal yang menunggu tombol, dimulai oleh tekanan tombol BOOT.
- * Pemeriksaannya sama persis dengan halangan_ukur() yang dipakai perintah dari
- * aplikasi -- baterai kritis dan sensor hilang menolak keduanya dengan alasan
- * yang sama -- hanya saja jawabannya di sini pesan di layar, bukan NAK. */
-static void mulai_index_menunggu(void) {
-  uint8_t index = s_index_menunggu;
-  if (s_ukur_aktif)     { s_tolak = JAM_TOLAK_SEDANG_UKUR; return; }
-  if (!ppg_present())   { s_tolak = JAM_TOLAK_SENSOR;      return; }
-  if (baterai_kritis()) { s_tolak = JAM_TOLAK_BATERAI;     return; }
-
-  s_index_menunggu = 0;
-  s_index_selesai |= (uint8_t)(1 << index);
-  Serial.printf("[sesi] tombol ditekan -- mulai pengukuran index %u\n",
-                (unsigned)index);
-  ukur_mulai(index, s_sesi_id, false);
-}
-
-/* Pengukuran yang jatuh temponya lewat tanpa tombol pernah ditekan. Dicatat
- * sebagai UKUR_GAGAL dengan payload index, sama seperti pengukuran yang berjalan
- * lalu tidak menghasilkan apa pun: dari sisi aplikasi keduanya memang peristiwa
- * yang sama -- index itu tidak punya sampel dan tidak akan pernah punya. */
-static void lewatkan_index(uint8_t index) {
-  aw_ring_tambah_event(AW_EV_UKUR_GAGAL, s_sesi_id, index, aw_uptime_s());
-  s_index_selesai |= (uint8_t)(1 << index);
-  s_index_menunggu = 0;
-  Serial.printf("[sesi] index %u hangus -- tombol tidak pernah ditekan\n",
-                (unsigned)index);
-
-  if (index == 3) {
-    /* Index 3 hangus menutup sesi, persis seperti sampel index 3 yang terkirim.
-     * Kalau tidak, sesi RUNNING menggantung selamanya dengan interval koneksi
-     * rapat yang terus menguras baterai. */
-    s_status = AW_SESI_IDLE;
-    memset(s_sesi_id, 0, 16);
-    s_t0_uptime = 0;
-    s_index_selesai = 0;
-  }
   kirim_status();
 }
 
 void jam_tekan_tombol(void) {
   if (s_status == AW_SESI_RUNNING) {
-    /* Diperiksa sebelum apa pun: pengukuran yang sedang berjalan adalah jawaban
-     * yang lebih tepat daripada "belum waktunya" di bawah, dan itu justru
-     * keadaan yang paling mungkin saat tombol ditekan dua kali berturut-turut. */
-    if (s_ukur_aktif) { s_tolak = JAM_TOLAK_SEDANG_UKUR; return; }
-
-    /* Selama sesi berjalan, tombol ini berganti arti: ia tidak lagi melahirkan
-     * t0 (itu hanya boleh sekali) melainkan MEMULAI pengukuran terjadwal yang
-     * sudah jatuh tempo -- inilah tekanan tombol satu jam dan dua jam setelah
-     * makan. */
-    if (s_index_menunggu) { mulai_index_menunggu(); return; }
-
-    /* Sesi berjalan tetapi belum ada yang jatuh tempo. Pesannya dibedakan dari
-     * "sesi sudah mulai" karena yang perlu diketahui pengguna bukan status sesi
-     * melainkan bahwa ia cuma perlu menunggu. */
-    s_tolak = JAM_TOLAK_BELUM_JATUH_TEMPO;
+    /* Sesi sudah berjalan: t0 hanya boleh lahir sekali, dan index 2 serta 3
+     * sekarang berjalan sendiri di jadwalnya. Tombol tidak punya arti kedua
+     * lagi di status ini. */
+    s_tolak = JAM_TOLAK_SESI_BERJALAN;
     return;
   }
   if (s_status != AW_SESI_ARMED) {
@@ -473,27 +447,37 @@ void jam_tekan_tombol(void) {
     Serial.println("[sesi] tombol ditekan di IDLE -- belum di-ARM aplikasi");
     return;
   }
-  if (s_ukur_aktif) {
-    s_tolak = JAM_TOLAK_SEDANG_UKUR;
-    return;
-  }
   if (baterai_kritis()) {
     s_tolak = JAM_TOLAK_BATERAI;
     Serial.println("[sesi] tombol ditolak: baterai kritis");
     return;
   }
 
-  s_status    = AW_SESI_RUNNING;
-  s_t0_uptime = aw_uptime_s();
+  /* PERHATIKAN yang TIDAK ada di sini: pemeriksaan s_ukur_aktif.
+   *
+   * Itu dihapus dengan sengaja (dokumen 12.1). t0 adalah STEMPEL WAKTU, bukan
+   * pengukuran; keduanya kebetulan dipicu peristiwa yang sama tetapi tidak
+   * punya kendala yang sama. Urutan yang paling lazim justru membuktikannya:
+   * UKUR index 0 dikirim aplikasi saat shutter kamera ditekan, lalu penggunanya
+   * menekan tombol beberapa detik kemudian -- dengan sensor sungguhan, baseline
+   * itu masih berjalan. Menolak di situ berarti t0 bergeser dari saat tombol
+   * benar-benar ditekan, dan itu kerusakan yang tidak bisa diperbaiki siapa pun
+   * sesudahnya.
+   *
+   * Yang juga TIDAK ada di sini: ukur_mulai(1, ...). Rutin tombol hanya mencatat
+   * t0, memancarkan peristiwanya, dan selesai. Index 1 diambil putar_sesi()
+   * pada iterasi berikutnya, lewat jalur yang sama dengan index 2 dan 3 -- dan
+   * itulah yang membuat tombol tidak pernah bisa gagal gara-gara sensor sibuk. */
+  s_status        = AW_SESI_RUNNING;
+  s_t0_uptime     = aw_uptime_s();
   s_index_selesai = 0;
 
   /* Event tombol WAJIB masuk ring buffer seperti entri lain -- justru event
    * inilah yang paling sering terjadi saat HP tidak tersambung, dan ia adalah
    * sumber tunggal t0 (dokumen 7). */
   aw_ring_tambah_event(AW_EV_TOMBOL_SELESAI_MAKAN, s_sesi_id, 0, s_t0_uptime);
-
-  s_index_selesai |= (1 << 1);
-  ukur_mulai(1, s_sesi_id, false);
+  Serial.println("[sesi] RUNNING -- t0 dicatat, index 1 menyusul di putaran berikutnya");
+  kirim_status();
 }
 
 void jam_cek_manual(void) {
@@ -542,37 +526,40 @@ static void putar_sesi(void) {
     return;
   }
 
-  if (s_status != AW_SESI_RUNNING || s_ukur_aktif) return;
+  if (s_status != AW_SESI_RUNNING) return;
 
-  /* Jadwal dihitung dari uptime_s ABSOLUT milik t0, tidak pernah dari "sisa
-   * waktu" yang diakumulasikan sendiri -- sisa waktu akan hanyut setiap kali
-   * ada penundaan (dokumen 12). Yang dijadwalkan sekarang adalah SAAT TOMBOL
-   * MULAI BERARTI, bukan saat sensor menyala; lihat UKUR_TUNGGU_TOMBOL_S. */
+  /* Penjaga "sedang mengukur" (dokumen 12.1 aturan 3). Ia yang membuat titik
+   * ukur sesi DITUNDA alih-alih dibatalkan: iterasi ini dilewati, dan karena
+   * bitmask index baru menyala saat pengukuran tuntas, titik yang sama diperiksa
+   * lagi pada iterasi berikutnya sampai ia benar-benar terlaksana.
+   *
+   * Penundaannya tidak terlihat di aplikasi: aplikasi menormalkan waktu relatif
+   * tiap titik ke slot jadwalnya (0 / 3600 / 7200), karena label di layar
+   * menjanjikan "+1 jam" dan bukan "+1 jam 40 detik". Yang tidak boleh terjadi
+   * bukan penundaannya, melainkan titiknya hilang. */
+  if (s_ukur_aktif) return;
 
-  /* Yang hangus diperiksa lebih dulu, supaya index 2 yang tidak pernah ditekan
-   * sudah tercatat gagal sebelum index 3 mengambil giliran menunggu. */
-  if (!(s_index_selesai & (1 << 2)) && skrg >= s_t0_uptime + AW_JADWAL_IDX3_S) {
-    lewatkan_index(2);
-  }
-  if (s_index_menunggu == 3 &&
-      skrg >= s_t0_uptime + AW_JADWAL_IDX3_S + UKUR_TUNGGU_TOMBOL_S) {
-    lewatkan_index(3);           /* ini juga menutup sesi */
+  /* Perbandingan memakai uptime_s ABSOLUT milik t0, tidak pernah sisa waktu
+   * yang diakumulasikan sendiri -- sisa waktu hanyut tiap kali ada penundaan
+   * (dokumen 12). */
+  if (!(s_index_selesai & (1 << 1))) {
+    /* Index 1 ada DI SINI, bukan di dalam jam_tekan_tombol(). Lihat alasannya
+     * di sana: tombol tidak boleh bisa gagal gara-gara sensor sibuk. */
+    ukur_mulai(1, s_sesi_id, false);
     return;
   }
-
-  if (!(s_index_selesai & (1 << 2)) && s_index_menunggu != 2 &&
-      skrg >= s_t0_uptime + AW_JADWAL_IDX2_S &&
-      skrg <  s_t0_uptime + AW_JADWAL_IDX3_S) {
-    s_index_menunggu = 2;
-    Serial.println("[sesi] index 2 jatuh tempo (t0+1 jam) -- menunggu tombol");
-    kirim_status();
+  if (!(s_index_selesai & (1 << 2)) && skrg >= s_t0_uptime + AW_JADWAL_IDX2_S) {
+    Serial.println("[sesi] index 2 jatuh tempo (t0+1 jam)");
+    ukur_mulai(2, s_sesi_id, false);
     return;
   }
-  if (!(s_index_selesai & (1 << 3)) && s_index_menunggu != 3 &&
-      skrg >= s_t0_uptime + AW_JADWAL_IDX3_S) {
-    s_index_menunggu = 3;
-    Serial.println("[sesi] index 3 jatuh tempo (t0+2 jam) -- menunggu tombol");
-    kirim_status();
+  if (!(s_index_selesai & (1 << 3)) && skrg >= s_t0_uptime + AW_JADWAL_IDX3_S) {
+    /* Kepulangan ke IDLE TIDAK dilakukan di sini melainkan di ukur_selesai(),
+     * saat sampel index 3 benar-benar tuntas -- memulangkannya sekarang akan
+     * membuang sesi yang pengukuran terakhirnya baru saja dimulai. */
+    Serial.println("[sesi] index 3 jatuh tempo (t0+2 jam)");
+    ukur_mulai(3, s_sesi_id, false);
+    return;
   }
 }
 
@@ -667,11 +654,50 @@ static void jalankan_perintah(const aw_perintah_t *p) {
       uint8_t halangan = halangan_ukur();
       if (halangan) { nak(halangan); return; }
       ack(op);
-      s_index_selesai |= (uint8_t)(1 << index);
-      /* Aplikasi mendahului tombol: index yang tadinya menunggu ditekan sudah
-       * diukur sekarang, jadi panggilan di layar harus ikut hilang. */
-      if (s_index_menunggu == index) s_index_menunggu = 0;
+      /* Bitmask TIDAK dinyalakan di sini -- ukur_selesai() yang menyalakannya
+       * setelah pengukurannya tuntas (dokumen 12.1 aturan 2). */
       ukur_mulai(index, s_sesi_id, false);
+      return;
+    }
+
+    case AW_OP_MULAI_SESI: {
+      /* Tombol "Selesai Makan" jam yang ditekan DARI APLIKASI (dokumen 5, v1.2).
+       *
+       * Payloadnya sesiId saja, dan ketiadaan waktu di dalamnya adalah seluruh
+       * isi perintah ini: jam membaca uptime_s-nya sendiri saat perintah tiba.
+       * Kalau suatu saat ada yang tergoda menaruh epoch di sini, seluruh
+       * dokumen 2 runtuh -- jam tidak punya RTC, jadi satu-satunya t0 yang bisa
+       * dibandingkan dengan uptime_s sampel-sampelnya adalah yang berasal dari
+       * pencacah yang sama.
+       *
+       * Peristiwanya TIDAK BOLEH dibedakan dari tombol fisik: tidak ada flag
+       * "dari aplikasi", dan karena itu di sini dipanggil jam_tekan_tombol()
+       * yang sudah ada, bukan salinan jalurnya. Jalur kembar adalah cara paling
+       * pasti membuat keduanya lambat laun berbeda. */
+      if (narg < 16) { nak(AW_NAK_PAYLOAD_INVALID); return; }
+
+      if (s_status == AW_SESI_RUNNING) {
+        /* IDEMPOTEN. ACK bisa hilang di udara dan aplikasi mengulang sampai
+         * tiga kali; dua t0 untuk satu sesi adalah kerusakan yang tidak bisa
+         * diperbaiki siapa pun sesudahnya. Jadi: di-ACK lalu DIABAIKAN --
+         * tidak ada t0 kedua, tidak ada TOMBOL_SELESAI_MAKAN kedua. */
+        if (!sesi_cocok(arg)) { nak(AW_NAK_SESI_TAK_DIKENAL); return; }
+        ack(op);
+        Serial.println("[sesi] MULAI_SESI diulang untuk sesi yang sudah RUNNING -- diabaikan");
+        return;
+      }
+      if (s_status != AW_SESI_ARMED) { nak(AW_NAK_BELUM_ARM); return; }
+      if (!sesi_cocok(arg))          { nak(AW_NAK_SESI_TAK_DIKENAL); return; }
+
+      /* Perhatikan halangan_ukur() TIDAK dipanggil di sini, dan itu disengaja:
+       * ini satu-satunya opcode pengukuran-adjacent yang tidak boleh menjawab
+       * NAK 0x05 walau sensor sedang sibuk (dokumen 12.1). Baterai kritis tetap
+       * ditolak, dengan kode yang berbeda dan dengan alasan yang sama persis
+       * seperti tombol fisik -- sehingga keduanya tetap tidak bisa dibedakan. */
+      if (baterai_kritis()) { nak(AW_NAK_BATERAI_RENDAH); return; }
+
+      ack(op);
+      jam_tekan_tombol();
       return;
     }
 
@@ -854,7 +880,6 @@ void jam_mulai(void) {
   s_t0_uptime = 0;
   s_arm_uptime = 0;
   s_index_selesai = 0;
-  s_index_menunggu = 0;
 
   aw_ble_begin();
 
@@ -963,8 +988,6 @@ uint8_t  jam_tertunda(void)          { return aw_ring_tertunda(); }
 bool     jam_terhubung(void)         { return aw_ble_terhubung(); }
 bool     jam_siap_notifikasi(void)   { return aw_ble_siap_notifikasi(); }
 bool     jam_ada_anchor(void)        { return aw_anchor_boot_ini(); }
-
-uint8_t  jam_index_jatuh_tempo(void) { return s_index_menunggu; }
 
 uint8_t  jam_ukur_index(void)        { return s_ukur_index; }
 uint16_t jam_ukur_detak(void)        { return s_ukur_detak; }
