@@ -25,14 +25,19 @@
  * dipindah ke tekan-lama tombol BOOT, yang tidak memakan tempat di layar.
  * Lihat boot_poll().
  *
- * Tombol itu satu-satunya pemicu SELURUH pengukuran: saat makan selesai, satu
- * jam sesudahnya, dan dua jam sesudahnya -- ketiganya terkirim ke aplikasi --
- * ditambah cek manual di luar sesi yang hasilnya berhenti di layar ini. Jam
- * tidak lagi menyalakan sensornya sendiri saat jadwal jatuh tempo: MAX30105 cuma
- * menghasilkan angka kalau ada jari menempel, dan pengukuran yang menyala saat
- * jamnya tergeletak di meja hanya menghasilkan UKUR_GAGAL. Yang dijadwalkan
- * sekarang adalah panggilannya, bukan sensornya -- lihat UKUR_TUNGGU_TOMBOL_S di
- * aw_jam.cpp dan status_baris() di bawah.
+ * SATU TOMBOL, DUA MAKNA (protokol v1.3). Artinya ditentukan keadaan jam, dan
+ * LAYAR INI yang menuliskannya -- lihat status_baris() dan tombol_arti(). Ada
+ * ARM_TITIK berarti "Ukur"; ARMED berarti "Selesai Makan"; IDLE tanpa keduanya
+ * jatuh ke cek manual yang hasilnya berhenti di layar ini. Pemilihan antara dua
+ * makna protokolnya ada di aw_jam, bukan di sini: ARM_TITIK bisa tiba lewat BLE
+ * antara layar membaca keadaan dan jari diangkat.
+ *
+ * JAM TIDAK MENJADWALKAN APA PUN lagi. Sebabnya bukan sensor melainkan daya:
+ * jam bertahan ~50 menit menyala sedangkan satu sesi lebih dari dua jam, jadi ia
+ * PASTI dimatikan sebelum titik berikutnya jatuh tempo. Yang menjadwalkan
+ * sekarang aplikasi, lewat UKUR dan ARM_TITIK. Satu-satunya pengukuran atas
+ * inisiatif jam yang tersisa adalah index 1, dan itu akibat langsung tombol yang
+ * baru ditekan, bukan tenggat.
  *
  * SELAMA MENGUKUR keempat kartu menampilkan bacaan langsung yang terus berubah,
  * termasuk yang belum lolos gerbang kirim (ditandai warna lebih redup). Yang
@@ -60,7 +65,7 @@
  *   battery             - ADC1 + kurva Li-Po
  *   ppg                 - MAX30105/30102: BPM, SpO2, glukosa, tekanan darah
  *                         EKSPERIMENTAL
- *   aw_proto/aw_store/  - AsaWatch: protokol BLE v1.1, ring buffer NVS, mesin
+ *   aw_proto/aw_store/  - AsaWatch: protokol BLE v1.3, ring buffer NVS, mesin
  *   aw_ble/aw_jam         status sesi. Spesifikasinya ada di
  *                         docs/asawatch-ble-untuk-jam-lvgl.md dan NORMATIF --
  *                         sisi aplikasi Flutter sudah diuji terhadapnya.
@@ -75,6 +80,7 @@
 #include <Wire.h>
 #include "TouchDrv.hpp"
 #include "ui_assets.h"
+#include "splash_assets.h"
 
 #include "config.h"
 #include "rtc.h"
@@ -83,6 +89,18 @@
 #include "battery.h"
 #include "ppg.h"
 #include "aw_jam.h"
+#include "aw_ble.h"
+
+/* Ditaruh SETINGGI ini, jauh dari satu-satunya pemakainya di bawah, karena
+ * praprosesor Arduino menyisipkan prototipe otomatis tepat setelah blok #include
+ * -- termasuk untuk tombol_arti(), yang mengembalikan tipe ini. Typedef yang
+ * ditulis di dekat fungsinya akan berada DI BAWAH prototipenya sendiri, dan
+ * pesan galatnya ("does not name a type") tidak menunjuk ke sebabnya sama
+ * sekali.
+ *
+ * Apa arti tombol fisik saat ini. HANYA untuk label dan pesan -- tidak pernah
+ * untuk memilih fungsi mana yang dipanggil (dokumen 12 poin 5 & 13.4). */
+typedef enum { TBL_MATI = 0, TBL_UKUR, TBL_SELESAI_MAKAN, TBL_CEK_MANUAL } tombol_arti_t;
 
 /* Subset digit-only dari montserrat_48 (cuma glyph '-' '.' '/' dan 0-9),
  * dipakai untuk jam besar. Font bawaan LVGL di ukuran itu ikut membawa seluruh
@@ -277,6 +295,25 @@ static bool s_bl_tunda    = false;
  * menyalakan layarnya sendiri lagi karena ada pengukuran yang jatuh tempo. */
 static bool pwr_daya_lepas = false;
 
+/* Layar pembuka. Definisinya jauh di bawah (butuh scr_wajah dan helper widget),
+ * tetapi layar_set() adalah satu-satunya pintu menyala/mati layar dan karena itu
+ * juga satu-satunya tempat yang benar untuk memulai dan membatalkannya.
+ * Dideklarasikan eksplisit alih-alih menumpang prototipe otomatis Arduino,
+ * supaya urutan berkas tidak diam-diam menentukan apakah ini ter-compile. */
+static void splash_mulai(void);
+static void splash_batal(void);
+
+/* 1 = logo tampil juga setiap layar dinyalakan kembali, bukan cuma saat boot.
+ *
+ * Ini keputusan produk, bukan detail teknis, jadi ditaruh sebagai sakelar yang
+ * terlihat. Sisi baiknya: layar tidak pernah menyala dengan wajah jam basi
+ * sepersekian detik sebelum digambar ulang. Sisi mahalnya nyata dan spesifik --
+ * sejak v1.2 layar menyala sendiri saat pengukuran sesi dimulai (lihat
+ * refresh_cb), dan di situ SPL_TOTAL_MS berdiri persis di antara pengguna dan
+ * isyarat "tempelkan jari sekarang". Diset 0 kalau isyarat itu ternyata lebih
+ * berharga daripada logonya. */
+#define SPL_SAAT_BANGUN 1
+
 static void layar_set(bool nyala) {
   if (nyala && pwr_daya_lepas) return;
   if (nyala == s_layar_nyala) return;
@@ -284,11 +321,23 @@ static void layar_set(bool nyala) {
 
   if (nyala) {
     gfx->displayOn();
+#if SPL_SAAT_BANGUN
+    /* Memuat layar pembuka sekaligus meng-invalidate seluruh piksel, jadi ini
+     * menggantikan lv_obj_invalidate() di bawah, bukan menambahinya. */
+    splash_mulai();
+#else
     /* Isi RAM panel tidak dijamin selamat dari SLPIN, jadi seluruh layar
      * digambar ulang alih-alih mengandalkan apa yang tersisa di sana. */
     lv_obj_invalidate(lv_scr_act());
+#endif
     s_bl_tunda = true;
   } else {
+    /* Dibatalkan SEBELUM panel dipadamkan. Animasi yang dibiarkan berjalan di
+     * balik layar mati bukan cuma membuang CPU: timer penutupnya akan memuat
+     * wajah jam beberapa ratus milidetik kemudian, sehingga penyalaan
+     * berikutnya menemukan splash yang sudah separuh jalan dan memulainya dari
+     * tengah. */
+    splash_batal();
     ledcWrite(LCD_BL, 0);
     gfx->displayOff();
     s_bl_tunda = false;
@@ -831,6 +880,255 @@ static void build_wajah(void) {
   build_tepi(scr_wajah);
 }
 
+/* ================= Layar pembuka =================
+ *
+ * Tampil saat boot dan -- kalau SPL_SAAT_BANGUN -- setiap kali layar dinyalakan
+ * lagi. Itulah yang menentukan seluruh anggarannya. Splash yang cuma dilihat
+ * sekali sehari boleh megah; yang dilihat belasan kali sehari harus SELESAI
+ * sebelum kesabaran habis, dan di bawah satu detik adalah batas praktisnya.
+ * Semua angka di bawah diturunkan dari batas itu, bukan sebaliknya.
+ *
+ * KENAPA GAMBAR, BUKAN GAMBAR VEKTOR
+ * Tanda jam di logo punya gradien badan, garis hati, dan garis EKG yang saling
+ * menimpa. Menirunya dengan primitif LVGL berarti belasan objek yang harus
+ * digambar ulang setiap frame -- lebih lambat DAN tidak pernah benar-benar mirip.
+ * Satu bitmap RGB565 adalah blit tunggal: tercepat sekaligus paling setia.
+ * Kata "ASAWatch" ikut jadi gambar karena bobot dan huruf 'W'-nya tidak ada di
+ * Montserrat bawaan LVGL. Anak judulnya justru KEBALIKANNYA: huruf kapital tipis
+ * berjarak lebar yang di 8 px tinggi (satu-satunya ukuran yang muat) akan jadi
+ * bubur kalau dijadikan bitmap, sedangkan font hinted tetap tajam -- jadi ia
+ * satu-satunya yang dirender sebagai teks.
+ *
+ * KENAPA TIDAK ADA ZOOM ATAU PUTAR
+ * lv_img_set_zoom menskalakan ulang seluruh piksel di CPU setiap frame. Pada
+ * C6 tanpa PSRAM itu justru sumber patah-patah yang paling dihindari di sini.
+ * Yang dipakai cuma tiga gerakan yang MURAH: sapuan busur (cuma cincin tipisnya
+ * yang digambar ulang), pudar (blit yang sama, sekali campur), dan geser tegak
+ * sejauh 8 px. Ketiganya tidak menyentuh penskalaan sama sekali.
+ *
+ * URUTANNYA PUNYA ARTI
+ * Busur menyapu lebih dulu dan sendirian -- ia menggambar lingkaran bezel jam,
+ * jadi tanda jamnya seolah muncul DI DALAM sesuatu yang baru saja terbentuk.
+ * Kata dan anak judul menyusul dari bawah setelah tandanya utuh. Kalau ketiganya
+ * memudar bersamaan, tidak ada yang menuntun mata dan hasilnya cuma kedipan. */
+
+/* Harus sama persis dengan BG di gensplash.py: latar sudah dipanggang ke dalam
+ * kedua bitmap, jadi warna yang berbeda akan memperlihatkan persegi gambarnya
+ * sebagai kotak yang lebih terang. */
+#define SPL_BG      0x090A10
+#define SPL_CX      120
+#define SPL_CY      109
+#define SPL_R       72          /* jari-jari busur, menyisakan 14 px dari tali jam */
+#define SPL_ARC_W   3
+#define SPL_C_ARC   0x35C8A0
+#define SPL_C_SUB   0x7FBFA8
+#define SPL_KATA_Y  197
+#define SPL_KATA_DY 8           /* tinggi geseran masuk kata "ASAWatch" */
+#define SPL_SUB_Y   228
+
+/* Jadwal, dalam milidetik sejak splash_mulai(). Tumpang tindihnya disengaja:
+ * setiap unsur mulai sebelum unsur sebelumnya betul-betul selesai, sehingga
+ * tidak pernah ada saat layar diam menunggu giliran berikutnya. */
+#define SPL_ARC_MS     420
+#define SPL_MARK_TUNDA 130
+#define SPL_MARK_MS    260
+#define SPL_KATA_TUNDA 380
+#define SPL_KATA_MS    250
+#define SPL_SUB_TUNDA  540
+#define SPL_SUB_MS     220
+#define SPL_TOTAL_MS   850      /* 760 ms animasi + 90 ms jeda baca */
+
+/* LV_DISP_DEF_REFR_PERIOD 30 ms berarti 33 frame/detik, dan pudaran 260 ms
+ * hanya kebagian 9 langkah opasitas -- terlihat sebagai tangga, bukan pudaran.
+ * Periodenya dipercepat SELAMA splash saja lalu dikembalikan. Ini target, bukan
+ * tenggat: kalau satu frame ternyata butuh lebih dari 16 ms, LVGL sekadar
+ * menggambar lebih jarang -- sama dengan yang akan terjadi tanpa baris ini.
+ * Wajah jam tidak ikut dipercepat karena ia cuma berubah dua kali per detik.
+ *
+ * DUA timer, bukan satu, dan ini terukur: mempercepat timer gambar saja tidak
+ * mengubah apa pun sama sekali -- frame tetap datang tiap 30 ms. Timer ANIMASI
+ * LVGL punya periodenya sendiri yang juga LV_DISP_DEF_REFR_PERIOD, dan selama
+ * ia belum jalan tidak ada nilai yang berubah, jadi tidak ada apa pun untuk
+ * digambar ulang. Timer gambar yang lebih cepat hanya menemukan layar bersih. */
+#define SPL_REFR_MS    16
+
+static void spl_periode(uint32_t ms) {
+  lv_timer_set_period(lv_disp_get_default()->refr_timer, ms);
+  lv_timer_set_period(lv_anim_get_timer(), ms);
+}
+
+static lv_obj_t *scr_splash;
+static lv_obj_t *spl_busur, *spl_o_mark, *spl_o_kata, *spl_o_sub;
+static lv_timer_t *spl_timer = NULL;
+static bool     s_splash_tampil = false;
+static uint32_t spl_frame = 0, spl_mulai_ms = 0, spl_render_maks = 0;
+
+/* Pengukur kehalusan. Dipasang permanen di disp_drv dan hanya mencacah selama
+ * splash: satu percabangan per frame, dan sebagai gantinya pertanyaan "apakah
+ * animasinya patah-patah" bisa dijawab dari serial, bukan dari kesan mata. */
+static void spl_monitor(lv_disp_drv_t *drv, uint32_t waktu, uint32_t px) {
+  LV_UNUSED(drv); LV_UNUSED(px);
+  if (!s_splash_tampil) return;
+  spl_frame++;
+  if (waktu > spl_render_maks) spl_render_maks = waktu;
+}
+
+static void spl_exec_busur(void *o, int32_t v) { lv_arc_set_value((lv_obj_t *)o, v); }
+static void spl_exec_gbr(void *o, int32_t v)   { lv_obj_set_style_img_opa((lv_obj_t *)o, (lv_opa_t)v, 0); }
+static void spl_exec_teks(void *o, int32_t v)  { lv_obj_set_style_text_opa((lv_obj_t *)o, (lv_opa_t)v, 0); }
+static void spl_exec_y(void *o, int32_t v)     { lv_obj_set_y((lv_obj_t *)o, v); }
+
+static void spl_anim(lv_obj_t *o, lv_anim_exec_xcb_t cb, int32_t dari, int32_t ke,
+                     uint32_t tunda, uint32_t lama, lv_anim_path_cb_t jalur) {
+  lv_anim_t a;
+  lv_anim_init(&a);
+  lv_anim_set_var(&a, o);
+  lv_anim_set_exec_cb(&a, cb);
+  lv_anim_set_values(&a, dari, ke);
+  lv_anim_set_delay(&a, tunda);
+  lv_anim_set_time(&a, lama);
+  lv_anim_set_path_cb(&a, jalur);
+  lv_anim_start(&a);
+}
+
+static void build_splash(void) {
+  scr_splash = lv_obj_create(NULL);
+  lv_obj_remove_style_all(scr_splash);
+  lv_obj_clear_flag(scr_splash, LV_OBJ_FLAG_SCROLLABLE);
+  /* Rata, bukan bergradien seperti wajah jam. Bukan selera: latar kedua bitmap
+   * sudah dipanggang dengan SATU warna, dan gradien akan membuat persegi
+   * gambarnya terlihat di mana pun warnanya tidak lagi berimpit. */
+  lv_obj_set_style_bg_color(scr_splash, lv_color_hex(SPL_BG), 0);
+  lv_obj_set_style_bg_opa(scr_splash, LV_OPA_COVER, 0);
+
+  /* Busur dibangun seperti mk_cincin (knob dilepas, klik dimatikan) tetapi tanpa
+   * jalur latar: yang belum tersapu harus benar-benar kosong, karena jejak
+   * gelap sepanjang lingkaran akan membocorkan ke mana sapuannya menuju. */
+  int d = SPL_R * 2 + 1;
+  spl_busur = lv_arc_create(scr_splash);
+  lv_obj_remove_style(spl_busur, NULL, LV_PART_KNOB);
+  lv_obj_clear_flag(spl_busur, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_size(spl_busur, d, d);
+  lv_obj_set_pos(spl_busur, SPL_CX - SPL_R, SPL_CY - SPL_R);
+  lv_arc_set_rotation(spl_busur, 270);        /* mulai di jam 12 */
+  lv_arc_set_bg_angles(spl_busur, 0, 360);
+  lv_arc_set_range(spl_busur, 0, 1000);
+  lv_arc_set_value(spl_busur, 0);
+  lv_obj_set_style_arc_opa(spl_busur, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_style_arc_width(spl_busur, SPL_ARC_W, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_color(spl_busur, lv_color_hex(SPL_C_ARC), LV_PART_INDICATOR);
+  lv_obj_set_style_arc_rounded(spl_busur, true, LV_PART_INDICATOR);
+
+  spl_o_mark = mk_img(scr_splash, &spl_mark,
+                      SPL_CX - spl_mark.header.w / 2,
+                      SPL_CY - spl_mark.header.h / 2);
+  spl_o_kata = mk_img(scr_splash, &spl_kata,
+                      (SCREEN_W - (int)spl_kata.header.w) / 2, SPL_KATA_Y);
+
+  spl_o_sub = mk_label(scr_splash, "VITAL HEALTH MONITORING",
+                       &lv_font_montserrat_12, SPL_C_SUB, 0, 0);
+  /* Jarak huruf 1 px meniru tracking lebar pada logo. Lebih dari itu membuat
+   * barisnya melewati 240 px dan terpotong di kedua tepi. */
+  lv_obj_set_style_text_letter_space(spl_o_sub, 1, 0);
+  lv_obj_align(spl_o_sub, LV_ALIGN_TOP_MID, 0, SPL_SUB_Y);
+}
+
+static void splash_tutup(bool tuntas) {
+  lv_anim_del(spl_busur,  NULL);
+  lv_anim_del(spl_o_mark, NULL);
+  lv_anim_del(spl_o_kata, NULL);
+  lv_anim_del(spl_o_sub,  NULL);
+
+  spl_periode(LV_DISP_DEF_REFR_PERIOD);
+  lv_scr_load(scr_wajah);
+
+  uint32_t lama = millis() - spl_mulai_ms;
+  s_splash_tampil = false;
+  if (!tuntas) {
+    Serial.printf("[splash] dibatalkan di %lu ms\n", (unsigned long)lama);
+    return;
+  }
+  Serial.printf("[splash] %lu frame / %lu ms = %lu fps, render terlama %lu ms\n",
+                (unsigned long)spl_frame, (unsigned long)lama,
+                (unsigned long)(lama ? spl_frame * 1000UL / lama : 0),
+                (unsigned long)spl_render_maks);
+}
+
+static void splash_selesai_cb(lv_timer_t *t) {
+  LV_UNUSED(t);
+  /* repeat_count 1: LVGL menghapus timernya sendiri tepat setelah callback ini
+   * kembali, jadi yang dibersihkan di sini cuma pointernya. Melepasnya dengan
+   * lv_timer_del() di sini berarti LVGL menghapus blok yang sudah bebas. */
+  spl_timer = NULL;
+  splash_tutup(true);
+}
+
+static void splash_mulai(void) {
+  if (s_splash_tampil) return;
+  s_splash_tampil = true;
+  spl_frame       = 0;
+  spl_render_maks = 0;
+  spl_mulai_ms    = millis();
+
+  /* Keadaan t=0 ditulis eksplisit sebelum animasi mana pun dimulai. LVGL 8.3
+   * memang menerapkan nilai awal seketika (early_apply), tetapi splash ini
+   * dijalankan berulang kali pada objek yang SAMA -- kalau satu saja anim gagal
+   * dimulai, sisa keadaan dari putaran sebelumnya akan tampil sebagai unsur yang
+   * sudah utuh sejak frame pertama. */
+  lv_arc_set_value(spl_busur, 0);
+  lv_obj_set_style_img_opa(spl_o_mark, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_img_opa(spl_o_kata, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_text_opa(spl_o_sub, LV_OPA_TRANSP, 0);
+  lv_obj_set_y(spl_o_kata, SPL_KATA_Y + SPL_KATA_DY);
+
+  lv_scr_load(scr_splash);
+
+  spl_anim(spl_busur,  spl_exec_busur, 0, 1000,
+           0, SPL_ARC_MS, lv_anim_path_ease_out);
+  spl_anim(spl_o_mark, spl_exec_gbr, LV_OPA_TRANSP, LV_OPA_COVER,
+           SPL_MARK_TUNDA, SPL_MARK_MS, lv_anim_path_ease_out);
+  /* Dua anim pada objek yang sama tetapi exec_cb berbeda, jadi keduanya hidup:
+   * lv_anim_start() hanya menggusur anim dengan pasangan (var, exec_cb) identik. */
+  spl_anim(spl_o_kata, spl_exec_gbr, LV_OPA_TRANSP, LV_OPA_COVER,
+           SPL_KATA_TUNDA, SPL_KATA_MS, lv_anim_path_linear);
+  spl_anim(spl_o_kata, spl_exec_y, SPL_KATA_Y + SPL_KATA_DY, SPL_KATA_Y,
+           SPL_KATA_TUNDA, SPL_KATA_MS, lv_anim_path_ease_out);
+  spl_anim(spl_o_sub,  spl_exec_teks, LV_OPA_TRANSP, LV_OPA_COVER,
+           SPL_SUB_TUNDA, SPL_SUB_MS, lv_anim_path_linear);
+
+  spl_timer = lv_timer_create(splash_selesai_cb, SPL_TOTAL_MS, NULL);
+  lv_timer_set_repeat_count(spl_timer, 1);
+
+  spl_periode(SPL_REFR_MS);
+}
+
+static void splash_batal(void) {
+  if (!s_splash_tampil) return;
+  if (spl_timer) { lv_timer_del(spl_timer); spl_timer = NULL; }
+  splash_tutup(false);
+}
+
+/* Dipakai HANYA saat boot: memutar splash sampai habis dengan CPU penuh, sebelum
+ * jam_mulai() dan net_begin() menyalakan radio. Membiarkannya berjalan asinkron
+ * di loop() bersama init NimBLE dan Wi-Fi berarti animasinya tersendat persis di
+ * satu-satunya kesempatan ia dilihat utuh. Saat layar bangun kembali splash TIDAK
+ * boleh diputar begini -- FIFO MAX30105 penuh dalam ratusan milidetik, dan
+ * menghentikan loop() selama itu akan membuang sampel PPG.
+ *
+ * Jaring pengaman waktunya bukan basa-basi: kalau timer penutup entah bagaimana
+ * tidak pernah jalan, tanpa batas ini jam berhenti di logo selamanya. */
+static void splash_tunggu(void) {
+  uint32_t batas = millis() + SPL_TOTAL_MS + 500;
+  while (s_splash_tampil && (int32_t)(millis() - batas) < 0) {
+    lv_timer_handler();
+    delay(1);
+  }
+  if (s_splash_tampil) {
+    Serial.println("[splash] BUG: timer penutup tidak pernah jalan -- dipaksa tutup");
+    splash_batal();
+  }
+}
+
 /* ================= Pembaruan isi ================= */
 
 /* true kalau teksnya benar-benar berubah. lv_label_set_text() selalu
@@ -982,6 +1280,30 @@ static void status_baris(void) {
     return;
   }
 
+  /* Arti tombol ditulis DI SINI, di baris yang sama dengan tanggal, dan ia
+   * mendahului tanggal saat ada yang menunggu ditekan (dokumen 14).
+   *
+   * Ini bukan hiasan: jam punya satu tombol dengan dua makna, dan penggunanya
+   * lansia. Dua tombol fisik lebih mahal daripada satu tombol yang layarnya
+   * menjelaskan diri -- tetapi hanya kalau layarnya benar-benar menjelaskan.
+   *
+   * Perhatikan tombolnya PADAM begitu titiknya terukur, termasuk saat yang
+   * mengukur adalah aplikasi lewat UKUR dan bukan tombolnya. Baris ini ikut
+   * padam pada putaran refresh berikutnya karena ia membaca jam_titik_armed()
+   * apa adanya. Tombol yang masih menyala untuk titik yang sudah terisi adalah
+   * kebohongan yang akan membuat pengguna menekannya lagi. */
+  if (jam_titik_armed()) {
+    snprintf(buf, sizeof(buf), "TEKAN: UKUR %u", (unsigned)jam_titik_index());
+    if (set_jika_beda(lbl_status, buf))
+      lv_obj_set_style_text_color(lbl_status, lv_color_hex(C_ISI), 0);
+    return;
+  }
+  if (jam_status() == AW_SESI_ARMED) {
+    if (set_jika_beda(lbl_status, "TEKAN: SELESAI MAKAN"))
+      lv_obj_set_style_text_color(lbl_status, lv_color_hex(C_ISI), 0);
+    return;
+  }
+
   struct tm t;
   if (!tm_now(&t)) {
     if (set_jika_beda(lbl_status, "--"))
@@ -1028,12 +1350,14 @@ static void refresh_cb(lv_timer_t *tm) {
    * wajah jam kembali seperti desainnya. */
   tepi_set(jam_sedang_mengukur() ? (int)jam_ukur_persen() : 0);
 
-  /* ---- pengukuran sesi yang menyala sendiri membangunkan layar ----
-   * Sejak v1.2 jam menyalakan sensor sendiri di t0+1 jam dan t0+2 jam, tanpa
-   * menunggu tombol. Tanpa baris ini, LED menyala pada jam yang layarnya gelap
-   * dan pengguna tidak punya cara apa pun mengetahui bahwa SEKARANG saatnya
-   * menempelkan jari -- pengukurannya lalu menyerah setelah 90 detik tanpa
-   * kontak dan sesi berakhir kosong.
+  /* ---- pengukuran yang tidak dimulai tombol membangunkan layar ----
+   * Alasannya berubah di v1.3 tetapi barisnya tetap perlu, dan justru lebih
+   * perlu. Yang membangunkan layar sekarang bukan lagi jadwal jam sendiri --
+   * jadwal itu dicabut -- melainkan UKUR dari aplikasi, yang bisa tiba kapan
+   * saja termasuk saat layar sedang gelap. Tanpa baris ini, LED menyala pada
+   * jam yang layarnya gelap dan pengguna tidak punya cara apa pun mengetahui
+   * bahwa SEKARANG saatnya menempelkan jari -- pengukurannya lalu menyerah
+   * setelah 90 detik tanpa kontak dan titik itu tetap kosong.
    *
    * Hanya pada TRANSISI mulai-mengukur, bukan selama pengukurannya berjalan:
    * kalau tidak, layar yang baru saja dimatikan pengguna menyala lagi setengah
@@ -1041,7 +1365,10 @@ static void refresh_cb(lv_timer_t *tm) {
    * kali menyala adalah pemberitahuan; menyala terus adalah tombol yang rusak.
    *
    * Cek manual dikecualikan: ia dimulai oleh tekanan tombol, jadi layarnya sudah
-   * pasti menyala dan pemakainya sudah pasti sedang melihat. */
+   * pasti menyala dan pemakainya sudah pasti sedang melihat. Hal yang sama
+   * berlaku untuk tombol ukur ARM_TITIK, dan itu tidak perlu dikecualikan
+   * terpisah -- layar yang sudah menyala membuat layar_set(true) tidak
+   * melakukan apa pun. */
   static bool ukur_lalu = false;
   bool ukur_kini = jam_sedang_mengukur();
   if (ukur_kini && !ukur_lalu && !jam_ukur_lokal()) layar_set(true);
@@ -1346,18 +1673,127 @@ static bool boot_umpan_balik_tolak(void) {
   }
 }
 
+static tombol_arti_t tombol_arti(void) {
+  if (jam_titik_armed())              return TBL_UKUR;
+  if (jam_status() == AW_SESI_ARMED)  return TBL_SELESAI_MAKAN;
+  if (jam_status() == AW_SESI_IDLE)   return TBL_CEK_MANUAL;
+  return TBL_MATI;                    /* RUNNING tanpa titik ter-ARM */
+}
+
 static void boot_aktifkan(void) {
-  /* Dua arti saja sekarang, turun dari tiga. Arti ketiga -- "mulai pengukuran
-   * terjadwal yang sudah jatuh tempo" -- hilang bersama mekanisme menunggu
-   * tombol: sejak v1.2 index 2 dan 3 menyala sendiri di jadwalnya, jadi selama
-   * sesi berjalan tombol ini memang tidak punya pekerjaan lagi dan
-   * jam_tekan_tombol() menolaknya dengan JAM_TOLAK_SESI_BERJALAN. */
-  bool idle = (jam_status() == AW_SESI_IDLE);
-  if (idle) jam_cek_manual();
-  else      jam_tekan_tombol();
+  /* TIGA arti sekarang, dan hanya SATU di antaranya dipilih di sini.
+   *
+   * Pemilihan antara "Ukur" dan "Selesai Makan" ada di dalam jam_tekan_tombol(),
+   * bukan di sini, dan itu bukan gaya melainkan syarat: sebuah ARM_TITIK bisa
+   * tiba lewat BLE dalam jeda antara baris ini membaca keadaan dan pengguna
+   * mengangkat jarinya, dan UI yang memilih sendiri akan mengukur titik yang
+   * salah (dokumen 13.4).
+   *
+   * Yang MASIH dipilih di sini cuma cek manual, dan itu memang bukan bagian
+   * protokol: ia fitur lokal yang hasilnya tidak pernah meninggalkan jam. Ia
+   * dipetakan ke satu-satunya keadaan yang tersisa -- IDLE tanpa titik ter-ARM --
+   * jadi ia tidak pernah bisa mencuri giliran dari jalur protokol mana pun. */
+  tombol_arti_t arti = tombol_arti();
+
+  if (arti == TBL_CEK_MANUAL) jam_cek_manual();
+  else                        jam_tekan_tombol();
 
   if (boot_umpan_balik_tolak()) return;
-  status_pesan(idle ? "CEK MANUAL" : "SELESAI MAKAN");
+
+  switch (arti) {
+    case TBL_UKUR:           status_pesan("MENGUKUR TITIK"); break;
+    case TBL_SELESAI_MAKAN:  status_pesan("SELESAI MAKAN");  break;
+    case TBL_CEK_MANUAL:     status_pesan("CEK MANUAL");     break;
+    default:                 status_pesan("SESI BERJALAN");  break;
+  }
+}
+
+
+/* ================= Konsol uji serial (dokumen 15) =================
+ * Menyuntik opcode Kontrol persis seperti aplikasi menulisnya, LEWAT ANTREAN
+ * YANG SAMA dengan tulisan BLE. Jalur yang sama itu syarat, bukan kenyamanan:
+ * memanggil rutin aw_jam langsung akan melewati handler-nya, sehingga cabang
+ * NAK dan idempotensi -- yang justru paling sering salah -- tidak pernah teruji.
+ *
+ * Ia ada karena satu sesi v1.3 tidak bisa diuji tanpa HP sama sekali: sejak jam
+ * berhenti menjadwalkan, SETIAP titik sesudah index 1 datang lewat UKUR atau
+ * ARM_TITIK. Tanpa konsol ini, satu-satunya cara memverifikasi ARM_TITIK
+ * bertahan melewati pemutusan daya adalah menjalankan aplikasi Flutter.
+ *
+ * Perintah (satu baris, diakhiri Enter):
+ *   arm [1|2]    ARM_SESI dengan sesiId uji ke-1 atau ke-2
+ *   batal        BATAL_SESI
+ *   mulai        MULAI_SESI  (jalankan dua kali untuk menguji idempotensinya)
+ *   ukur <idx>   UKUR index idx
+ *   titik <idx>  ARM_TITIK index idx
+ *   now          UKUR_SEKARANG
+ *   tombol       tekan tombol fisik (bukan BLE -- menguji jalur tombol)
+ *   status       cetak keadaan jam
+ *
+ * Satu sesi utuh tanpa HP:
+ *   arm -> ukur 0 -> tombol -> titik 2 -> tombol -> titik 3 -> tombol
+ */
+static const uint8_t SESI_UJI[2][16] = {
+  { 0xA1,0xA1,0xA1,0xA1, 0xA1,0xA1,0xA1,0xA1, 0xA1,0xA1,0xA1,0xA1, 0xA1,0xA1,0xA1,0xA1 },
+  { 0xB2,0xB2,0xB2,0xB2, 0xB2,0xB2,0xB2,0xB2, 0xB2,0xB2,0xB2,0xB2, 0xB2,0xB2,0xB2,0xB2 },
+};
+static uint8_t konsol_sesi = 0;      /* sesiId uji yang sedang dipakai */
+
+static void konsol_kirim(uint8_t op, bool bawa_sesi, bool bawa_index, uint8_t index) {
+  uint8_t buf[18];
+  uint8_t n = 0;
+  buf[n++] = op;
+  if (bawa_sesi)  { memcpy(&buf[n], SESI_UJI[konsol_sesi], 16); n += 16; }
+  if (bawa_index) buf[n++] = index;
+  if (!aw_ble_suntik_perintah(buf, n))
+    Serial.println("[konsol] antrean penuh");
+  else
+    Serial.printf("[konsol] -> opcode 0x%02X (%u byte)\n", op, (unsigned)n);
+}
+
+static void konsol_jalankan(char *baris) {
+  char *sp = strchr(baris, ' ');
+  int arg = 0;
+  if (sp) { *sp = 0; arg = atoi(sp + 1); }
+
+  if      (!strcmp(baris, "arm")) {
+    if (sp && (arg == 1 || arg == 2)) konsol_sesi = (uint8_t)(arg - 1);
+    Serial.printf("[konsol] sesi uji #%u\n", (unsigned)(konsol_sesi + 1));
+    konsol_kirim(AW_OP_ARM_SESI, true, false, 0);
+  }
+  else if (!strcmp(baris, "batal")) konsol_kirim(AW_OP_BATAL_SESI, true, false, 0);
+  else if (!strcmp(baris, "mulai")) konsol_kirim(AW_OP_MULAI_SESI, true, false, 0);
+  else if (!strcmp(baris, "ukur"))  konsol_kirim(AW_OP_UKUR, true, true, (uint8_t)arg);
+  else if (!strcmp(baris, "titik")) konsol_kirim(AW_OP_ARM_TITIK, true, true, (uint8_t)arg);
+  else if (!strcmp(baris, "now"))   konsol_kirim(AW_OP_UKUR_SEKARANG, false, false, 0);
+  else if (!strcmp(baris, "tombol")) {
+    /* Jalur tombol fisik, sengaja BUKAN lewat antrean: yang diuji di sini justru
+     * dispatcher satu-tombol-dua-makna, yang tidak punya opcode. */
+    Serial.println("[konsol] tombol fisik ditekan");
+    boot_aktifkan();
+  }
+  else if (!strcmp(baris, "status")) {
+    static const char *NAMA[] = { "IDLE", "ARMED", "RUNNING" };
+    Serial.printf("[konsol] sesi=%s  mengukur=%d  titik_armed=%d index=%u  "
+                  "t0=%lu  uptime=%lu  tertunda=%u\n",
+                  NAMA[jam_status() <= 2 ? jam_status() : 0],
+                  jam_sedang_mengukur() ? 1 : 0,
+                  jam_titik_armed() ? 1 : 0, (unsigned)jam_titik_index(),
+                  (unsigned long)jam_t0_uptime(), (unsigned long)jam_uptime(),
+                  (unsigned)jam_tertunda());
+  }
+  else if (baris[0]) Serial.printf("[konsol] tidak dikenal: \"%s\"\n", baris);
+}
+
+static void konsol_poll(void) {
+  static char buf[48];
+  static uint8_t n = 0;
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n') { buf[n] = 0; konsol_jalankan(buf); n = 0; continue; }
+    if (n < sizeof(buf) - 1) buf[n++] = c;
+  }
 }
 
 static void boot_poll(void) {
@@ -1465,6 +1901,7 @@ void setup() {
   disp_drv.hor_res = SCREEN_W;
   disp_drv.ver_res = SCREEN_H;
   disp_drv.flush_cb = my_disp_flush;
+  disp_drv.monitor_cb = spl_monitor;   /* hanya mencacah selama layar pembuka */
   disp_drv.draw_buf = &draw_buf;
   lv_disp_drv_register(&disp_drv);
 
@@ -1485,12 +1922,29 @@ void setup() {
   ppg_begin();
 
   build_wajah();
-  lv_scr_load(scr_wajah);
+  build_splash();
+  splash_mulai();
 
-  lv_timer_create(refresh_cb, 500, NULL);
-
+  /* Frame pertama digambar SEBELUM cahaya dinyalakan. Yang tampak di frame itu
+   * adalah latar rata tanpa satu pun unsur logo (semuanya masih opasitas nol),
+   * jadi layar terbuka dari gelap ke gelap -- tanpa kilatan isi RAM panel yang
+   * tersisa dari sebelum reset. */
   lv_timer_handler();
   ledcWrite(LCD_BL, LCD_BL_TERANG);
+
+  /* Splash diputar sampai habis di sini, bukan dibiarkan berjalan sendiri di
+   * loop(). Alasannya ada di splash_tunggu(). Konsekuensinya boot mundur
+   * ~SPL_TOTAL_MS, dan itu memang harga yang dibayar dengan sadar.
+   *
+   * refresh_cb sengaja dibuat SESUDAHNYA. Kalau ia sudah ada selama putaran
+   * splash, ia akan menyala satu kali di detik pertama -- yaitu sebelum
+   * jam_mulai() -- dan memanggil jam_status()/jam_snapshot() pada mesin sesi
+   * yang belum diinisialisasi. Kode lama tidak pernah menemui ini karena
+   * lv_timer_handler() cuma dipanggil sekali di sini. */
+  splash_tunggu();
+
+  lv_timer_create(refresh_cb, 500, NULL);
+  lv_timer_handler();
 
   /* Arming tombol PWR persis sealasan dengan arming tombol BOOT di bawah, dan
    * di sini keliru diamnya lebih mahal: tanpa baris ini, board yang menyala
@@ -1515,8 +1969,8 @@ void setup() {
   boot_level_lalu = boot_stabil_lvl;
   boot_siap       = (boot_stabil_lvl == HIGH);
   Serial.printf("[boot] tombol BOOT %s\n",
-                boot_siap ? "siap (klik = ukur yang jatuh tempo, tekan lama = "
-                            "cek manual / selesai makan)"
+                boot_siap ? "siap (satu tombol, artinya mengikuti keadaan: "
+                            "ukur titik / selesai makan / cek manual)"
                           : "masih ditahan -- lepaskan dulu");
 
   /* Paling akhir: UI sudah tampil sebelum radio mulai menyita CPU dan heap.
@@ -1536,6 +1990,7 @@ void setup() {
 
 void loop() {
   touch_poll();          /* tetap dibaca demi board yang sentuhannya sehat */
+  konsol_poll();         /* penyuntik opcode untuk uji tanpa HP (dokumen 15) */
   pwr_poll();            /* satu digitalRead; tombol mati harus selalu responsif */
   boot_poll();
 

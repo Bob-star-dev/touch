@@ -58,39 +58,110 @@
 #define UKUR_TANPA_KONTAK_MS  90000UL    /* 90 dtk tanpa kulit menempel   */
 #define UKUR_BATAS_KERAS_MS  300000UL    /* 5 menit, apa pun keadaannya   */
 
-/* ---------------- Jadwal titik ukur sesi (dokumen 12 & 12.1) ==========
- * Jam menjalankan sendiri index 2 pada t0+1 jam dan index 3 pada t0+2 jam.
- * Tidak ada lagi "menunggu tombol": jatuh tempo langsung menyalakan sensor.
+/* ---------------- Tidak ada jadwal lagi (dokumen 12, v1.3) ==========
+ * Sampai v1.2 berkas ini menjalankan sendiri index 2 di t0+1 jam dan index 3 di
+ * t0+2 jam. SELURUH penjadwal itu dicabut, dan satu sebab menjelaskan semuanya:
+ * jam tidak bertahan lebih dari ~50 menit menyala sedangkan satu sesi berdurasi
+ * lebih dari dua jam. Layarnya tidak bisa dipadamkan, dan layar itulah yang
+ * mendominasi anggaran daya -- bukan radio -- jadi light sleep pun tidak
+ * menolong. Satu-satunya tuas yang tersisa adalah memutus daya, dan itu memang
+ * yang dilakukan penggunanya: nyalakan jam, ukur satu titik, matikan lagi.
  *
- * Versi sebelumnya menunda pengukuran sampai tombol ditekan, dengan alasan
- * fisik yang masih benar -- MAX30102 hanya menghasilkan angka kalau ada jari
- * menempel, jadi pengukuran yang menyala saat jamnya tergeletak di meja akan
- * menyerah lewat UKUR_TANPA_KONTAK_MS dan mencatat UKUR_GAGAL. Konsekuensi itu
- * TIDAK hilang; ia diterima. Dokumen v1.2 bersifat normatif dan sisi Flutter-nya
- * sudah diuji terhadapnya, dan UKUR_GAGAL memang cara protokol ini menyatakan
- * "titik itu tidak punya sampel" -- aplikasi sudah tahu membacanya.
+ * Jam karena itu PASTI mati sebelum titik berikutnya jatuh tempo. Penjadwal yang
+ * tidak pernah bisa menyelesaikan tugasnya bukan cadangan yang lemah melainkan
+ * cadangan yang selalu salah, jadi ia dihapus, bukan dilemahkan. Yang
+ * menjadwalkan sekarang aplikasi, lewat UKUR dan ARM_TITIK.
  *
- * Tiga aturan dari dokumen 12.1 yang membentuk kode di bawah:
+ * JANGAN MEMASANGNYA LAGI "sebagai cadangan kalau HP tidak datang". Itu godaan
+ * yang disebut namanya di dokumen 15, dan jawabannya satu kalimat: jamnya sudah
+ * mati saat titiknya jatuh tempo.
  *
- *   1. Jadwal dibandingkan dengan uptime_s ABSOLUT milik t0, tidak pernah dari
- *      sisa waktu yang diakumulasikan sendiri -- sisa waktu hanyut tiap kali
- *      ada penundaan.
- *   2. Bitmask index baru menyala SESUDAH pengukuran tuntas, bukan saat ia
+ * YANG TERSISA dari inisiatif jam sendiri tepat satu: index 1. Dan itu BUKAN
+ * pelanggaran aturan di atas, karena aturannya "jam tidak pernah MENJADWALKAN",
+ * bukan "jam tidak pernah mengukur tanpa disuruh". Index 1 adalah akibat
+ * langsung sebuah peristiwa lokal -- tombol yang baru saja ditekan -- sekelas
+ * dengan jawaban atas UKUR_SEKARANG, bukan tenggat yang ditunggu.
+ *
+ * Bedanya menentukan, dan alasannya ada di pengguna: tombol "Selesai Makan" ada
+ * justru untuk keadaan ponsel tidak di tangan, dan itu keadaan paling lazim saat
+ * orang sedang makan. Kalau index 1 ikut menunggu UKUR dari aplikasi, tombol
+ * yang ditekan tanpa HP di dekatnya menghasilkan t0 TANPA pengukurannya, dan
+ * pengukuran itu baru terjadi saat HP tersambung -- bisa berjam-jam kemudian, di
+ * titik yang sudah bukan "baru selesai makan" lagi. Yang hilang bukan presisi
+ * melainkan artinya.
+ *
+ * Tiga aturan dari dokumen 12.1 yang tetap membentuk kode di bawah:
+ *
+ *   1. Bitmask index baru menyala SESUDAH pengukuran tuntas, bukan saat ia
  *      dimulai. Kalau dinyalakan di awal, titik yang terpotong ditandai "sudah"
  *      dan tidak pernah diulang.
- *   3. Ada penjaga "sedang mengukur" di depan seluruh jadwal, jadi titik ukur
- *      yang bertabrakan dengan UKUR_SEKARANG DITUNDA, bukan dibatalkan. Titik
- *      ukur sesi selalu menang karena ia tidak bisa diulang -- t0+1 jam cuma
- *      terjadi sekali -- sementara pindai atas permintaan bisa diminta lagi
- *      kapan saja. Asimetri nilai, bukan asimetri teknis.
+ *   2. Ada penjaga "sedang mengukur" di depan segalanya, jadi pengukuran yang
+ *      bertabrakan DITUNDA, bukan dibatalkan. Sejak v1.3 penjaga yang sama juga
+ *      melindungi UKUR dan penekanan tombol ukur, yang keduanya kini bisa datang
+ *      kapan saja.
+ *   3. Asimetri nilainya tetap ditulis walau barisnya tinggal satu: index 1
+ *      tidak bisa diulang, pindai atas permintaan bisa diminta lagi kapan saja.
  */
+
+/* ---------------- Dedup (sesiId, index) di RAM, dokumen 12 poin 4 ==========
+ * Sejak UKUR dilayani di ketiga status tanpa validasi sesi, tidak ada lagi yang
+ * mencegah satu titik diukur dua kali selain ini. Dua tombol di aplikasi bisa
+ * memicu perintah yang sama, dan ACK bisa hilang di udara.
+ *
+ * RAM, BUKAN NVS, dan itu bukan penghematan melainkan definisi: cakupannya
+ * memang satu masa hidup daya, jadi reboot yang menghapusnya adalah perilaku
+ * yang benar. Aplikasi tetap men-dedup dengan kunci yang sama, jadi yang dijaga
+ * di sini murni sensor dan baterai.
+ *
+ * sesiId BERBEDA ME-RESET bitmask, tidak pernah menolak perintahnya. Jam tidak
+ * tahu sesi mana yang sedang berjalan dan tidak boleh berpura-pura tahu.
+ *
+ * Lebarnya 256 bit, bukan 4, karena v1.3 melonggarkan batas index ke lebar byte
+ * penuh -- jadwal titik kini data sisi aplikasi, dan firmware tidak lagi berhak
+ * menebak berapa banyak titik yang boleh ada dalam satu sesi. 32 byte RAM. */
+static uint8_t s_dedup_sesi[16];
+static uint8_t s_dedup_bit[32];
+
+static bool dedup_cek(uint8_t index) {
+  return (s_dedup_bit[index >> 3] >> (index & 7)) & 1;
+}
+
+static void dedup_set(uint8_t index) {
+  s_dedup_bit[index >> 3] |= (uint8_t)(1 << (index & 7));
+}
+
+/* Menyelaraskan kunci dedup dengan sebuah sesi. true kalau bitmasknya baru saja
+ * di-reset karena sesinya berbeda. */
+static bool dedup_pakai_sesi(const uint8_t *sesi_id) {
+  if (memcmp(s_dedup_sesi, sesi_id, 16) == 0) return false;
+  memcpy(s_dedup_sesi, sesi_id, 16);
+  memset(s_dedup_bit, 0, sizeof(s_dedup_bit));
+  return true;
+}
 
 /* ---------------- Keadaan sesi ---------------- */
 static uint8_t  s_status = AW_SESI_IDLE;
 static uint8_t  s_sesi_id[16];
 static uint32_t s_arm_uptime = 0;
 static uint32_t s_t0_uptime  = 0;
-static uint8_t  s_index_selesai = 0;      /* bitmask index yang sudah TUNTAS diukur */
+
+/* Index 1 punya penandanya SENDIRI, terpisah dari bitmask dedup, dan pemisahan
+ * itu bukan duplikasi. Dokumen 12 poin 4 memerintahkan bit dedup menyala HANYA
+ * bila pengukurannya berhasil, supaya titik yang gagal masih bisa dicoba lagi --
+ * dan itu benar untuk UKUR dan tombol ukur, yang keduanya dipicu dari luar.
+ *
+ * Index 1 tidak dipicu dari luar. Ia dipicu putar_sesi() setiap iterasi loop,
+ * jadi bit yang tidak pernah menyala berarti sensor dinyalakan ulang tanpa henti
+ * selama sesi berjalan -- LED penuh pada perangkat yang umur nyalanya ~50 menit.
+ * Penandanya karena itu menyala pada KEDUA hasil, berhasil maupun gagal total,
+ * persis seperti di v1.2. Dokumen tidak membahas tabrakan ini; ini penyelesaian
+ * yang dipilih, dan ia menyimpang dari "hanya bila berhasil" dengan sadar. */
+static bool     s_idx1_selesai = false;
+
+/* Titik yang ter-ARM, cermin RAM dari catatan NVS (dokumen 5, v1.3). */
+static bool     s_titik_ada = false;
+static uint8_t  s_titik_index = 0;
+static uint8_t  s_titik_sesi[16];
 
 /* ---------------- Keadaan pengukuran ---------------- */
 static bool     s_ukur_aktif = false;
@@ -197,7 +268,16 @@ static void balas(uint8_t jenis, uint8_t payload) {
 }
 
 static void ack(uint8_t opcode) { balas(AW_EV_ACK, opcode); }
-static void nak(uint8_t kode)   { balas(AW_EV_NAK, kode);   }
+
+/* NAK dicetak, ACK tidak. Bukan simetri yang hilang melainkan perbedaan nilai:
+ * ACK adalah jalur normal dan mencetaknya cuma membanjiri konsol, sedangkan NAK
+ * selalu berarti sebuah perintah aplikasi TIDAK dikerjakan -- dan tanpa baris
+ * ini satu-satunya jejaknya adalah notifikasi BLE, yang tidak terlihat sama
+ * sekali saat menguji lewat konsol serial (dokumen 15). */
+static void nak(uint8_t kode) {
+  Serial.printf("[nak] 0x%02X\n", (unsigned)kode);
+  balas(AW_EV_NAK, kode);
+}
 
 /* ================= Paket Status (dokumen 8) ================= */
 static void kirim_status(void) {
@@ -312,12 +392,44 @@ static void ukur_selesai(bool lengkap) {
     return;
   }
 
-  /* Bitmask index baru menyala DI SINI, sesudah pengukurannya tuntas -- bukan
-   * saat ia dimulai (dokumen 12.1 aturan 2). Ia menyala pada KEDUA cabang di
-   * bawah, berhasil maupun gagal total: index yang sudah dicoba dan gagal
-   * memang tidak boleh dicoba lagi, kalau tidak putar_sesi() akan mengulangnya
-   * tanpa henti sampai sesinya berakhir. */
-  if (s_ukur_titik_sesi) s_index_selesai |= (uint8_t)(1 << s_ukur_index);
+  /* Penanda index 1 menyala pada KEDUA hasil -- lihat alasannya di deklarasi
+   * s_idx1_selesai. Hanya berlaku untuk sesi yang sedang RUNNING di jam ini. */
+  if (s_ukur_titik_sesi && s_ukur_index == 1 && s_status == AW_SESI_RUNNING &&
+      memcmp(s_ukur_sesi, s_sesi_id, 16) == 0)
+    s_idx1_selesai = true;
+
+  /* Bit dedup menyala DI SINI, sesudah pengukurannya tuntas (dokumen 12.1
+   * aturan 2) dan HANYA bila berhasil (dokumen 12 poin 4). Pengukuran yang gagal
+   * total tidak boleh mengunci titiknya: kalau bitnya menyala, percobaan ulang
+   * lewat UKUR maupun lewat tombol akan ditolak sebagai "sudah terisi" padahal
+   * tidak ada satu pun sampel yang keluar. */
+  if (s_ukur_titik_sesi && ada) {
+    dedup_pakai_sesi(s_ukur_sesi);
+    dedup_set(s_ukur_index);
+  }
+
+  /* Tombol ukur padam mengikuti KEBERHASILAN, bukan penekanan (dokumen 5).
+   *
+   * Perhatikan ini juga berlaku saat yang mengukur adalah aplikasi lewat UKUR,
+   * bukan tombolnya -- dan itu justru jalur yang paling lazim. Tanpa baris ini,
+   * pengguna mengukur dari aplikasi lalu menemukan tombol di jam masih menyala:
+   * ia akan menekannya juga, wajar, apalagi bagi pengguna lansia, dan satu siklus
+   * sensor terbuang di perangkat yang umur nyalanya ~50 menit. Lebih penting
+   * lagi, tombol yang menyala tetapi tidak menghasilkan apa-apa adalah kebohongan
+   * di layar jam. Menyala berarti "ada yang menunggu ditekan"; setelah titiknya
+   * terukur, tidak ada.
+   *
+   * Pengukuran yang GAGAL sengaja meninggalkannya menyala, sebagai percobaan
+   * ulang. UKUR_SEKARANG tidak pernah cocok di sini karena sesiId-nya nol dan
+   * s_ukur_titik_sesi sudah menyaringnya lebih dulu. */
+  if (s_ukur_titik_sesi && ada && s_titik_ada &&
+      s_titik_index == s_ukur_index &&
+      memcmp(s_titik_sesi, s_ukur_sesi, 16) == 0) {
+    s_titik_ada = false;
+    aw_titik_hapus();
+    Serial.printf("[titik] index %u terukur -- tombol ukur padam, catatan NVS dihapus\n",
+                  (unsigned)s_ukur_index);
+  }
 
   if (!ada) {
     /* Bila SEMUA metrik gagal, jangan kirim sampel -- catat UKUR_GAGAL dengan
@@ -338,16 +450,10 @@ static void ukur_selesai(bool lengkap) {
                   s_acc_bpm, s_acc_spo2, s_acc_gula, s_acc_sis, s_acc_dia);
   }
 
-  /* Sampel index 3 selesai -> kembali IDLE. Sampel yang belum di-ack tetap di
-   * buffer; kepulangan ke IDLE tidak menunggu konfirmasi aplikasi, karena
-   * seluruh siklus harus selesai walau HP tidak pernah tersambung sekali pun
-   * (dokumen 12). */
-  if (s_ukur_index == 3 && s_status == AW_SESI_RUNNING) {
-    s_status = AW_SESI_IDLE;
-    memset(s_sesi_id, 0, 16);
-    s_t0_uptime = 0;
-    s_index_selesai = 0;
-  }
+  /* TIDAK ADA lagi "index 3 selesai -> IDLE". Jam tidak tahu index berapa yang
+   * terakhir dalam sebuah sesi -- arti index milik aplikasi sejak v1.3, dan
+   * batasnya sudah dilonggarkan ke lebar byte penuh. RUNNING kini hanya berakhir
+   * lewat BATAL_SESI atau daya yang putus (dokumen 12). */
   kirim_status();
 }
 
@@ -428,15 +534,31 @@ static void ke_idle(void) {
   memset(s_sesi_id, 0, 16);
   s_t0_uptime = 0;
   s_arm_uptime = 0;
-  s_index_selesai = 0;
+  s_idx1_selesai = false;
+  /* Kunci dedup TIDAK disentuh: cakupannya satu masa hidup daya, bukan satu
+   * sesi (dokumen 12 poin 4). Membersihkannya di sini akan membuat UKUR yang
+   * datang sesudah BATAL_SESI mengukur ulang titik yang sudah terisi -- dan
+   * sejak v1.3 jam ada di IDLE hampir sepanjang sesi, jadi itu jalur biasa.
+   *
+   * ARM_TITIK juga tidak disentuh: ia sengaja hidup lebih lama daripada mesin
+   * status, karena penyalaan di tengah sesi selalu mendarat di IDLE. */
   kirim_status();
 }
 
-void jam_tekan_tombol(void) {
+/* "Selesai Makan": mencatat t0 dan memancarkan peristiwanya. Ini SEMANTIKNYA,
+ * bukan tombolnya -- MULAI_SESI memanggil fungsi ini, dan tombol fisik
+ * memanggilnya lewat jam_tekan_tombol() di bawah.
+ *
+ * Dipisah dari tombol fisik di v1.3 karena tombol fisik punya dua makna sekarang
+ * (dokumen 12 poin 5). Kalau MULAI_SESI memanggil dispatcher-nya, sebuah
+ * ARM_TITIK yang kebetulan tersimpan akan membuat perintah "tekan tombolmu" dari
+ * aplikasi mengukur sebuah titik alih-alih menetapkan t0. Dokumen 13.4 dan
+ * dokumen 5 saling menuntut hal yang berbeda di titik ini; yang dipertahankan
+ * adalah maksud keduanya -- MULAI_SESI tetap berarti "Selesai Makan", dan tetap
+ * tidak ada jalur kembar, karena keduanya bermuara di fungsi yang sama ini. */
+static void sesi_selesai_makan(void) {
   if (s_status == AW_SESI_RUNNING) {
-    /* Sesi sudah berjalan: t0 hanya boleh lahir sekali, dan index 2 serta 3
-     * sekarang berjalan sendiri di jadwalnya. Tombol tidak punya arti kedua
-     * lagi di status ini. */
+    /* Sesi sudah berjalan: t0 hanya boleh lahir sekali. */
     s_tolak = JAM_TOLAK_SESI_BERJALAN;
     return;
   }
@@ -464,20 +586,68 @@ void jam_tekan_tombol(void) {
    * benar-benar ditekan, dan itu kerusakan yang tidak bisa diperbaiki siapa pun
    * sesudahnya.
    *
-   * Yang juga TIDAK ada di sini: ukur_mulai(1, ...). Rutin tombol hanya mencatat
-   * t0, memancarkan peristiwanya, dan selesai. Index 1 diambil putar_sesi()
-   * pada iterasi berikutnya, lewat jalur yang sama dengan index 2 dan 3 -- dan
-   * itulah yang membuat tombol tidak pernah bisa gagal gara-gara sensor sibuk. */
-  s_status        = AW_SESI_RUNNING;
-  s_t0_uptime     = aw_uptime_s();
-  s_index_selesai = 0;
+   * Yang juga TIDAK ada di sini: ukur_mulai(1, ...). Rutin ini hanya mencatat
+   * t0, memancarkan peristiwanya, dan selesai. Index 1 diambil putar_sesi() pada
+   * iterasi berikutnya -- dan itulah yang membuat tombol tidak pernah bisa gagal
+   * gara-gara sensor sibuk. */
+  s_status       = AW_SESI_RUNNING;
+  s_t0_uptime    = aw_uptime_s();
+  s_idx1_selesai = false;
 
   /* Event tombol WAJIB masuk ring buffer seperti entri lain -- justru event
    * inilah yang paling sering terjadi saat HP tidak tersambung, dan ia adalah
-   * sumber tunggal t0 (dokumen 7). */
+   * sumber tunggal t0 (dokumen 7). Sejak v1.3 aplikasilah yang menstempel t0
+   * sebagai wall clock saat peristiwa ini TIBA; payloadnya tetap tanpa waktu,
+   * dan itu yang menjaga jam tidak punya dua sumber waktu. */
   aw_ring_tambah_event(AW_EV_TOMBOL_SELESAI_MAKAN, s_sesi_id, 0, s_t0_uptime);
   Serial.println("[sesi] RUNNING -- t0 dicatat, index 1 menyusul di putaran berikutnya");
   kirim_status();
+}
+
+/* Titik yang ter-ARM diukur sekarang. Dipanggil hanya dari jam_tekan_tombol(). */
+static void titik_ukur_sekarang(void) {
+  /* Sensor sibuk: DIABAIKAN, tidak diantrekan (dokumen 12.1). Tombolnya tetap
+   * menyala dan boleh ditekan lagi setelah sensor bebas -- mengantrekannya akan
+   * membuat pengukuran menyala beberapa detik setelah jari sudah diangkat. */
+  if (s_ukur_aktif) {
+    s_tolak = JAM_TOLAK_SEDANG_UKUR;
+    return;
+  }
+  /* Dedup dipakai di KEDUA jalur, di sini dan di handler UKUR (dokumen 12 poin
+   * 4). Menaruhnya hanya di handler UKUR menyisakan jalur tombol yang
+   * melewatinya sama sekali. Normalnya tombolnya sudah padam sebelum sampai
+   * sini; ini penjaga terakhir, bukan jalur utama. */
+  dedup_pakai_sesi(s_titik_sesi);
+  if (dedup_cek(s_titik_index)) {
+    s_titik_ada = false;
+    aw_titik_hapus();
+    Serial.printf("[titik] index %u sudah terukur di masa hidup daya ini -- "
+                  "tombol dipadamkan tanpa mengukur\n", (unsigned)s_titik_index);
+    kirim_status();
+    return;
+  }
+  if (!ppg_present()) {
+    s_tolak = JAM_TOLAK_SENSOR;
+    return;
+  }
+  if (baterai_kritis()) {
+    s_tolak = JAM_TOLAK_BATERAI;
+    return;
+  }
+  Serial.printf("[titik] tombol ukur ditekan untuk index %u\n", (unsigned)s_titik_index);
+  ukur_mulai(s_titik_index, s_titik_sesi, false);
+}
+
+/* SATU tombol fisik, DUA makna (dokumen 12 poin 5 & 13.4).
+ *
+ * Pemilihannya ada DI SINI, bukan di UI. Keadaan bisa berubah antara UI membaca
+ * dan pengguna menekan -- sebuah ARM_TITIK bisa tiba dalam jeda itu -- dan UI
+ * yang memilih sendiri berdasarkan bacaan lamanya akan menghasilkan pengukuran
+ * untuk titik yang salah. UI hanya membaca jam_titik_armed() untuk MENULISKAN
+ * LABEL, tidak pernah untuk memilih fungsi mana yang dipanggil. */
+void jam_tekan_tombol(void) {
+  if (s_titik_ada) { titik_ukur_sekarang(); return; }
+  sesi_selesai_makan();
 }
 
 void jam_cek_manual(void) {
@@ -528,39 +698,27 @@ static void putar_sesi(void) {
 
   if (s_status != AW_SESI_RUNNING) return;
 
-  /* Penjaga "sedang mengukur" (dokumen 12.1 aturan 3). Ia yang membuat titik
-   * ukur sesi DITUNDA alih-alih dibatalkan: iterasi ini dilewati, dan karena
-   * bitmask index baru menyala saat pengukuran tuntas, titik yang sama diperiksa
-   * lagi pada iterasi berikutnya sampai ia benar-benar terlaksana.
+  /* Penjaga "sedang mengukur" (dokumen 12.1 aturan 3). Ia yang membuat index 1
+   * DITUNDA alih-alih dibatalkan bila UKUR_SEKARANG kebetulan sedang berjalan:
+   * iterasi ini dilewati, dan karena penandanya baru menyala saat pengukuran
+   * tuntas, titik yang sama diperiksa lagi pada iterasi berikutnya sampai ia
+   * benar-benar terlaksana.
    *
    * Penundaannya tidak terlihat di aplikasi: aplikasi menormalkan waktu relatif
-   * tiap titik ke slot jadwalnya (0 / 3600 / 7200), karena label di layar
-   * menjanjikan "+1 jam" dan bukan "+1 jam 40 detik". Yang tidak boleh terjadi
+   * tiap titik ke slot jadwalnya, karena label di layar menjanjikan "saat tombol
+   * ditekan" dan bukan "empat puluh detik sesudahnya". Yang tidak boleh terjadi
    * bukan penundaannya, melainkan titiknya hilang. */
   if (s_ukur_aktif) return;
 
-  /* Perbandingan memakai uptime_s ABSOLUT milik t0, tidak pernah sisa waktu
-   * yang diakumulasikan sendiri -- sisa waktu hanyut tiap kali ada penundaan
-   * (dokumen 12). */
-  if (!(s_index_selesai & (1 << 1))) {
-    /* Index 1 ada DI SINI, bukan di dalam jam_tekan_tombol(). Lihat alasannya
-     * di sana: tombol tidak boleh bisa gagal gara-gara sensor sibuk. */
-    ukur_mulai(1, s_sesi_id, false);
-    return;
-  }
-  if (!(s_index_selesai & (1 << 2)) && skrg >= s_t0_uptime + AW_JADWAL_IDX2_S) {
-    Serial.println("[sesi] index 2 jatuh tempo (t0+1 jam)");
-    ukur_mulai(2, s_sesi_id, false);
-    return;
-  }
-  if (!(s_index_selesai & (1 << 3)) && skrg >= s_t0_uptime + AW_JADWAL_IDX3_S) {
-    /* Kepulangan ke IDLE TIDAK dilakukan di sini melainkan di ukur_selesai(),
-     * saat sampel index 3 benar-benar tuntas -- memulangkannya sekarang akan
-     * membuang sesi yang pengukuran terakhirnya baru saja dimulai. */
-    Serial.println("[sesi] index 3 jatuh tempo (t0+2 jam)");
-    ukur_mulai(3, s_sesi_id, false);
-    return;
-  }
+  /* Dan ini SELURUH isi penjadwal sekarang: index 1, dan hanya index 1.
+   *
+   * Index 1 ada DI SINI, bukan di dalam rutin tombol. Rutin tombol hanya
+   * mencatat t0, memancarkan peristiwanya, dan selesai -- itulah yang membuat
+   * tombol tidak pernah bisa gagal gara-gara sensor sibuk (dokumen 12.1).
+   *
+   * Tidak ada apa pun di bawah baris ini, dan tidak boleh ada. Lihat kotak di
+   * kepala berkas soal kenapa t0+3600 dan t0+7200 dicabut. */
+  if (!s_idx1_selesai) ukur_mulai(1, s_sesi_id, false);
 }
 
 /* ================= Perintah dari aplikasi (dokumen 5) ================= */
@@ -624,8 +782,27 @@ static void jalankan_perintah(const aw_perintah_t *p) {
       memcpy(s_sesi_id, arg, 16);
       s_status = AW_SESI_ARMED;
       s_arm_uptime = aw_uptime_s();
-      s_index_selesai = 0;
+      s_idx1_selesai = false;
       s_t0_uptime = 0;
+
+      /* ARM_SESI MENGHAPUS titik yang ter-ARM (dokumen 12 poin 5), di RAM
+       * maupun NVS. Ini kebalikan dari yang disarankan asimetri dokumen 12.1
+       * ("titik ukur selalu menang"), dan alasannya harus dibaca sampai habis
+       * sebelum diubah.
+       *
+       * Aplikasi hanya mengizinkan satu sesi aktif pada satu waktu, dan
+       * ARM_TITIK baru dikirim setelah t0 ada -- saat itu jam sudah RUNNING,
+       * bukan ARMED. Maka satu-satunya cara ARM_SESI dan ARM_TITIK bertemu
+       * adalah: ARM_TITIK itu milik sesi yang SUDAH BERAKHIR, dan BATAL_SESI
+       * penutupnya tidak sampai karena jam sedang mati. Membiarkannya menang
+       * berarti tombol basi milik sesi mati mencuri t0 sesi yang hidup, lalu
+       * mengirim sampel yang di aplikasi tidak jatuh ke mana-mana -- yang
+       * hilang justru yang tidak bisa diulang. */
+      if (s_titik_ada) {
+        s_titik_ada = false;
+        aw_titik_hapus();
+        Serial.println("[titik] ARM_SESI menghapus titik ter-ARM milik sesi lama");
+      }
       ack(op);
       kirim_status();
       Serial.println("[sesi] ARMED -- tombol \"Selesai Makan\" aktif");
@@ -644,19 +821,93 @@ static void jalankan_perintah(const aw_perintah_t *p) {
     }
 
     case AW_OP_UKUR: {
+      /* SATU-SATUNYA cara sebuah titik sesi terukur sejak v1.3 (dokumen 5).
+       * Sampai v1.2 ia hanya dipakai untuk baseline index 0; sejak jam berhenti
+       * menjadwalkan, SETIAP titik datang lewat opcode ini. Bentuk paketnya
+       * tidak berubah sama sekali -- ia sejak awal berarti "ukur titik index N
+       * milik sesi S, sekarang"; yang berubah hanya siapa yang memicunya.
+       *
+       * DUA PENJAGA v1.2 DICABUT DI SINI, dan keduanya JANGAN dikembalikan:
+       *
+       *   status harus bukan IDLE  -> dicabut
+       *   sesiId harus cocok       -> dicabut
+       *
+       * Keduanya benar di v1.2 dan salah di v1.3. Setelah jam dimatikan di
+       * antara titik ukur -- yang memang pola pemakaiannya -- ia SELALU ada di
+       * IDLE dan SELALU sudah lupa sesiId-nya, jadi setiap titik sesudah yang
+       * pertama akan di-NAK. Keduanya akan terlihat seperti validasi yang
+       * hilang; keduanya adalah v1.2 yang sudah tidak berlaku (dokumen 15).
+       * Yang memvalidasi sesi adalah aplikasi, satu-satunya yang tahu sesi apa
+       * yang sedang berjalan.
+       *
+       * Batas index juga dilonggarkan ke lebar byte penuh: jadwal titik kini
+       * data sisi aplikasi, dan firmware tidak berhak menebak berapa titik yang
+       * boleh ada dalam satu sesi. */
       if (narg < 17) { nak(AW_NAK_PAYLOAD_INVALID); return; }
-      /* Jam hanya melayani UKUR dalam status ARMED atau RUNNING; permintaan
-       * yang tiba selagi IDLE ditolak (dokumen 5). */
-      if (s_status == AW_SESI_IDLE) { nak(AW_NAK_BELUM_ARM); return; }
-      if (!sesi_cocok(arg))         { nak(AW_NAK_SESI_TAK_DIKENAL); return; }
       uint8_t index = arg[16];
-      if (index > 3) { nak(AW_NAK_PAYLOAD_INVALID); return; }
+
+      /* sesiId dari payload diteruskan APA ADANYA ke paket Sampel, tidak pernah
+       * s_sesi_id: yang terakhir itu biasanya kosong sekarang. Yang dicabut
+       * adalah sesiId sebagai IZIN; yang tersisa adalah sesiId sebagai KUNCI
+       * DEDUP. */
+      if (dedup_pakai_sesi(arg))
+        Serial.println("[dedup] sesiId baru -- bitmask direset");
+
+      if (dedup_cek(index)) {
+        /* IDEMPOTEN per (sesiId, index) dalam satu masa hidup daya. Dua tombol
+         * bisa memicu perintah yang sama dan ACK bisa hilang di udara; aplikasi
+         * sudah men-dedup dengan kunci yang sama, jadi ini murni penghematan
+         * sensor dan baterai -- yang mahal di perangkat berumur nyala ~50 menit. */
+        ack(op);
+        Serial.printf("[dedup] index %u sudah terukur di masa hidup daya ini -- "
+                      "di-ACK lalu diabaikan\n", (unsigned)index);
+        return;
+      }
+
       uint8_t halangan = halangan_ukur();
       if (halangan) { nak(halangan); return; }
       ack(op);
-      /* Bitmask TIDAK dinyalakan di sini -- ukur_selesai() yang menyalakannya
-       * setelah pengukurannya tuntas (dokumen 12.1 aturan 2). */
-      ukur_mulai(index, s_sesi_id, false);
+      /* Bit dedup TIDAK dinyalakan di sini -- ukur_selesai() yang menyalakannya
+       * setelah pengukurannya tuntas, dan hanya bila berhasil (dokumen 12.1
+       * aturan 2 dan dokumen 12 poin 4). */
+      ukur_mulai(index, arg, false);
+      return;
+    }
+
+    case AW_OP_ARM_TITIK: {
+      /* Menyalakan tombol ukur fisik untuk SATU titik (dokumen 5, v1.3).
+       *
+       * Ia ada karena jam yang baru dinyalakan tidak tahu ia sedang mengukur
+       * titik yang mana -- pengetahuan yang tidak bisa ia simpulkan sendiri
+       * setelah dimatikan. Polanya mengikuti ARM_SESI persis: sebelum di-ARM,
+       * menekan tombolnya tidak menghasilkan apa-apa.
+       *
+       * TIDAK ADA WAKTU di payloadnya, dan itu disengaja. Rancangan pertamanya
+       * membawa 2B detik_tunda; itu dibuang sebelum implementasi karena
+       * penundaan tidak pernah selamat melewati mati-hidup, dan mati-hidup
+       * adalah keadaan normal di v1.3. Jam tidak bisa tahu berapa lama ia mati,
+       * jadi penundaan yang belum matang harus dibuang saat boot -- dan
+       * aplikasi harus mengirim ulang begitu jam menyala. Karena ARM_TITIK
+       * sama-sama butuh koneksi seperti UKUR, aplikasi mengirimnya saat titiknya
+       * JATUH TEMPO, bukan di awal sesi.
+       *
+       * Tidak memeriksa status sesi sama sekali: ARM_TITIK boleh masuk di status
+       * mana pun dan tidak menyentuh mesin status (dokumen 12). IDLE justru yang
+       * paling lazim. */
+      if (narg < 17) { nak(AW_NAK_PAYLOAD_INVALID); return; }
+
+      /* Yang baru menimpa yang lama, di RAM maupun NVS. Hanya satu titik ter-ARM
+       * pada satu waktu; tidak ada keadaan setengah jalan yang perlu dijaga.
+       * aw_titik_set() sendiri membandingkan dulu, jadi ARM_TITIK berulang
+       * dengan isi yang sama tidak menyentuh flash (dokumen 11). */
+      memcpy(s_titik_sesi, arg, 16);
+      s_titik_index = arg[16];
+      s_titik_ada   = true;
+      aw_titik_set(s_titik_sesi, s_titik_index);
+      ack(op);
+      kirim_status();
+      Serial.printf("[titik] ARM_TITIK index %u -- tombol ukur menyala, tersimpan di NVS\n",
+                    (unsigned)s_titik_index);
       return;
     }
 
@@ -671,9 +922,16 @@ static void jalankan_perintah(const aw_perintah_t *p) {
        * pencacah yang sama.
        *
        * Peristiwanya TIDAK BOLEH dibedakan dari tombol fisik: tidak ada flag
-       * "dari aplikasi", dan karena itu di sini dipanggil jam_tekan_tombol()
-       * yang sudah ada, bukan salinan jalurnya. Jalur kembar adalah cara paling
-       * pasti membuat keduanya lambat laun berbeda. */
+       * "dari aplikasi", dan karena itu di sini dipanggil rutin yang sudah ada,
+       * bukan salinan jalurnya. Jalur kembar adalah cara paling pasti membuat
+       * keduanya lambat laun berbeda.
+       *
+       * Yang dipanggil adalah sesi_selesai_makan(), BUKAN jam_tekan_tombol().
+       * Sejak v1.3 yang kedua itu dispatcher satu-tombol-dua-makna, dan sebuah
+       * ARM_TITIK yang kebetulan tersimpan akan membuat perintah "tekan
+       * tombolmu" dari aplikasi mengukur titik alih-alih menetapkan t0. Tidak
+       * ada jalur kembar yang lahir dari sini: tombol fisik bermuara di fungsi
+       * yang sama persis. */
       if (narg < 16) { nak(AW_NAK_PAYLOAD_INVALID); return; }
 
       if (s_status == AW_SESI_RUNNING) {
@@ -697,7 +955,7 @@ static void jalankan_perintah(const aw_perintah_t *p) {
       if (baterai_kritis()) { nak(AW_NAK_BATERAI_RENDAH); return; }
 
       ack(op);
-      jam_tekan_tombol();
+      sesi_selesai_makan();
       return;
     }
 
@@ -867,19 +1125,30 @@ static void putar_pengirim(void) {
 /* ================= API publik ================= */
 void jam_mulai(void) {
   /* Urutan ini tidak boleh dibalik (dokumen 13.4). */
-  aw_store_begin();          /* NVS, boot_id++, muat ring tanpa dibersihkan */
+  aw_store_begin();          /* NVS, boot_id++, muat ring, muat ARM_TITIK */
 
-  /* Reboot saat RUNNING mengakhiri sesi: uptime_s kembali nol dan t0 lama
-   * tidak bisa dibandingkan lagi. Sampel yang terlanjur ada tetap di buffer
-   * dengan boot_id lamanya, dan aplikasi menutup sesi itu sebagai tidak
-   * lengkap. Jangan mencoba melanjutkan sesi lintas boot -- tanpa RTC itu
-   * tidak mungkin, dan yang dihasilkan hanya data yang tampak sah tetapi
-   * salah (dokumen 12 & 15). */
+  /* ARM_TITIK dicerminkan ke RAM SEBELUM status dipaksa IDLE, karena justru
+   * itulah keadaan yang v1.3 rancang: jam yang baru dinyalakan di tengah sesi
+   * selalu mendarat di IDLE, dan tombol ukurnya harus sudah menyala di frame
+   * pertama tanpa aplikasi mengirim apa pun (dokumen 13.4). Melewatkan ini
+   * menghasilkan bug yang gejalanya kebalikan dari yang dicari: tombol mati
+   * justru saat ia paling dibutuhkan. */
+  s_titik_ada = aw_titik_ada();
+  if (s_titik_ada) aw_titik_get(s_titik_sesi, &s_titik_index);
+
+  /* Reboot mengembalikan jam ke IDLE, dan sampel lama tetap di buffer dengan
+   * boot_id lamanya. Sejak v1.3 ini KEADAAN NORMAL YANG DIHARAPKAN, bukan sesi
+   * yang gagal: sesinya tetap hidup di aplikasi dan titik berikutnya masih bisa
+   * diukur. Tetap jangan mencoba melanjutkan sesi lintas boot di sini -- bukan
+   * lagi karena mustahil tanpa RTC, melainkan karena tidak ada yang perlu
+   * dilanjutkan; yang mengingat sesi itu aplikasi (dokumen 12 & 15). */
   s_status = AW_SESI_IDLE;
   memset(s_sesi_id, 0, 16);
   s_t0_uptime = 0;
   s_arm_uptime = 0;
-  s_index_selesai = 0;
+  s_idx1_selesai = false;
+  memset(s_dedup_sesi, 0, 16);
+  memset(s_dedup_bit, 0, sizeof(s_dedup_bit));
 
   aw_ble_begin();
 
@@ -989,7 +1258,10 @@ bool     jam_terhubung(void)         { return aw_ble_terhubung(); }
 bool     jam_siap_notifikasi(void)   { return aw_ble_siap_notifikasi(); }
 bool     jam_ada_anchor(void)        { return aw_anchor_boot_ini(); }
 
-uint8_t  jam_ukur_index(void)        { return s_ukur_index; }
+bool     jam_titik_armed(void)       { return s_titik_ada; }
+uint8_t  jam_titik_index(void)       { return s_titik_index; }
+
+uint8_t  jam_ukur_index(void)        { return s_ukur_index; }  /* lebar byte penuh sejak v1.3 */
 uint16_t jam_ukur_detak(void)        { return s_ukur_detak; }
 uint16_t jam_ukur_detak_perlu(void)  { return UKUR_MIN_DETAK; }
 

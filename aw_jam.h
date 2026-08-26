@@ -1,7 +1,7 @@
 /*
  * AsaWatch -- mesin status sesi, rutin pengukuran, dan pengirim buffer.
  *
- * Dokumen bagian 5, 12, 13, dan 16. Ini "logika jam"-nya, dan sengaja tetap
+ * Dokumen bagian 5, 12, 13, dan 16 -- protokol kawat v1.3. Ini "logika jam"-nya, dan sengaja tetap
  * setipis mungkin: verdict, kualitas respons, waktu pemulihan, tren, "lonjakan"
  * -- semuanya dihitung di aplikasi dan tidak pernah disimpan di sini. Jam
  * adalah sensor + buffer + pencacah (dokumen 1). Kalau sebuah fitur terasa
@@ -31,27 +31,41 @@ void jam_putar(void);
  * Memadamkan sensor dan memaksa ring buffer tersimpan ke NVS.
  *
  * Ia TIDAK mengirim apa pun lewat BLE dan TIDAK mencatat event apa pun:
- * protokol v1.2 tidak punya jenis peristiwa "dimatikan" (dokumen 18), dan
+ * protokol v1.3 tidak punya jenis peristiwa "dimatikan" (dokumen 18), dan
  * mengarang satu di sini akan membuat firmware menyimpang dari dokumen yang
  * sisi Flutter-nya sudah diuji. Aplikasi mengetahui jam mati dengan cara yang
  * memang sudah dirancang: boot_id yang naik pada koneksi berikutnya. */
 void jam_siap_mati(void);
 
-/* Tombol utama jam -- "Selesai Makan", sumber tunggal t0 (dokumen 7).
+/* SATU tombol fisik, DUA makna (dokumen 12 poin 5 & 13.4, v1.3).
  *
- *   IDLE     -> tidak menghasilkan apa-apa selain umpan balik "belum di-ARM"
- *   ARMED    -> mencatat t0 dan memancarkan TOMBOL_SELESAI_MAKAN
- *   RUNNING  -> ditolak dengan JAM_TOLAK_SESI_BERJALAN; t0 hanya lahir sekali,
- *               dan index 1..3 berjalan sendiri di jadwalnya
+ * Artinya ditentukan keadaan jam, dan PEMILIHANNYA ADA DI DALAM aw_jam, bukan di
+ * UI:
  *
- * Ia TIDAK menyalakan sensor. Rutin ini hanya mencatat t0 dan memancarkan
- * peristiwanya; index 1 diambil putar_sesi() pada iterasi berikutnya, lewat
- * jalur yang sama dengan index 2 dan 3. Itulah yang membuat tombol tidak pernah
- * bisa gagal gara-gara sensor sedang sibuk (dokumen 12.1).
+ *   ada ARM_TITIK  -> "Ukur": titik itu diukur sekarang, di status apa pun --
+ *                     termasuk IDLE, yang justru paling lazim karena jam baru
+ *                     saja dinyalakan kembali di tengah sesi
+ *   ARMED          -> "Selesai Makan": mencatat t0, memancarkan peristiwanya
+ *   RUNNING        -> ditolak dengan JAM_TOLAK_SESI_BERJALAN; t0 lahir sekali
+ *   IDLE           -> umpan balik "belum di-ARM"
  *
- * Opcode MULAI_SESI (0x09) memanggil fungsi INI, bukan salinannya: bagi seluruh
- * protokol, tombol fisik dan tombol dari aplikasi adalah peristiwa yang sama
- * dan tidak boleh bisa dibedakan.
+ * UI TIDAK BOLEH memanggil dua fungsi berbeda berdasarkan tebakannya sendiri.
+ * Keadaan bisa berubah antara UI membaca dan pengguna menekan -- sebuah
+ * ARM_TITIK bisa tiba dalam jeda itu -- dan yang dihasilkan adalah pengukuran
+ * untuk titik yang salah. UI hanya membaca jam_titik_armed() untuk MENULISKAN
+ * LABEL.
+ *
+ * Pada jalur "Selesai Makan" ia TIDAK menyalakan sensor: rutinnya hanya mencatat
+ * t0 dan memancarkan peristiwanya, dan index 1 diambil putar_sesi() pada iterasi
+ * berikutnya. Itulah yang membuat tombol tidak pernah bisa gagal gara-gara
+ * sensor sedang sibuk (dokumen 12.1). Pada jalur "Ukur" sebaliknya: sensor sibuk
+ * membuat tekanan itu DIABAIKAN, tidak diantrekan, dan tombolnya tetap menyala.
+ *
+ * Opcode MULAI_SESI (0x09) TIDAK memanggil fungsi ini melainkan rutin "Selesai
+ * Makan" yang sama persis di baliknya -- kalau ia memanggil dispatcher ini,
+ * ARM_TITIK yang tersimpan akan membuat perintah dari aplikasi mengukur titik
+ * alih-alih menetapkan t0. Bagi protokol, tombol fisik dan tombol dari aplikasi
+ * tetap peristiwa yang sama dan tetap tidak bisa dibedakan.
  *
  * Lihat jam_umpan_balik_ditolak() untuk cara membaca penolakannya. */
 void jam_tekan_tombol(void);
@@ -74,17 +88,30 @@ bool jam_ukur_lokal(void);
 /* ---- Pembaca untuk UI. Semuanya murni RAM dan murah. ---- */
 uint8_t  jam_status(void);             /* aw_sesi_t: 0 IDLE, 1 ARMED, 2 RUNNING */
 bool     jam_sedang_mengukur(void);
-uint32_t jam_t0_uptime(void);          /* 0 bila belum RUNNING                  */
+/* 0 bila belum RUNNING. INFORMASIONAL SAJA sejak v1.3: t0 yang mengikat hidup
+ * di aplikasi sebagai wall clock. Masih berguna untuk menampilkan "sesi dimulai
+ * sekian menit lalu" DALAM MASA HIDUP DAYA INI; jangan membangun jadwal apa pun
+ * di atasnya, dan jangan menampilkan hitung mundur ke titik berikutnya -- jam
+ * tidak tahu kapan titik berikutnya jatuh tempo, dan biasanya sudah mati saat
+ * itu tiba (dokumen 14). */
+uint32_t jam_t0_uptime(void);
 uint32_t jam_uptime(void);
 uint8_t  jam_tertunda(void);           /* entri belum di-ack                    */
 bool     jam_terhubung(void);
 bool     jam_siap_notifikasi(void);    /* terhubung DAN dilanggani              */
 bool     jam_ada_anchor(void);
 
+/* ---- Titik yang ter-ARM (v1.3) ----
+ * HANYA untuk menuliskan label tombol di layar (dokumen 12 poin 5 & 14). Jangan
+ * dipakai untuk memilih fungsi mana yang dipanggil saat tombol ditekan -- lihat
+ * jam_tekan_tombol(). jam_titik_index() hanya berarti bila jam_titik_armed(). */
+bool     jam_titik_armed(void);
+uint8_t  jam_titik_index(void);
+
 /* ---- Pembaca khusus layar "sedang mengukur" ----
  * Dengan sensor sungguhan satu pengukuran makan puluhan detik dan pengguna
  * harus diam; itu perlu tampilannya sendiri, bukan sekadar ikon (dokumen 14). */
-uint8_t  jam_ukur_index(void);         /* 0..3, berlaku saat sedang mengukur    */
+uint8_t  jam_ukur_index(void);         /* lebar byte penuh sejak v1.3           */
 uint16_t jam_ukur_detik(void);         /* lama pengukuran berjalan              */
 /* Detak yang sudah tercacah dan yang dibutuhkan. Inilah gerbang sebenarnya --
  * pengukuran tidak lagi dibatasi waktu, jadi kemajuan yang ditampilkan ke

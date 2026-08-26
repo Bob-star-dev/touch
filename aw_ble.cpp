@@ -479,6 +479,15 @@ void aw_ble_putar(void) {
 }
 
 /* ---------------- Perintah masuk ---------------- */
+bool aw_ble_suntik_perintah(const uint8_t *data, uint8_t panjang) {
+  if (!s_antrean) return false;
+  aw_perintah_t p;
+  if (panjang > AW_MAKS_PERINTAH) panjang = AW_MAKS_PERINTAH;
+  p.panjang = panjang;
+  memcpy(p.data, data, panjang);
+  return xQueueSend(s_antrean, &p, 0) == pdTRUE;
+}
+
 bool aw_ble_ambil_perintah(aw_perintah_t *out) {
   if (!s_antrean) return false;
   return xQueueReceive(s_antrean, out, 0) == pdTRUE;

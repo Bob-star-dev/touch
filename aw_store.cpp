@@ -20,6 +20,7 @@ uint32_t aw_uptime_s(void) {
 #define K_ANCHOR      "anchor"
 #define K_ANCHORED    "anchored"
 #define K_KALIB       "kalib"
+#define K_TITIK       "titik"
 
 /* Blob ring dibubuhi magic + versi. Kalau tata letak aw_entri_t berubah (mis.
  * field baru ditambahkan), blob lama dibuang alih-alih dibaca sebagai sampah:
@@ -58,24 +59,62 @@ typedef struct {
   int16_t offset_dia;
 } kalib_t;
 
+/* Titik yang ter-ARM (v1.3). Disimpan sebagai blob supaya sesiId dan index
+ * tidak pernah bisa terpisah separuh jalan. */
+typedef struct {
+  uint8_t valid;
+  uint8_t index_;
+  uint8_t sesi_id[16];
+} titik_t;
+
 static Preferences  s_nvs;
 static bool         s_nvs_ok = false;
 static ring_blob_t  s_ring;
 static anchored_t   s_anchored;
 static kalib_t      s_kalib;
+static titik_t      s_titik;
 static uint16_t     s_boot_id = 0;
 static bool         s_anchor_boot_ini = false;
 static bool         s_flag_penuh = false;
 
-/* Tulis flash ditunda: dokumen 11. Satu sesi menghasilkan belasan perubahan dan
- * tidak ada satu pun yang perlu tersimpan dalam milidetik yang sama. */
+/* ---- Tulis flash: ditunda untuk ack, SEKETIKA untuk data baru (dokumen 11) ----
+ *
+ * Jeda 3 detik itu ada supaya pengurasan 64 entri tidak menjadi 64 penulisan
+ * berturut-turut, dan yang datang berombongan memang ack. Tetapi jedanya
+ * ASIMETRIS, dan sejak v1.3 asimetrinya menentukan:
+ *
+ *   entri baru (sampel/peristiwa)  -> hilang PERMANEN kalau daya putus
+ *   ack (entri dihapus)            -> entrinya terkirim ulang, aplikasi men-dedup
+ *
+ * Pola pemakaian yang dikunci v1.3 adalah nyalakan jam, ukur satu titik,
+ * MATIKAN LAGI. Tidak ada alasan bagi siapa pun menunggu sesudah pengukurannya
+ * selesai, jadi daya yang putus di dalam jendela 3 detik itu bukan kasus tepi
+ * melainkan yang diharapkan terjadi. Yang hilang adalah titik ukur yang TIDAK
+ * BISA DIULANG -- t0+1 jam cuma terjadi sekali -- dan hilangnya tidak
+ * menghasilkan gejala apa pun selain titik yang tetap kosong: di aplikasi ia
+ * terlihat persis seperti sensor yang gagal atau pengguna yang lupa. Tidak ada
+ * yang akan tahu itu bug.
+ *
+ * Biayanya sekitar lima penulisan tambahan per hari. Kalau suatu saat ada yang
+ * menyeragamkan kedua jalur "supaya rapi", ia menghapus perlindungan ini tanpa
+ * satu pun gejala. */
 #define JEDA_SIMPAN_MS  3000
 static bool     s_kotor = false;
 static uint32_t s_kotor_ms = 0;
 
+static void tulis_ring(void);
+
+/* Perubahan yang boleh menunggu: ack, penanda terkirim, antre ulang. */
 static void tandai_kotor(void) {
   s_kotor = true;
   s_kotor_ms = millis();
+}
+
+/* Perubahan yang membawa DATA BARU. Tidak boleh menunggu. */
+static void tandai_kotor_segera(void) {
+  s_kotor = true;
+  s_kotor_ms = millis();
+  tulis_ring();
 }
 
 /* ---------------- Init ---------------- */
@@ -83,6 +122,7 @@ void aw_store_begin(void) {
   memset(&s_ring, 0, sizeof(s_ring));
   memset(&s_anchored, 0, sizeof(s_anchored));
   memset(&s_kalib, 0, sizeof(s_kalib));
+  memset(&s_titik, 0, sizeof(s_titik));
   s_ring.magic    = RING_MAGIC;
   s_ring.next_seq = 1;
   s_ring.next_ord = 1;
@@ -125,6 +165,12 @@ void aw_store_begin(void) {
   size_t nk = s_nvs.getBytes(K_KALIB, &s_kalib, sizeof(s_kalib));
   if (nk != sizeof(s_kalib)) memset(&s_kalib, 0, sizeof(s_kalib));
 
+  /* ARM_TITIK dimuat di sini, dan LUPA MEMUATNYA adalah bug v1.3 yang gejalanya
+   * persis kebalikan dari yang dicari: tombol ukur justru mati pada penyalaan di
+   * tengah sesi -- saat ia paling dibutuhkan (dokumen 13.4 & 15). */
+  size_t nt = s_nvs.getBytes(K_TITIK, &s_titik, sizeof(s_titik));
+  if (nt != sizeof(s_titik)) memset(&s_titik, 0, sizeof(s_titik));
+
   /* Disalin ke RAM saat boot justru karena membacanya dari NVS di dalam
    * callback onRead terlarang (dokumen 4 & 13.1). */
   s_anchor_boot_ini = aw_boot_punya_anchor(s_boot_id);
@@ -133,6 +179,9 @@ void aw_store_begin(void) {
   aw_ring_antre_ulang_semua();
 
   int tertunda = aw_ring_tertunda();
+  if (s_titik.valid)
+    Serial.printf("[store] ARM_TITIK selamat: index %u -- tombol ukur menyala\n",
+                  (unsigned)s_titik.index_);
   Serial.printf("[store] boot_id=%u, %d entri tersisa di buffer, kalibrasi=%s\n",
                 (unsigned)s_boot_id, tertunda, s_kalib.valid ? "ada" : "kosong");
 }
@@ -188,6 +237,36 @@ void aw_kalibrasi_set(int16_t offset_sis, int16_t offset_dia) {
                 (int)offset_sis, (int)offset_dia);
 }
 
+/* ---------------- Titik yang ter-ARM (v1.3) ---------------- */
+bool aw_titik_ada(void) { return s_titik.valid != 0; }
+
+void aw_titik_get(uint8_t *sesi_id_out, uint8_t *index_out) {
+  if (sesi_id_out) memcpy(sesi_id_out, s_titik.sesi_id, 16);
+  if (index_out)   *index_out = s_titik.index_;
+}
+
+void aw_titik_set(const uint8_t *sesi_id, uint8_t index) {
+  /* Dibandingkan DULU. Aplikasi boleh mengirim ARM_TITIK berulang -- ACK bisa
+   * hilang di udara, dan mengirim ulang lebih murah daripada bertanya -- jadi
+   * menulis flash setiap kali berarti mengikisnya untuk perintah yang tidak
+   * mengubah apa pun. */
+  if (s_titik.valid && s_titik.index_ == index &&
+      memcmp(s_titik.sesi_id, sesi_id, 16) == 0) return;
+
+  s_titik.valid  = 1;
+  s_titik.index_ = index;
+  memcpy(s_titik.sesi_id, sesi_id, 16);
+  if (s_nvs_ok && s_nvs.putBytes(K_TITIK, &s_titik, sizeof(s_titik)) != sizeof(s_titik))
+    Serial.println("[store] GAGAL menulis ARM_TITIK -- tombol ukur tidak akan "
+                   "selamat melewati mati-hidup");
+}
+
+void aw_titik_hapus(void) {
+  if (!s_titik.valid) return;      /* tidak ada yang perlu ditulis */
+  memset(&s_titik, 0, sizeof(s_titik));
+  if (s_nvs_ok) s_nvs.putBytes(K_TITIK, &s_titik, sizeof(s_titik));
+}
+
 /* ---------------- Ring buffer ---------------- */
 static uint8_t seq_berikutnya(void) {
   /* seq berputar 1..255. 0 TIDAK PERNAH dipakai: aplikasi memakainya sebagai
@@ -231,7 +310,9 @@ static uint8_t tambah(uint8_t jenis, const uint8_t *sesi_id, uint8_t index_,
   e->gula = gula; e->bpm = bpm; e->sis = sis; e->dia = dia; e->spo2 = spo2;
   e->perlu_dikirim = 1;
   e->ord = s_ring.next_ord++;
-  tandai_kotor();
+  /* SEGERA, bukan ditunda: ini satu-satunya jalur yang membawa data baru, dan
+   * satu-satunya yang kehilangannya permanen. Lihat kotak di JEDA_SIMPAN_MS. */
+  tandai_kotor_segera();
   return e->seq;
 }
 
@@ -309,13 +390,25 @@ bool aw_ring_ambil_flag_penuh(void) {
   return f;
 }
 
-/* Penulisan sebenarnya. Dipisah supaya jalur bertunda dan jalur paksa tidak
- * pernah bisa menyimpang isinya -- keduanya menulis blob yang sama persis dan
- * sama-sama membersihkan penanda kotor. */
+/* Penulisan sebenarnya. Dipisah supaya ketiga jalur (bertunda, segera, paksa)
+ * tidak pernah bisa menyimpang isinya -- ketiganya menulis blob yang sama persis.
+ *
+ * NILAI BALIKNYA WAJIB DIPERIKSA (dokumen 11). Mengabaikannya lalu menurunkan
+ * penanda "kotor" berarti buffer berhenti persisten DIAM-DIAM saat NVS penuh
+ * atau gagal -- tanpa gejala apa pun sampai jam reboot dan seluruh isinya
+ * lenyap. Bila gagal, "kotor" sengaja dibiarkan menyala supaya percobaan
+ * berikutnya mengulanginya. */
 static void tulis_ring(void) {
+  if (!s_nvs_ok) { s_kotor = false; return; }
+  size_t n = s_nvs.putBytes(K_RING, &s_ring, sizeof(s_ring));
+  if (n != sizeof(s_ring)) {
+    /* Penanda kotor TIDAK diturunkan: percobaan berikutnya harus mengulang. */
+    s_kotor_ms = millis();
+    Serial.printf("[store] GAGAL menulis ring (%u dari %u byte) -- tetap kotor, "
+                  "akan diulang\n", (unsigned)n, (unsigned)sizeof(s_ring));
+    return;
+  }
   s_kotor = false;
-  if (!s_nvs_ok) return;
-  s_nvs.putBytes(K_RING, &s_ring, sizeof(s_ring));
 }
 
 void aw_ring_simpan_jika_perlu(void) {

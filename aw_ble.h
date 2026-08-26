@@ -48,6 +48,17 @@ void aw_ble_tertunda(uint8_t jumlah);
  * Ambil satu perintah dari antrean. false = antrean kosong. */
 bool aw_ble_ambil_perintah(aw_perintah_t *out);
 
+/* Suntik satu perintah Kontrol dari konsol serial, LEWAT ANTREAN YANG SAMA
+ * dengan tulisan BLE (dokumen 15 "Menguji tanpa aplikasi").
+ *
+ * Jalur yang sama itu syarat, bukan kenyamanan: menyuntik dengan memanggil
+ * rutin internal aw_jam akan melewati handler-nya, sehingga cabang NAK dan
+ * idempotensi -- yang justru paling sering salah -- tidak pernah teruji. Lewat
+ * sini, yang diuji adalah kode yang sama persis dengan yang dijalankan aplikasi.
+ *
+ * false kalau antreannya penuh. */
+bool aw_ble_suntik_perintah(const uint8_t *data, uint8_t panjang);
+
 /* ---- Pengiriman ----
  * Ketiganya mengembalikan false kalau tidak ada yang berlangganan; pemanggil
  * memperlakukan itu sebagai "belum terkirim", bukan sebagai error. */

@@ -29,6 +29,23 @@
 #include <stdint.h>
 #include "aw_proto.h"
 
+/* ---- Titik yang ter-ARM (ARM_TITIK, dokumen 5 & 12, v1.3) ----
+ * Menyalakan tombol ukur fisik untuk SATU titik. Ia menghuni NVS karena pola
+ * pemakaian v1.3 adalah nyalakan-ukur-matikan: tombol yang lupa dirinya setiap
+ * kali daya diputus tidak akan pernah berguna, sebab penyalaan di tengah sesi
+ * justru keadaan yang paling lazim.
+ *
+ * Hanya SATU titik ter-ARM pada satu waktu; yang baru menimpa yang lama. Tidak
+ * ada keadaan setengah jalan yang perlu dijaga.
+ *
+ * aw_titik_set() MEMBANDINGKAN DULU: ARM_TITIK berulang dengan isi yang sama
+ * tidak menyentuh flash sama sekali (dokumen 11). Aplikasi boleh mengirim ulang
+ * sesukanya tanpa mengikis flash. */
+bool aw_titik_ada(void);
+void aw_titik_get(uint8_t *sesi_id_out, uint8_t *index_out);
+void aw_titik_set(const uint8_t *sesi_id, uint8_t index);
+void aw_titik_hapus(void);
+
 /* Harus sama dengan AW_KAPASITAS_BUFFER yang dilaporkan ke aplikasi. */
 #define AW_RING_KAP  AW_KAPASITAS_BUFFER
 
@@ -102,7 +119,14 @@ uint8_t aw_ring_tertunda(void);
 bool aw_ring_ambil_flag_penuh(void);
 
 /* Tulis flash yang ditunda: dipanggil tiap iterasi, benar-benar menulis hanya
- * setelah ~3 detik tanpa perubahan baru (dokumen 11). */
+ * setelah ~3 detik tanpa perubahan baru (dokumen 11).
+ *
+ * SEJAK v1.3 JEDA INI ASIMETRIS, dan asimetrinya yang menentukan. Entri BARU
+ * (sampel dan peristiwa) ditulis SEKETIKA; yang boleh ditunda hanya perubahan
+ * yang kalau hilang cuma menghasilkan kiriman ulang -- ack, penanda terkirim,
+ * antre ulang. Lihat aw_store.cpp untuk alasan lengkapnya; ringkasnya: pola
+ * pemakaian v1.3 adalah nyalakan-ukur-MATIKAN, jadi daya yang putus di dalam
+ * jendela 3 detik itu bukan kasus tepi melainkan yang diharapkan terjadi. */
 void aw_ring_simpan_jika_perlu(void);
 
 /* Tulis SEKARANG, melewati jeda tunda di atas. Hanya untuk satu keadaan:
