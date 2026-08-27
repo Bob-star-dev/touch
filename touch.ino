@@ -885,8 +885,17 @@ static void build_wajah(void) {
  * Tampil saat boot dan -- kalau SPL_SAAT_BANGUN -- setiap kali layar dinyalakan
  * lagi. Itulah yang menentukan seluruh anggarannya. Splash yang cuma dilihat
  * sekali sehari boleh megah; yang dilihat belasan kali sehari harus SELESAI
- * sebelum kesabaran habis, dan di bawah satu detik adalah batas praktisnya.
- * Semua angka di bawah diturunkan dari batas itu, bukan sebaliknya.
+ * sebelum kesabaran habis.
+ *
+ * Batas itu dulu ditetapkan di bawah satu detik dan seluruh jadwal diturunkan
+ * darinya. Sekarang 1,4 detik, dan itu keputusan sadar: pada 850 ms ketiga
+ * gerakannya lewat terlalu cepat untuk terbaca sebagai gerakan -- yang tersisa
+ * di mata cuma logo yang tiba-tiba sudah ada. Harganya spesifik dan ada dua:
+ * boot mundur setengah detik, dan -- ini yang lebih mahal -- setiap kali layar
+ * menyala sendiri untuk sebuah pengukuran, SPL_TOTAL_MS berdiri lebih lama di
+ * antara pengguna dan isyarat "tempelkan jari sekarang". Kalau isyarat itu
+ * ternyata lebih berharga, yang diubah SPL_SAAT_BANGUN menjadi 0, BUKAN jadwal
+ * di bawah: splash saat boot tidak punya siapa pun yang sedang menunggu.
  *
  * KENAPA GAMBAR, BUKAN GAMBAR VEKTOR
  * Tanda jam di logo punya gradien badan, garis hati, dan garis EKG yang saling
@@ -928,15 +937,27 @@ static void build_wajah(void) {
 
 /* Jadwal, dalam milidetik sejak splash_mulai(). Tumpang tindihnya disengaja:
  * setiap unsur mulai sebelum unsur sebelumnya betul-betul selesai, sehingga
- * tidak pernah ada saat layar diam menunggu giliran berikutnya. */
-#define SPL_ARC_MS     420
-#define SPL_MARK_TUNDA 130
-#define SPL_MARK_MS    260
-#define SPL_KATA_TUNDA 380
-#define SPL_KATA_MS    250
-#define SPL_SUB_TUNDA  540
-#define SPL_SUB_MS     220
-#define SPL_TOTAL_MS   850      /* 760 ms animasi + 90 ms jeda baca */
+ * tidak pernah ada saat layar diam menunggu giliran berikutnya.
+ *
+ * Ketujuh angka pertama adalah jadwal 850 ms yang lama DIKALI ~1,6 -- dikali,
+ * bukan ditulis ulang, supaya tumpang tindih yang sudah ditimbang itu tetap
+ * utuh dan yang berubah cuma kecepatannya. Busur menyapu lebih tenang, tanda
+ * jam memudar cukup lama untuk benar-benar terlihat memudar, dan kata
+ * "ASAWatch" menempuh 8 px-nya sebagai gerakan alih-alih sebagai lompatan.
+ *
+ * Jeda bacanya naik lebih dari faktor itu (90 -> 180 ms) karena ia menjawab
+ * pertanyaan yang berbeda dari keenam lainnya: bukan seberapa cepat sebuah
+ * unsur masuk, melainkan berapa lama logo yang SUDAH utuh boleh berdiri diam
+ * sebelum layar berganti. Pada 90 ms anak judul praktis belum sempat terbaca
+ * penuh saat wajah jam sudah menggantikannya. */
+#define SPL_ARC_MS     680
+#define SPL_MARK_TUNDA 210
+#define SPL_MARK_MS    420
+#define SPL_KATA_TUNDA 610
+#define SPL_KATA_MS    400
+#define SPL_SUB_TUNDA  870
+#define SPL_SUB_MS     350
+#define SPL_TOTAL_MS   1400     /* 1220 ms animasi + 180 ms jeda baca */
 
 /* LV_DISP_DEF_REFR_PERIOD 30 ms berarti 33 frame/detik, dan pudaran 260 ms
  * hanya kebagian 9 langkah opasitas -- terlihat sebagai tangga, bukan pudaran.
