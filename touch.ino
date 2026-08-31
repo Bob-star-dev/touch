@@ -342,8 +342,8 @@ static void splash_batal(void);
  * Tenggatnya dipasang PEMANGGIL, bukan layar_set(), supaya setiap penyalaan
  * menyatakan maksudnya sendiri -- dan supaya layar_set(false) tetap punya satu
  * arti saja. */
-#define LAYAR_MATI_TOMBOL_MS  30000UL
-#define LAYAR_AUTO_MATI_MS    20000UL
+#define LAYAR_MATI_TOMBOL_MS  20000UL
+#define LAYAR_AUTO_MATI_MS    10000UL
 static uint32_t layar_mati_pada = 0;   /* 0 = tanpa batas waktu */
 
 static void layar_set(bool nyala) {
