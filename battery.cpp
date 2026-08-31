@@ -47,6 +47,38 @@ static uint32_t s_slot_ms  = 0;
 static int      s_base_mv  = 0;       /* minimum jendela -> dasar persen */
 static bool     s_charging = false;
 
+/* ---- deteksi "sedang dicolok": tiga aturan yang saling menambal ----
+ *
+ * Ambang di bawah bukan tebakan; semuanya dari log probe di board ini
+ * (perintah konsol `sag`/`saglog` di touch.ino, yang tetap ada untuk mengukur
+ * ulang kalau selnya diganti):
+ *
+ *   dicolok  t=22..62s   SAG = -2, +0, +0        berat 4104..4105 mV
+ *   baterai  t=82..182s  SAG = +6,+10,+9,+9,+13  berat 4001..3967 mV
+ *   dicolok  t=202s      SAG = +1                berat 4104 mV
+ *
+ * Jarak antara dua gugus itu 5 mV dengan pengulangan +-2 mV. Sempit dalam
+ * angka absolut, tetapi konsisten -- dan yang menanggung beban keputusan
+ * sehari-hari sebenarnya deteksi langkah 100 mV, bukan sag ini. */
+#define STEP_SLOTS       8      /* 8 x ~500 ms = 4 detik  */
+#define STEP_MV          50     /* langkah colok/cabut terukur >100 mV */
+#define SAG_COLOK_MAX    3      /* <= ini: sumber teregulasi -> dicolok */
+#define SAG_BATERAI_MIN  5      /* >= ini: sel ambles      -> di baterai */
+#define PROBE_SETTLE_MS  300
+
+static uint16_t s_step[STEP_SLOTS];
+static int      s_step_n = 0, s_step_i = 0;
+
+static int      s_probe_v0     = 0;
+static uint32_t s_probe_ms     = 0;
+static bool     s_probe_nunggu = false;
+static bool     s_probe_ke_berat = false;
+static int      s_sag_mv       = 0;
+static bool     s_sag_ada      = false;
+static uint32_t s_probe_us     = 0;
+static uint32_t s_tren_sah_ms  = 0;   /* tren dibisukan sampai 3 mnt setelah ini */
+static uint32_t s_step_naik_ms = 0;   /* langkah-naik terakhir; menggerbang sag besar */
+
 /* Acuan sejak nyala. Tanpa ini tidak ada cara membedakan dua sebab yang sama
  * sekali berbeda ketika persen tidak bergerak:
  *   - tegangan memang belum turun (kurva Li-Po sangat datar di dekat penuh,
@@ -164,12 +196,104 @@ void battery_update(void) {
   for (int k = 0; k < s_wmin_n; k++)
     if (s_wmin[k] < wmin) wmin = s_wmin[k];
 
-  /* Naik/turun dinilai dari slot tertua vs terbaru, bukan dari nilai sesaat --
-   * keduanya sama-sama "minimum berbeban" jadi bisa dibandingkan langsung. */
-  if (s_wmin_n >= WMIN_SLOTS) {
+  /* ================= Apakah jam sedang dicolok? =================
+   * Tiga aturan, dijalankan dari yang paling lemah ke yang paling kuat supaya
+   * yang kuat menang dalam pemanggilan yang sama.
+   *
+   * Versi pertama menjalankannya terbalik dan itu bug yang nyata: aturan tren
+   * dievaluasi TERAKHIR, jadi sesaat setelah kabel dicabut, deteksi langkah
+   * memang menyetel false -- lalu tren yang masih memuat kenaikan selama
+   * mengisi tadi langsung menyetelnya true lagi di baris berikutnya. Ikonnya
+   * macet menyala sampai jendela 3 menit itu habis, dan tiap probe sag yang
+   * datang di sela itu pun ditimpa lagi. Gejalanya persis "stuck di kondisi
+   * charge terus". */
+
+  /* ---- 1. Tren naik 3 menit: memegang fase CC ----
+   * HANYA boleh menyalakan, tidak pernah memadamkan. Ia cuma benar di satu
+   * fase: saat mengisi dari sel kosong, charger bekerja sebagai sumber ARUS,
+   * jadi langkah beban tetap menghasilkan sag persis seperti di baterai dan
+   * aturan 2 akan salah menyimpulkan "tidak mengisi". Yang tidak bisa
+   * dipalsukan di fase itu adalah tegangan yang naik terus.
+   *
+   * Kebalikannya tidak berlaku -- tegangan yang tidak naik bukan bukti tidak
+   * mengisi (di CV memang tidak naik) -- karena itu tidak ada cabang else.
+   *
+   * s_tren_sah_ms adalah penawar kemacetan di atas: setiap langkah membisukan
+   * tren selama satu panjang jendela penuh, supaya ia tidak pernah menjawab
+   * berdasarkan slot yang terkumpul SEBELUM keadaan dayanya berubah. Sengaja
+   * memakai stempel waktu, bukan mengosongkan s_wmin: jendela itu juga dasar
+   * perhitungan persen, dan persen tidak ada urusannya dengan ini. */
+  if (s_wmin_n >= WMIN_SLOTS &&
+      (uint32_t)(millis() - s_tren_sah_ms) >= (uint32_t)WMIN_SLOTS * WMIN_SLOT_MS) {
     int oldest = s_wmin[s_wmin_i];               /* slot berikut = yang tertua */
     int newest = s_wmin[(s_wmin_i + WMIN_SLOTS - 1) % WMIN_SLOTS];
-    s_charging = (newest - oldest) >= 20;
+    if (newest - oldest >= 20) s_charging = true;
+  }
+
+  /* ---- 2. Probe sag: memegang fase CV ----
+   * Di sinilah tren buta total: saat sel hampir penuh charger meregulasi di
+   * 4,2 V dan tegangannya RATA, jadi tidak ada tren untuk dilihat. Yang tetap
+   * berbeda adalah tanggapannya terhadap beban -- charger menahan, baterai
+   * ambles. Terukur di board ini dengan backlight sebagai beban: dicolok
+   * -2..+1 mV, di baterai +6..+13 mV.
+   *
+   * Jendela 300 ms cukup: tegangan mengikuti langkah beban dalam milidetik,
+   * jauh lebih cepat daripada relaksasi kimia sel yang berskala detik. */
+  if (s_probe_nunggu && (uint32_t)(millis() - s_probe_ms) >= PROBE_SETTLE_MS) {
+    s_probe_nunggu = false;
+    const uint32_t t0 = micros();
+    int v1  = battery_baca_langsung_mv(NULL);
+    s_probe_us = micros() - t0;      /* satu-satunya pembacaan mahal yang tersisa */
+    int sag = s_probe_ke_berat ? (s_probe_v0 - v1) : (v1 - s_probe_v0);
+    s_sag_mv  = sag;
+    s_sag_ada = true;
+
+    /* Zona mati 4 mV di antara kedua ambang sengaja dibiarkan TIDAK memutuskan
+     * apa-apa. Pengulangan pengukuran ini +-2 mV (terbaca dari empat probe
+     * berturut-turut saat dicolok: -2, 0, 0, +1), jadi nilai di antara 4 dan 5
+     * tidak bisa dibedakan dari derau -- dan menebak di situ berarti ikonnya
+     * berkedip, yaitu keluhan yang memulai semua ini.
+     *
+     * Sag KECIL boleh langsung menyalakan: sumber teregulasi tidak punya
+     * penjelasan lain. Sag BESAR tidak simetris -- ia muncul baik di baterai
+     * MAUPUN saat mengisi di fase CC, jadi ia hanya boleh memadamkan setelah
+     * langkah-naik terakhir cukup lama berlalu sehingga aturan 1 sudah punya
+     * jendela penuh untuk berbicara. Tanpa gerbang itu, mencolok charger ke
+     * baterai yang benar-benar kosong akan memadamkan ikonnya sendiri beberapa
+     * detik kemudian. */
+    if (sag <= SAG_COLOK_MAX) {
+      s_charging = true;
+    } else if (sag >= SAG_BATERAI_MIN &&
+               (uint32_t)(millis() - s_step_naik_ms) >=
+                   (uint32_t)WMIN_SLOTS * WMIN_SLOT_MS) {
+      s_charging = false;
+    }
+  }
+
+  /* ---- 3. Langkah cepat: kabel dicolok / dicabut ----
+   * Bukti paling langsung yang ada, karena itu dijalankan terakhir dan menang
+   * atas dua aturan di atas. Terukur di board ini: mencabut 4105 -> 4001 mV,
+   * mencolok lagi 3967 -> 4104 mV. Seratus milivolt ke atas, dalam satu-dua
+   * detik. Tidak ada apa pun dalam pemakaian normal yang menggeser tegangan
+   * sebesar itu secepat itu, jadi ambang 50 mV punya margin dua kali lipat dan
+   * tetap jauh di atas sag beban (9 mV). */
+  s_step[s_step_i] = (uint16_t)s_batt_mv;
+  s_step_i = (s_step_i + 1) % STEP_SLOTS;
+  if (s_step_n < STEP_SLOTS) s_step_n++;
+
+  if (s_step_n >= STEP_SLOTS) {
+    int lama = s_step[s_step_i];
+    int baru = s_step[(s_step_i + STEP_SLOTS - 1) % STEP_SLOTS];
+    if (baru - lama >= STEP_MV) {
+      s_charging     = true;
+      s_step_naik_ms = millis();
+      s_tren_sah_ms  = millis();     /* bisukan tren: slotnya milik keadaan lama */
+      s_sag_ada      = false;
+    } else if (lama - baru >= STEP_MV) {
+      s_charging     = false;
+      s_tren_sah_ms  = millis();
+      s_sag_ada      = false;
+    }
   }
 
   s_base_mv = wmin;
@@ -211,3 +335,68 @@ int  battery_raw_millivolts(void) { return s_raw_mv; }
 bool battery_valid(void)          { return s_valid; }
 int  battery_spread_mv(void)      { return s_spread; }
 int  battery_raw_counts(void)     { return s_counts; }
+
+/* ---- bacaan seketika untuk probe sag ----
+ * Sengaja memakai buffer lokal, bukan s_ring: mencampurkan sampel probe ke ring
+ * berarti langkah beban yang kita buat sendiri ikut menggeser persen yang tampil
+ * di layar, yaitu artefak yang justru sedang kita ukur. */
+#define PROBE_N 31
+
+int battery_baca_langsung_mv(int *sebaran_pin_mv) {
+  int s[PROBE_N];
+  for (int k = 0; k < PROBE_N; k++) s[k] = analogReadMilliVolts(BATT_ADC_PIN);
+  qsort(s, PROBE_N, sizeof(int), cmp_int);
+  if (sebaran_pin_mv) *sebaran_pin_mv = s[PROBE_N - 1] - s[0];
+  return (int)(s[PROBE_N / 2] * BATT_DIVIDER + 0.5f);
+}
+
+/* Dipanggil TEPAT SEBELUM duty backlight diubah, oleh layar_set() dan oleh
+ * penyalaan pertama di setup().
+ *
+ * Tidak ada probe aktif di sini, dan itu keputusan yang disengaja: build
+ * kalibrasi mengedipkan backlight sendiri tiap 20 detik, dan itu tidak bisa
+ * dibiarkan di firmware yang dipakai. Ternyata memang tidak perlu -- jam sudah
+ * mengubah bebannya sendiri setiap kali layar mati atau menyala, jadi
+ * pengukurannya cukup MENUMPANG pada langkah yang toh sudah terjadi. Nol
+ * kedipan, nol daya tambahan.
+ *
+ * Efek sampingnya kebetulan persis yang diinginkan: nilainya diperbarui pada
+ * detik layar dinyalakan -- yaitu saat pengguna benar-benar sedang menatap
+ * ikonnya. Yang tampil selalu hasil ratusan milidetik lalu, bukan tren 3 menit
+ * yang basi.
+ *
+ * Hanya menyimpan nilai "sebelum"; battery_update() yang menyelesaikannya 300 ms
+ * kemudian, sehingga fungsi ini tidak pernah memblokir lebih dari ~3 ms dan
+ * aman dipanggil dari konteks loop(). */
+void battery_beban_akan_berubah(bool jadi_berat) {
+  if (!s_valid) return;                /* belum ada acuan; abaikan saja */
+
+  /* Nilai "sebelum" diambil dari s_batt_mv yang SUDAH ada, bukan dari burst ADC
+   * baru. Versi pertama membaca 31 sampel di sini dan itu keliru tempat: fungsi
+   * ini dipanggil dari layar_set(), yang ada di jalur tekan-tombol dan
+   * bangun-layar -- persis dua interaksi yang paling terasa kalau tertunda.
+   * Sekarang biayanya nol, dan yang tersisa hanya satu pembacaan 300 ms
+   * kemudian di battery_update(), jauh dari jalur kritis.
+   *
+   * Boleh dipakai karena s_batt_mv memang berarti "tegangan pada beban yang
+   * berlaku sebelum ini" -- beban belum berubah saat baris ini jalan. Syaratnya
+   * EMA-nya sempat mengendap, karena itu gerbang 2 detik di bawah: dua
+   * transisi berturut-turut yang rapat membuat nilai "sebelum" masih separuh
+   * jalan dari langkah sebelumnya, dan sag-nya jadi mengada-ada. */
+  const uint32_t sekarang = millis();
+  if (s_probe_ms && (uint32_t)(sekarang - s_probe_ms) < 2000UL) {
+    s_probe_nunggu = false;            /* terlalu rapat -- lewati, jangan tebak */
+    s_probe_ms     = sekarang;
+    return;
+  }
+
+  s_probe_v0       = s_batt_mv;
+  s_probe_ms       = sekarang;
+  s_probe_ke_berat = jadi_berat;
+  s_probe_nunggu   = true;
+}
+
+int  battery_sag_mv(void)   { return s_sag_mv; }
+bool battery_sag_valid(void){ return s_sag_ada; }
+
+uint32_t battery_probe_us(void) { return s_probe_us; }

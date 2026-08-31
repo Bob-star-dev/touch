@@ -307,17 +307,60 @@ static void splash_batal(void);
  *
  * Ini keputusan produk, bukan detail teknis, jadi ditaruh sebagai sakelar yang
  * terlihat. Sisi baiknya: layar tidak pernah menyala dengan wajah jam basi
- * sepersekian detik sebelum digambar ulang. Sisi mahalnya nyata dan spesifik --
- * sejak v1.2 layar menyala sendiri saat pengukuran sesi dimulai (lihat
- * refresh_cb), dan di situ SPL_TOTAL_MS berdiri persis di antara pengguna dan
- * isyarat "tempelkan jari sekarang". Diset 0 kalau isyarat itu ternyata lebih
- * berharga daripada logonya. */
-#define SPL_SAAT_BANGUN 1
+ * sepersekian detik sebelum digambar ulang.
+ *
+ * DIMATIKAN, dan yang mematikannya adalah auto-mati layar. Selama layar
+ * praktis tidak pernah padam sendiri, logo saat bangun itu peristiwa langka
+ * dan terasa mewah. Begitu layar mati tiap 20-30 detik, ia berubah jadi pajak
+ * yang dibayar berkali-kali sehari: setiap kali ingin melihat jam, SPL_TOTAL_MS
+ * berdiri lebih dulu di depan angkanya.
+ *
+ * Ongkos yang sama sudah lama berlaku di tempat yang lebih buruk -- sejak v1.2
+ * layar menyala sendiri saat pengukuran dimulai (lihat refresh_cb), dan di situ
+ * splash berdiri persis di antara pengguna dan isyarat "tempelkan jari
+ * sekarang".
+ *
+ * Splash saat BOOT tidak terpengaruh: setup() memanggil splash_mulai() sendiri,
+ * tidak lewat sakelar ini. */
+#define SPL_SAAT_BANGUN 0
+
+/* ---- Auto-mati layar ----
+ * Sebelumnya jam ini TIDAK punya batas waktu sama sekali: sekali menyala ia
+ * menyala sampai tombol ditekan lagi. Yang membuat itu tidak bisa dipertahankan
+ * adalah satu angka -- jam bertahan sekitar 50 menit dengan layar menyala. Jadi
+ * sekali klik PWR untuk melihat jam lalu lupa mengkliknya lagi, dan baterainya
+ * habis total dalam kurang dari sejam. Tidak ada yang mencegahnya, dan
+ * kehilangannya senyap: yang terlihat cuma jam yang mati padahal tadi penuh.
+ *
+ * Dua tenggat, karena dua maksud yang berbeda:
+ *   TOMBOL -- pengguna MEMINTA melihat sesuatu, jadi diberi waktu membaca
+ *             empat kartu metrik dengan tenang.
+ *   AUTO   -- jam yang memberi tahu sesuatu tanpa diminta (kabel masuk,
+ *             pengukuran mulai). Isyaratnya cuma berguna sebentar; mengisi
+ *             sendiri berjam-jam dan sering semalaman.
+ *
+ * Tenggatnya dipasang PEMANGGIL, bukan layar_set(), supaya setiap penyalaan
+ * menyatakan maksudnya sendiri -- dan supaya layar_set(false) tetap punya satu
+ * arti saja. */
+#define LAYAR_MATI_TOMBOL_MS  30000UL
+#define LAYAR_AUTO_MATI_MS    20000UL
+static uint32_t layar_mati_pada = 0;   /* 0 = tanpa batas waktu */
 
 static void layar_set(bool nyala) {
   if (nyala && pwr_daya_lepas) return;
   if (nyala == s_layar_nyala) return;
   s_layar_nyala = nyala;
+
+  /* Setiap perubahan keadaan membatalkan tenggat yang berjalan. Penyalaan yang
+   * diminta pengguna karena itu selalu abadi, walau datang di tengah 20 detik
+   * penyalaan otomatis -- yang belakangan menang, dan itu yang diharapkan. */
+  layar_mati_pada = 0;
+
+  /* Dilaporkan SEBELUM duty backlight berubah -- inilah "nilai sebelum" bagi
+   * probe sag di battery.cpp, yang darinya jam tahu ia sedang dicolok atau
+   * tidak. Layar mati/nyala adalah satu-satunya langkah beban besar yang
+   * terjadi rutin, jadi di sinilah satu-satunya tempat yang benar. */
+  battery_beban_akan_berubah(nyala);
 
   if (nyala) {
     gfx->displayOn();
@@ -343,6 +386,16 @@ static void layar_set(bool nyala) {
     s_bl_tunda = false;
   }
   Serial.printf("[pwr] layar %s\n", nyala ? "menyala" : "dimatikan");
+}
+
+/* Nyala dengan tenggat. Urutannya penting: layar_set() mengosongkan tenggat,
+ * jadi tenggat baru harus dipasang SESUDAHNYA. Kalau layar sudah menyala,
+ * layar_set() langsung kembali dan tenggat tidak dipasang -- juga disengaja:
+ * layar yang sedang dipakai pengguna tidak boleh mati gara-gara kabel dicolok. */
+static void layar_nyala_sementara(uint32_t ms) {
+  const bool sudah_nyala = s_layar_nyala;
+  layar_set(true);
+  if (!sudah_nyala && s_layar_nyala) layar_mati_pada = millis() + ms;
 }
 
 /* Glyph non-ASCII yang tersedia di lv_font_montserrat_* bawaan LVGL. */
@@ -1405,7 +1458,8 @@ static void refresh_cb(lv_timer_t *tm) {
    * melakukan apa pun. */
   static bool ukur_lalu = false;
   bool ukur_kini = jam_sedang_mengukur();
-  if (ukur_kini && !ukur_lalu && !jam_ukur_lokal()) layar_set(true);
+  if (ukur_kini && !ukur_lalu && !jam_ukur_lokal())
+    layar_nyala_sementara(LAYAR_AUTO_MATI_MS);
   ukur_lalu = ukur_kini;
 
   /* ---- baterai ----
@@ -1425,10 +1479,25 @@ static void refresh_cb(lv_timer_t *tm) {
     int kotak = batt_hitung_kotak(battery_percent(), kotak_lalu);
     int chg   = battery_charging() ? 1 : 0;
     if (kotak != kotak_lalu || chg != isi_lalu) {
+      /* Layar dibangunkan saat MULAI mengisi, sebagai satu-satunya umpan balik
+       * bahwa kabelnya benar-benar masuk -- jam ini tidak punya LED charger.
+       * isi_lalu == -1 dikecualikan supaya boot dalam keadaan tercolok tidak
+       * ikut memicunya; layarnya toh sudah menyala di situ. */
+      if (chg && isi_lalu == 0) layar_nyala_sementara(LAYAR_AUTO_MATI_MS);
       kotak_lalu = kotak;
       isi_lalu   = chg;
       batt_gambar(kotak, chg != 0);
     }
+  }
+
+  /* Tenggat auto-mati. Pengukuran menundanya alih-alih membatalkannya: pengguna
+   * harus diam belasan detik dan kemajuannya cuma ada di layar (dokumen 14),
+   * jadi mematikannya di tengah situ akan membuang pengukuran yang sedang
+   * berjalan. Kalau ditunda, layarnya tetap mati beberapa detik setelah selesai
+   * dan tidak menyala semalaman. */
+  if (layar_mati_pada && (int32_t)(millis() - layar_mati_pada) >= 0) {
+    if (jam_sedang_mengukur()) layar_mati_pada = millis() + 5000UL;
+    else                       layar_set(false);   /* ini mengosongkan tenggatnya */
   }
 
   /* ---- empat metrik + tiga cincin ----
@@ -1608,7 +1677,7 @@ static void pwr_matikan(void) {
 static void pwr_hidupkan_lagi(void) {
   digitalWrite(BAT_EN, HIGH);
   pwr_daya_lepas = false;
-  layar_set(true);
+  layar_nyala_sementara(LAYAR_MATI_TOMBOL_MS);
   Serial.println("[pwr] latch dipasang lagi -- jam menyala kembali");
 }
 
@@ -1618,7 +1687,12 @@ static void pwr_hidupkan_lagi(void) {
  * dibatalkan sentuhan tak sengaja. */
 static void pwr_klik(void) {
   if (pwr_daya_lepas) return;
-  layar_set(!s_layar_nyala);
+  /* Klik saat sudah menyala tetap MEMATIKAN, bukan memperpanjang tenggat.
+   * Tombol ini satu-satunya cara mematikan layar dengan sengaja, dan menukarnya
+   * jadi "perpanjang" akan menghilangkan kemampuan itu sama sekali. Kalau butuh
+   * lebih lama: klik mati lalu klik nyala lagi. */
+  if (s_layar_nyala) layar_set(false);
+  else               layar_nyala_sementara(LAYAR_MATI_TOMBOL_MS);
 }
 
 static void pwr_poll(void) {
@@ -1785,6 +1859,113 @@ static void konsol_kirim(uint8_t op, bool bawa_sesi, bool bawa_index, uint8_t in
     Serial.printf("[konsol] -> opcode 0x%02X (%u byte)\n", op, (unsigned)n);
 }
 
+/* ================= Probe sag: "apakah jam sedang dicolok?" =================
+ *
+ * Charger CC/CV adalah sumber TEREGULASI, baterai tidak. Jadi kalau beban
+ * diubah mendadak:
+ *   - di baterai   -> tegangan ambles sebanding beban x resistansi dalam sel
+ *   - saat dicolok -> charger menahannya, amblesnya nyaris nol
+ * Bedanya berlaku di SEMUA tingkat isi, termasuk saat sel sudah penuh dan
+ * trennya rata -- persis lubang yang tidak bisa ditutup battery_charging() yang
+ * menilai tren tegangan 3 menit (dan yang membuat petir hilang justru saat
+ * mengisi dari kondisi hampir penuh, keluhan yang memulai semua ini).
+ *
+ * Bebannya backlight: satu-satunya konsumen besar yang bisa dinyalakan dan
+ * dimatikan seketika tanpa efek samping. Hanya duty PWM-nya yang disentuh,
+ * BUKAN layar_set() -- menghidupkan panel ikut menjalankan splash, dan animasi
+ * itu sendiri adalah beban yang berubah-ubah, yaitu derau yang sedang diukur.
+ *
+ * Ini masih tahap KALIBRASI: ambangnya belum ada, dan keluaran inilah yang
+ * dipakai untuk menetapkannya. Begitu ambangnya ketahuan, probe aktif ini
+ * diganti versi pasif yang menumpang pada layar mati/nyala yang toh sudah
+ * terjadi sendiri -- tanpa kedipan dan tanpa delay().
+ */
+typedef struct {
+  uint32_t t_s;        /* uptime detik, untuk mengurutkan kejadian     */
+  int16_t  berat;      /* mV baterai, backlight menyala                */
+  int16_t  ringan;     /* mV baterai, backlight padam                  */
+  int16_t  sag;        /* ringan - berat; >0 = beban lepas -> naik     */
+  int16_t  hanyut;     /* tren selama probe; memisahkan naik CC dari sag */
+  int16_t  derau;      /* sebaran di pin, lantai kebermaknaan          */
+} sag_hasil_t;
+
+#define SAG_LOG_N 14
+static sag_hasil_t sag_log[SAG_LOG_N];
+static int         sag_log_n = 0, sag_log_i = 0;
+
+/* Memblokir ~1,3 detik: LVGL, touch, dan jam_putar() berhenti selama itu.
+ * Boleh HANYA karena ini build kalibrasi sementara. Versi pasifnya nanti tidak
+ * memblokir sama sekali. */
+static void sag_ukur(bool cetak) {
+  const int bl_awal = s_layar_nyala ? LCD_BL_TERANG : 0;
+  int sb1 = 0, sb2 = 0, sb3 = 0;
+
+  /* Berat diukur DUA KALI mengapit yang ringan. Bukan demi presisi melainkan
+   * demi membatalkan hanyutan linear: kalau jam sedang mengisi di fase CC
+   * tegangannya naik terus, dan probe dua titik biasa akan melaporkan kenaikan
+   * itu sebagai "sag" bertanda salah. */
+  ledcWrite(LCD_BL, LCD_BL_TERANG);
+  delay(400);
+  const int berat1 = battery_baca_langsung_mv(&sb1);
+
+  ledcWrite(LCD_BL, 0);
+  delay(400);
+  const int ringan = battery_baca_langsung_mv(&sb2);
+
+  ledcWrite(LCD_BL, LCD_BL_TERANG);
+  delay(400);
+  const int berat2 = battery_baca_langsung_mv(&sb3);
+
+  ledcWrite(LCD_BL, bl_awal);                  /* kembalikan apa adanya */
+
+  const int berat  = (berat1 + berat2 + 1) / 2;
+  const int derau  = sb1 > sb2 ? (sb1 > sb3 ? sb1 : sb3) : (sb2 > sb3 ? sb2 : sb3);
+
+  sag_hasil_t *h = &sag_log[sag_log_i];
+  h->t_s    = millis() / 1000UL;
+  h->berat  = (int16_t)berat;
+  h->ringan = (int16_t)ringan;
+  h->sag    = (int16_t)(ringan - berat);
+  h->hanyut = (int16_t)(berat2 - berat1);
+  h->derau  = (int16_t)derau;
+
+  sag_log_i = (sag_log_i + 1) % SAG_LOG_N;
+  if (sag_log_n < SAG_LOG_N) sag_log_n++;
+
+  if (cetak)
+    Serial.printf("[sag] t=%lus berat=%d/%d ringan=%d  SAG=%+d mV  "
+                  "hanyut=%+d mV  derau_pin=%d mV\n",
+                  (unsigned long)h->t_s, berat1, berat2, ringan,
+                  (int)h->sag, (int)h->hanyut, (int)h->derau);
+}
+
+/* Serial mati begitu USB dicabut -- padahal "di baterai" justru salah satu dari
+ * dua kondisi yang harus dibandingkan. Jadi hasilnya disimpan di RAM dan dibaca
+ * belakangan. Ini bekerja karena mencolok USB lagi TIDAK me-reset board (ia cuma
+ * mulai mengisi), pola yang sama persis dengan battery_history(). */
+static void sag_cetak_log(void) {
+  Serial.printf("[saglog] %d hasil (tertua dulu), uptime sekarang %lus\n",
+                sag_log_n, (unsigned long)(millis() / 1000UL));
+  for (int k = 0; k < sag_log_n; k++) {
+    const sag_hasil_t *h = &sag_log[(sag_log_i - sag_log_n + k + 2 * SAG_LOG_N) % SAG_LOG_N];
+    Serial.printf("  t=%5lus  berat=%4d  ringan=%4d  SAG=%+4d  hanyut=%+4d  derau=%d\n",
+                  (unsigned long)h->t_s, (int)h->berat, (int)h->ringan,
+                  (int)h->sag, (int)h->hanyut, (int)h->derau);
+  }
+  Serial.println("[saglog] SAG saat dicolok harus jauh lebih kecil daripada "
+                 "SAG di baterai; selisihnya = ambang");
+}
+
+/* 1 = probe berjalan sendiri tiap SAG_AUTO_MS. HANYA untuk kalibrasi: ia
+ * mengedipkan backlight dan memblokir 1,3 detik. Set 0 setelah ambang didapat. */
+#define AW_KALIBRASI_SAG 0
+#define SAG_AUTO_MS      20000UL
+
+/* Instrumen lag. Murah (dua micros() per iterasi) dan sengaja dibiarkan
+ * terpasang: "jamnya terasa lambat" adalah keluhan yang mustahil dikejar tanpa
+ * angka, dan menebak-nebak penyebabnya memakan satu siklus flash tiap tebakan. */
+static uint32_t lag_maks_us = 0, lag_total_us = 0, lag_n = 0, lag_lambat = 0;
+
 static void konsol_jalankan(char *baris) {
   char *sp = strchr(baris, ' ');
   int arg = 0;
@@ -1816,6 +1997,17 @@ static void konsol_jalankan(char *baris) {
                   (unsigned long)jam_t0_uptime(), (unsigned long)jam_uptime(),
                   (unsigned)jam_tertunda());
   }
+  else if (!strcmp(baris, "lag")) {
+    Serial.printf("[lag] loop: maks=%lu us  rata=%lu us  n=%lu  >20ms=%lu  "
+                  "(probe ADC terakhir=%lu us)\n",
+                  (unsigned long)lag_maks_us,
+                  lag_n ? (unsigned long)(lag_total_us / lag_n) : 0UL,
+                  (unsigned long)lag_n, (unsigned long)lag_lambat,
+                  (unsigned long)battery_probe_us());
+    lag_maks_us = 0; lag_total_us = 0; lag_n = 0; lag_lambat = 0;
+  }
+  else if (!strcmp(baris, "sag"))    sag_ukur(true);
+  else if (!strcmp(baris, "saglog")) sag_cetak_log();
   else if (baris[0]) Serial.printf("[konsol] tidak dikenal: \"%s\"\n", baris);
 }
 
@@ -1844,7 +2036,7 @@ static void boot_poll(void) {
       /* Layar dibangunkan pada TEKANAN, bukan pada aksinya: pengukuran yang
        * dimulai di layar gelap tidak punya cara memberi tahu kemajuannya, dan
        * kemajuan itulah satu-satunya alasan pengguna mau menahan jari diam. */
-      if (!s_layar_nyala) layar_set(true);
+      if (!s_layar_nyala) layar_nyala_sementara(LAYAR_MATI_TOMBOL_MS);
     } else if (!boot_siap) {
       boot_siap = true;
       Serial.println("[boot] tombol dilepas -- siap dipakai");
@@ -1878,6 +2070,23 @@ void setup() {
   bool nyala_disengaja = pwr_gerbang_nyala();
 
   Serial.begin(115200);
+
+  /* Menulis ke serial TIDAK BOLEH memblokir loop(). Bawaan core menyakitkan:
+   * HWCDC.cpp memakai tx_timeout_ms=100 dan max_consec_timeouts=20, jadi SATU
+   * Serial.printf() bisa menahan pemanggilnya sampai ~2 DETIK kalau host tidak
+   * menguras buffernya.
+   *
+   * Yang membuatnya jarang terlihat: saat USB dicabut tidak ada host sama
+   * sekali, tulisan langsung dibuang, dan loop() melaju normal. Begitu kabel
+   * ditancapkan TANPA ada terminal yang membaca -- mengecas dari adaptor,
+   * power bank, atau PC dengan Serial Monitor tertutup -- backpressure-nya
+   * muncul dan heartbeat 5 detik yang mencetak lima baris itu menjadi lima
+   * kesempatan menggantung. Gejalanya persis "jamnya nge-lag kalau ditancap".
+   *
+   * 0 berarti antre kalau muat, buang kalau penuh. Yang hilang cuma log
+   * diagnostik, dan hanya pada detik-detik saat memang tidak ada yang membaca.
+   * Itu harga yang jelas lebih murah daripada UI yang membeku. */
+  Serial.setTxTimeoutMs(0);
   delay(200);
   Serial.println("\n[boot] AsaWatch -- wajah satu halaman");
   if (!nyala_disengaja)
@@ -1964,6 +2173,10 @@ void setup() {
    * jadi layar terbuka dari gelap ke gelap -- tanpa kilatan isi RAM panel yang
    * tersisa dari sebelum reset. */
   lv_timer_handler();
+  /* Penyalaan backlight pertama juga langkah beban, dan yang paling berharga:
+   * ia memberi jawaban "dicolok atau tidak" beberapa ratus milidetik setelah
+   * boot, tanpa menunggu pengguna mematikan layar sekali pun. */
+  battery_beban_akan_berubah(true);
   ledcWrite(LCD_BL, LCD_BL_TERANG);
 
   /* Splash diputar sampai habis di sini, bukan dibiarkan berjalan sendiri di
@@ -2023,6 +2236,7 @@ void setup() {
 }
 
 void loop() {
+  const uint32_t lag_t0 = micros();
   touch_poll();          /* tetap dibaca demi board yang sentuhannya sehat */
   konsol_poll();         /* penyuntik opcode untuk uji tanpa HP (dokumen 15) */
   pwr_poll();            /* satu digitalRead; tombol mati harus selalu responsif */
@@ -2038,6 +2252,19 @@ void loop() {
    * di aw_ble. */
   jam_putar();
 
+#if AW_KALIBRASI_SAG
+  /* Probe berkala supaya kondisi "di baterai" ikut terekam tanpa perlu serial.
+   * Ditaruh setelah jam_putar() dan bukan sebelumnya supaya perintah BLE yang
+   * sudah antre tidak menunggu 1,3 detik ekstra. */
+  {
+    static uint32_t sag_auto_ms = 0;
+    if ((uint32_t)(millis() - sag_auto_ms) >= SAG_AUTO_MS) {
+      sag_auto_ms = millis();
+      sag_ukur(true);        /* dicetak juga: kalau USB tertancap, langsung terbaca */
+    }
+  }
+#endif
+
   lv_timer_handler();
 
   /* Backlight menyala setelah frame pertama selesai digambar, bukan di dalam
@@ -2049,6 +2276,11 @@ void loop() {
     s_bl_tunda = false;
     ledcWrite(LCD_BL, LCD_BL_TERANG);
   }
+
+  const uint32_t lag_dt = micros() - lag_t0;
+  if (lag_dt > lag_maks_us) lag_maks_us = lag_dt;
+  if (lag_dt > 20000UL) lag_lambat++;
+  lag_total_us += lag_dt; lag_n++;
 
   delay(2);
 }
