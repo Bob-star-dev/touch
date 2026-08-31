@@ -254,6 +254,7 @@ idle — setiap koneksi yang terbentuk adalah kesempatan memasang anchor.
 |---|---|
 | Tidak punya bond (`NimBLEDevice::getNumBonds() == 0`) | 100 ms, **terus-menerus, tanpa batas waktu** |
 | Punya bond, 30 detik pertama sesudah boot atau sesudah putus | 100 ms |
+| Punya bond, dan ada entri baru yang menunggu diambil (5 menit) | 100 ms |
 | Punya bond, sesudah itu | 1000 ms |
 
 **Tidak ada "mode pairing", dan tidak ada tombol yang memicunya.** Rancangan awal memakai iklan
@@ -271,6 +272,30 @@ pertama selalu sulit", bukan sebagai iklan yang lambat.
 untuk menghidupkannya kembali. Ia melayani kasus lain: jam yang baru saja terputus dan **masih
 membawa sampel di buffer-nya**. Ponsel yang kembali mendekat menemukannya dalam hitungan detik,
 dengan biaya 30 detik iklan cepat per peristiwa putus.
+
+**Baris ketiga dihidupkan kembali di v1.3, dan bentuknya yang menentukan.** Mekanisme "iklan cepat
+selama ada entri menunggu" pernah ada di v1.1 lalu dicabut di v1.2: ia memakai 10 menit dan
+dinyalakan ulang oleh entri mana pun yang masih ada, sehingga jam yang ditinggal seharian dengan
+hasil yang tidak pernah diambil mengiklan 10x lebih sering sepanjang hari demi HP yang memang tidak
+datang.
+
+Yang berubah bukan penalarannya melainkan pola pemakaiannya. Sejak v1.3 jam **tidak** ditinggal
+menyala — ia dinyalakan sebentar, diukur, lalu dimatikan lagi — jadi "baru menyala dan masih
+memegang hasil" hampir selalu berarti seseorang sedang berdiri di depan HP-nya menunggu
+sinkronisasi. Justru di situ 1000 ms paling merugikan: Android `connect()` memindai dengan duty
+cycle rendah, dan pada pengiklan satu detik, timeout 15 detik sudah marjinal bahkan tanpa gangguan
+apa pun.
+
+**Gejalanya menyesatkan, dan itu sebabnya baris ini ditulis eksplisit:** jam TERLIHAT saat
+memindai — iklan hanya perlu TX sekali tembak — lalu setiap percobaan menyambung timeout, karena
+connect request menuntut jam MENDENGAR di jendela sesaat sesudah paket iklan. "Ditemukan tapi selalu
+timeout" karena itu harus dibaca sebagai keluhan interval, bukan sebagai jam yang rusak.
+
+Dua batas menjaganya tidak mengulang kesalahan v1.1: jendelanya **5 menit**, dan yang menyalakannya
+ulang adalah entri **baru**, bukan entri yang sekadar masih ada. Jam dengan tujuh hasil basi yang
+tidak bertambah karena itu gesit lima menit sesudah dinyalakan, lalu diam. Boot ikut tercakup tanpa
+aturan tambahan: hitungan tertunda mulai dari nol, jadi ring buffer yang dimuat tidak kosong selalu
+terbaca sebagai kenaikan.
 
 **Jam yang bond-nya dihapus harus kembali mengiklan cepat** — dalam segala hal ia kembali menjadi
 jam yang belum pernah dipasangkan. Kalau keputusannya dibaca dari `getNumBonds()` setiap kali,
@@ -498,6 +523,22 @@ yang tidak bisa ia simpulkan sendiri setelah dimatikan.
   mengikuti keberhasilan, bukan penekanan.
 - **`ARM_TITIK` baru menimpa yang lama**, di RAM maupun NVS. Hanya satu titik ter-ARM pada satu waktu;
   tidak ada keadaan setengah jalan yang perlu dijaga.
+- **Sesi yang BERAKHIR memadamkannya**, bila titik yang ter-ARM memang milik sesi itu: `BATAL_SESI`,
+  dan ARM yang kedaluwarsa 4 jam. Keduanya jalur yang sama di firmware (`ke_idle()`), dan
+  perbandingan `sesiId`-nya harus terjadi sebelum `sesiId` sesi dihapus.
+
+  Ini **tidak** bertabrakan dengan "ARM_TITIK hidup lebih lama daripada mesin status" (§12 poin 5).
+  Aturan itu tentang IDLE yang lahir dari **daya diputus**, dan jalur itu tidak lewat sini sama
+  sekali — ia memuat titiknya dari NVS saat boot. Yang lewat sini hanya sesi yang benar-benar
+  selesai, dan titik milik sesi yang selesai tidak akan pernah bisa terisi: aplikasi membuang sampel
+  yang `sesiId`-nya tidak dikenalnya. Tombol yang tetap menyala untuknya adalah kebohongan di layar
+  jam, jenis yang sama persis dengan yang dilarang dua butir di bawah, dan dengan akibat yang sama —
+  pengguna menekannya, satu siklus sensor terbuang di perangkat yang umur nyalanya ~50 menit, dan
+  tidak ada yang sampai ke mana pun.
+
+  §12 poin 5 sudah mengandaikan aturan ini. Kalimatnya soal titik basi — "`BATAL_SESI` penutupnya
+  tidak sampai karena jam sedang mati" — hanya masuk akal kalau `BATAL_SESI` yang **sampai** memang
+  memadamkannya.
 - **`UKUR` untuk titik yang sedang ter-ARM memadamkan tombolnya dan menghapus catatan NVS-nya**,
   sesudah pengukurannya tuntas. Jam tahu keduanya titik yang sama karena `ARM_TITIK` menyimpan
   `(sesiId, index)` dan `UKUR` membawa `(sesiId, index)`.
@@ -680,7 +721,7 @@ static void balas(uint8_t jenis, uint8_t payload) {   // jenis = 0x05 ACK atau 0
 
 ## 8. Karakteristik Status dan baterai
 
-`A5A70006`, Read + Notify, **8 byte**.
+`A5A70006`, Read + Notify, **10 byte** sejak v1.4 (8 byte sebelumnya).
 
 | Offset | Ukuran | Field |
 |---|---|---|
@@ -689,9 +730,47 @@ static void balas(uint8_t jenis, uint8_t payload) {   // jenis = 0x05 ACK atau 0
 | 2 | 1 | `baterai` % |
 | 3 | 1 | `flag`: bit0 sedang mengukur, bit1 kalibrasi tersimpan, bit2 baterai kritis, bit3 boot ini sudah punya anchor |
 | 4 | 4 | `uptime_s` uint32 LE |
+| 8 | 1 | `ukur_persen` 0..100 — kemajuan pengukuran, 0 bila tidak mengukur *(v1.4)* |
+| 9 | 1 | `ukur_sisa_detik` — perkiraan sisa, **jenuh di 255**, 0 bila tidak mengukur *(v1.4)* |
 
 Dikirim sebagai notifikasi setiap kali salah satu isinya berubah (ARM, tombol, mulai/selesai ukur,
 anchor tersimpan, kalibrasi tersimpan, kembali ke IDLE), dan disegarkan juga saat dibaca.
+
+### 8.1 Denyut selama mengukur (v1.4)
+
+**Selagi `flag` bit0 menyala, paket ini dikirim ulang setiap 2 detik walau isinya tidak berubah.**
+Itu satu-satunya penyimpangan dari aturan "kirim hanya saat berubah" di atas, dan ia ada karena
+aturan itu membuat bit0 tidak bisa dipercaya:
+
+- selama pengukuran, byte 0..3 diam sama sekali, jadi bit0 hanya pernah terkirim **dua kali** —
+  sekali di `ukur_mulai()`, sekali di `ukur_selesai()`;
+- akibatnya jam yang mati, tertidur, atau keluar jangkauan di tengah pengukuran meninggalkan bit0
+  menyala **selamanya** di sisi aplikasi, tidak bisa dibedakan dari jam yang benar-benar sedang
+  bekerja dengan nadi yang sulit ditemukan;
+- notifikasi "selesai" yang hilang di udara memberi gejala yang persis sama.
+
+Karena itu yang menjadi bukti hidup adalah **paket yang sampai**, bukan angka yang bergeser: denyut
+tetap dikirim walau `ukur_persen` kebetulan tidak berubah — persen yang mandek adalah keadaan sah
+yang punya kalimatnya sendiri di aplikasi ("rapatkan jam"), bukan alasan menggagalkan pengukuran.
+
+Byte 8..9 **tidak** ikut dalam perbandingan "berubah atau tidak" (seperti `uptime_s`), karena
+`ukur_sisa_detik` berubah tiap detik dan akan memaksa notifikasi sekali per detik. Yang mengatur
+kedatangannya hanyalah kadensi 2 detik itu.
+
+Biayanya terbatas: pengukuran terpanjang (batas keras 5 menit) menghasilkan ~150 paket 10 byte, dan
+lalu lintasnya berhenti sendiri begitu pengukurannya selesai.
+
+Aturan aplikasi yang berpasangan dengannya (`BleAsliService.ukurSekarang`):
+
+| Kejadian | Sikap aplikasi |
+|---|---|
+| Denyut datang, `ukur_persen` bergerak | Tunggu terus — tidak ada tenggat total |
+| Denyut datang, `ukur_persen` diam ≥ 60 dtk | Tunggu terus, layar berkata "jam belum menemukan nadi" |
+| Tiga denyut terlewat (8 dtk) | Hentikan: "jam berhenti mengabari" |
+| Paket 8 byte (firmware ≤ v1.3) | Tidak ada denyut untuk dijaga; pakai batas keras 5 menit |
+| bit0 padam, sampel belum datang | Beri 8 detik — Sampel memang berangkat lewat ring buffer sesudah paket Status ini |
+| Tautan putus | Hentikan seketika: "jam terputus" |
+| `UKUR_GAGAL` ber-`sesiId` nol | Hentikan seketika: "jam tidak berhasil membaca" |
 
 Baterai diduplikasi ke **Battery Level standar** `0x180F` / `0x2A19` (Read + Notify) supaya satu kali
 baca cukup bagi aplikasi.
@@ -1365,6 +1444,10 @@ jam.
 - [ ] Jam tanpa bond mengiklan 100 ms **tanpa batas waktu**, dan terlihat dalam satu detik pertama
       pemindaian
 - [ ] Jam ber-bond mengiklan cepat 30 detik sesudah boot/putus, lalu turun ke 1000 ms
+- [ ] Jam ber-bond yang dinyalakan **membawa entri di buffer** mengiklan cepat 5 menit, dan bisa
+      disambungkan dalam sekali coba sepanjang jendela itu
+- [ ] `BATAL_SESI` memadamkan tombol ukur yang ter-ARM untuk sesi itu — ARM titik → batalkan sesi →
+      tombolnya padam, dan tetap padam sesudah jam dimatikan-dihidupkan
 - [ ] Menghapus jam dari Pengaturan Bluetooth ponsel membuatnya **kembali mengiklan cepat**
 - [ ] Interval iklan tidak pernah ditata ulang dari dalam callback NimBLE
 - [ ] Handshake mengembalikan 20 byte sesuai §4

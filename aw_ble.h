@@ -44,6 +44,12 @@ void aw_ble_putar(void);
  * gesit itu -- lihat ADV_GESIT_MS di aw_ble.cpp. */
 void aw_ble_tertunda(uint8_t jumlah);
 
+/* Angka yang sama, dibaca balik. Ada demi net_task, yang memakainya sebagai
+ * gerbang "BLE masih punya pekerjaan, jangan sentuh radio" -- lihat net.cpp.
+ * Ia menyeberang task, jadi yang dikembalikan sengaja salinan satu byte milik
+ * aw_ble, bukan aw_ring_tertunda() yang menyusuri buffer hidup. */
+uint8_t aw_ble_jumlah_tertunda(void);
+
 /* ---- Perintah masuk ----
  * Ambil satu perintah dari antrean. false = antrean kosong. */
 bool aw_ble_ambil_perintah(aw_perintah_t *out);

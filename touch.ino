@@ -1259,8 +1259,9 @@ static void batt_gambar(int kotak, bool mengisi) {
  *      BOOT; tanpa itu menekan tombol terasa seperti tidak terjadi apa-apa.
  *   2. Kemajuan pengukuran -- pengguna harus diam selama belasan detik, dan
  *      dokumen 14 mewajibkan ia tahu bahwa sesuatu sedang berjalan serta
- *      seberapa jauh. Yang ditampilkan perkiraan sisa waktu, dihitung ulang dari
- *      laju detak yang sungguhan terjadi.
+ *      seberapa jauh. Yang ditampilkan persen, angka yang sama dengan yang
+ *      dikirim ke aplikasi di byte 8 paket Status; alasan memilihnya di atas
+ *      sisa detik ada di status_baris().
  *   3. Panggilan pengukuran terjadwal yang menunggu tombol.
  *   4. Tanggal -- keadaan tenang.
  */
@@ -1284,18 +1285,30 @@ static void status_baris(void) {
   pesan_sampai_ms = 0;
 
   if (jam_sedang_mengukur()) {
-    /* Sisa waktu, bukan cacahan detak. Keduanya menjawab "berapa lama lagi",
-     * tetapi hanya satu yang bisa dijawab pengguna: "12/15" menuntut ia tahu
-     * bahwa detak yang dimaksud adalah detak yang berhasil DIBACA, bukan detak
-     * jantungnya, dan itu tidak pernah jelas dari layar. Angkanya sendiri sama
-     * jujurnya -- ia dihitung ulang dari laju detak yang sungguhan terjadi, jadi
-     * ia memendek saat nadinya ketemu cepat dan memanjang saat susah; lihat
-     * jam_ukur_sisa_detik(). */
-    /* "SISA", bukan "MENGUKUR ... dtk": yang terakhir 113 px dan menabrak angka
-     * baterai, sementara baris ini cuma punya ~100 px (lihat build_wajah()).
-     * Bahwa jam sedang mengukur toh sudah terbaca dari keempat kartu yang
-     * angkanya bergerak. */
-    snprintf(buf, sizeof(buf), "SISA %u dtk", (unsigned)jam_ukur_sisa_detik());
+    /* Kemajuan persen, bukan sisa detik. Keduanya jujur -- keduanya dihitung
+     * ulang dari laju detak yang sungguhan terjadi -- tetapi keduanya berbeda
+     * pada satu hal yang menentukan: SISA BOLEH BERTAMBAH.
+     *
+     * Angka sisa memanjang setiap kali nadinya susah ditemukan, dan itu persis
+     * keadaan yang paling sering dialami pengguna lansia (pergelangan dingin,
+     * tali agak longgar). Hitung mundur yang naik dari 12 ke 25 terbaca sebagai
+     * alat yang rusak atau bertambah lama karena penggunanya salah, dan orang
+     * lalu MENGGERAKKAN TANGAN untuk "membetulkan" -- persis hal yang merusak
+     * pembacaannya. Persen dijamin tidak pernah mundur (lihat jam_ukur_persen()
+     * di aw_jam.cpp): pada nadi yang susah ia berhenti, dan berhenti jauh lebih
+     * mudah dibaca sebagai "sedang berusaha" daripada angka yang naik.
+     *
+     * Ia juga menyamakan bahasa dengan aplikasi, yang menampilkan persen yang
+     * SAMA dari byte 8 paket Status (dokumen 8) -- dua layar yang menyebut satu
+     * pengukuran dengan dua satuan berbeda mengundang pertanyaan mana yang
+     * benar.
+     *
+     * Kata "UKUR" tetap dipakai walau cincin tepi sudah menggambarkan persen
+     * yang sama: baris ini bersebelahan dengan angka baterai, dan "45%" telanjang
+     * di sebelah ikon baterai punya satu bacaan yang salah dan sangat wajar.
+     * Panjangnya masih aman -- "UKUR 100%" lebih pendek daripada "SISA 120 dtk"
+     * yang selama ini muat di ~100 px baris ini (lihat build_wajah()). */
+    snprintf(buf, sizeof(buf), "UKUR %u%%", (unsigned)jam_ukur_persen());
     if (set_jika_beda(lbl_status, buf))
       lv_obj_set_style_text_color(lbl_status, lv_color_hex(C_ISI), 0);
     return;

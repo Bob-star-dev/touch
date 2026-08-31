@@ -8,7 +8,26 @@
  */
 #pragma once
 
-/* ---------------- Wi-Fi ---------------- */
+/* ---------------- Wi-Fi ----------------
+ *
+ * DIMATIKAN. Wi-Fi di firmware ini melayani dua hal saja -- NTP dan cuaca --
+ * dan yang pertama sudah punya sumber yang lebih baik: ANCHOR_WAKTU membawa
+ * epoch dari HP dan tm_terapkan_epoch_utc() menuliskannya ke RTC persis seperti
+ * NTP, di SETIAP koneksi (dokumen 4.2). Jadi yang tersisa milik Wi-Fi sendiri
+ * cuma ikon cuaca.
+ *
+ * Harganya jauh lebih mahal daripada itu. AP yang tidak ada membuat net_task
+ * menjalankan asosiasi yang gagal berulang-ulang, dan pemindaian aktif di 2,4
+ * GHz itu berbagi radio dengan BLE. Iklan tetap keluar -- ia cuma TX sekali
+ * tembak -- tetapi connect request perlu jam MENDENGAR di jendela sesaat
+ * sesudah paket iklan, dan jendela itulah yang hilang. Gejalanya menyesatkan:
+ * jam TERLIHAT saat memindai, lalu setiap percobaan menyambung timeout.
+ *
+ * Kredensialnya sengaja tidak dihapus, supaya menyalakannya lagi cukup satu
+ * angka. Baca dulu gerbang dan backoff di net.cpp sebelum melakukannya.
+ */
+#define AW_PAKAI_WIFI   0
+
 #define WIFI_SSID       "asawatch"
 #define WIFI_PASSWORD   "12345678"
 
@@ -36,6 +55,8 @@
 #define NTP_RESYNC_MS       (6UL * 3600UL * 1000UL) /* NTP ulang: 6 jam      */
 #define RTC_RESYNC_MS       (60UL * 1000UL)         /* baca RTC: 1 menit     */
 #define WIFI_RETRY_MS       (60UL * 1000UL)         /* coba sambung lagi     */
+#define WIFI_RETRY_MAX_MS   (15UL * 60UL * 1000UL)  /* batas atas backoff    */
+#define WIFI_TIMEOUT_MS     (8UL * 1000UL)          /* lama satu percobaan   */
 
 /* Backoff kalau permintaan cuaca gagal. WAJIB ada: tanpa jeda yang membesar,
  * kegagalan berulang (mis. key belum aktif -> HTTP 401) membuat board memanggil

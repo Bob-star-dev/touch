@@ -18,7 +18,7 @@
 
 /* ---------------- Versi ---------------- */
 #define AW_VERSI_MAYOR      1
-#define AW_VERSI_MINOR      3
+#define AW_VERSI_MINOR      4
 /* Dinaikkan manual tiap kali firmware dirilis. Aplikasi hanya melaporkannya,
  * tidak mengambil keputusan apa pun darinya. */
 #define AW_FIRMWARE_BUILD   1
@@ -60,7 +60,18 @@
 #define AW_LEN_INFO       20
 #define AW_LEN_SAMPEL     31
 #define AW_LEN_PERISTIWA  26
-#define AW_LEN_STATUS     8
+/* Status tumbuh dari 8 -> 10 byte di v1.4: byte 8 kemajuan pengukuran 0..100,
+ * byte 9 perkiraan sisa detik (jenuh di 255). Aman ditumbuhkan ke belakang --
+ * dokumen 3 mewajibkan aplikasi mengabaikan byte berlebih, dan pembacanya di
+ * aplikasi (`_periksa` di protokol_jam.dart) memang hanya memeriksa panjang
+ * MINIMUM. Aplikasi lama tetap membaca 8 byte pertama dengan benar.
+ *
+ * Kedua byte ini ada bukan sekadar untuk memperindah layar: ia yang membuat
+ * paket Status menjadi BUKTI HIDUP. Selama mengukur, byte 0..3 tidak berubah
+ * sama sekali, sehingga bit "sedang mengukur" hanya terkirim dua kali seumur
+ * pengukuran -- dan aplikasi tidak bisa membedakan jam yang masih bekerja dari
+ * jam yang mati di tengah jalan. Lihat kirim_status() di aw_jam.cpp. */
+#define AW_LEN_STATUS     10
 
 /* Perintah terpanjang: opcode + 16B sesiId + 1B index = 18. Dibulatkan ke 20
  * supaya perintah masa depan yang sedikit lebih panjang tidak diam-diam

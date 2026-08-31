@@ -36,8 +36,11 @@
  * susah terbaca (jari longgar, tangan dingin, kulit gelap, gerakan) menghasilkan
  * detak lebih jarang, dan pengukuran ikut memanjang sendiri sampai gerbangnya
  * terpenuhi. Pengukuran berhenti karena DATANYA cukup, bukan karena hitungan
- * mundur habis -- lihat jam_ukur_sisa_detik() untuk perkiraan yang ditampilkan
- * ke pengguna, yang ikut memendek begitu detaknya datang cepat.
+ * mundur habis -- lihat jam_ukur_sisa_detik() untuk perkiraannya, yang ikut
+ * memendek begitu detaknya datang cepat. Perkiraan itu dikirim ke aplikasi di
+ * byte 9 paket Status, tetapi TIDAK ditampilkan di layar jam: yang tampil di
+ * sana persen (jam_ukur_persen()), karena ia dijamin tidak pernah mundur
+ * sedangkan sisa detik boleh bertambah -- alasannya di status_baris().
  *
  * UKUR_MIN_MS adalah lantainya. Tanpa itu, nadi cepat (100+ bpm) memenuhi 10
  * detak dalam 6 detik, dan seluruh hasil akan lahir dari dua-tiga window SpO2
@@ -217,6 +220,25 @@ static uint8_t s_tolak = JAM_TOLAK_TIDAK_ADA;
  * benar-benar berubah. */
 static uint8_t s_status_paket[AW_LEN_STATUS];
 static bool    s_status_pernah = false;
+static uint32_t s_status_kirim_ms = 0;
+
+/* Kadensi DENYUT Status selama pengukuran (dokumen 8, v1.4).
+ *
+ * Selama mengukur, byte 0..3 tidak berubah sedikit pun -- status sesi, jumlah
+ * tertunda, baterai, dan flag semuanya diam. Dengan aturan "kirim hanya kalau
+ * berubah", bit "sedang mengukur" karena itu hanya pernah terkirim DUA KALI
+ * seumur satu pengukuran: sekali saat mulai, sekali saat selesai. Bagi aplikasi
+ * itu sebuah LEVEL, bukan denyut, dan level tidak bisa membedakan tiga keadaan
+ * yang sama sekali berbeda akibatnya: jam yang masih mengukur dengan nadi
+ * lambat, jam yang mati di tengah pengukuran, dan notifikasi "selesai" yang
+ * hilang di udara. Ketiganya tampil sebagai "sedang mengukur" selamanya.
+ *
+ * Dua detik dipilih supaya aplikasi bisa menyatakan jam berhenti mengabari
+ * dalam hitungan detik (tiga denyut terlewat) tanpa membuat penantian sah
+ * terputus, dan biayanya tetap kecil: pengukuran terpanjang (UKUR_BATAS_KERAS_MS
+ * 5 menit) hanya menghasilkan ~150 paket 10 byte, dan lalu lintasnya berhenti
+ * sendiri begitu pengukurannya selesai. */
+#define STATUS_DENYUT_UKUR_MS 2000UL
 
 static const uint8_t SESI_NOL[16] = { 0 };
 
@@ -264,7 +286,20 @@ static void balas(uint8_t jenis, uint8_t payload) {
   aw_tulis_u32(&b[20], aw_uptime_s());
   b[24] = 0;
   b[25] = payload;
-  aw_ble_kirim_peristiwa(b);
+
+  /* Kegagalan mengirim balasan DICATAT, meski tidak bisa diperbaiki di sini.
+   *
+   * aw_ble_kirim_peristiwa() menjawab false kalau CCCD Peristiwa belum ditulis,
+   * dan sampai sekarang jawaban itu dibuang. Akibatnya keadaan yang paling
+   * membingungkan tidak meninggalkan jejak di mana pun: aplikasi menunggu ACK
+   * sampai habis waktu lalu mengulang perintahnya tiga kali, sementara jam
+   * sudah mengerjakan perintah itu dan merasa sudah menjawab. Satu baris ini
+   * yang membedakannya dari paket yang terkirim lalu hilang di udara -- dan
+   * keduanya di layar aplikasi terlihat sama persis. */
+  if (!aw_ble_kirim_peristiwa(b))
+    Serial.printf("[balas] %s 0x%02X TIDAK terkirim -- langganan Peristiwa "
+                  "belum terpasang\n",
+                  jenis == AW_EV_ACK ? "ACK" : "NAK", (unsigned)payload);
 }
 
 static void ack(uint8_t opcode) { balas(AW_EV_ACK, opcode); }
@@ -291,13 +326,44 @@ static void kirim_status(void) {
                    (aw_anchor_boot_ini() ? AW_ST_ADA_ANCHOR         : 0));
   aw_tulis_u32(&b[4], aw_uptime_s());
 
+  /* Kemajuan pengukuran (dokumen 8, v1.4). Nol saat tidak mengukur -- kedua
+   * fungsi ini memang mengembalikan nol di luar pengukuran, jadi aplikasi tidak
+   * perlu aturan tambahan untuk membacanya.
+   *
+   * Sisa detik dijenuhkan di 255, bukan dipotong: satu byte tidak muat 300 detik
+   * batas keras, dan angka yang MELINGKAR akan membuat perkiraan sisa tiba-tiba
+   * mengecil justru saat pengukurannya paling lama. */
+  uint16_t sisa = jam_ukur_sisa_detik();
+  b[8] = jam_ukur_persen();
+  b[9] = (uint8_t)(sisa > 255 ? 255 : sisa);
+
   /* uptime (byte 4..7) tidak ikut dibandingkan: ia berubah tiap detik, dan
    * memakainya sebagai pemicu berarti mengirim notifikasi Status sekali per
-   * detik selamanya. Yang menarik bagi aplikasi adalah empat byte pertama. */
-  if (s_status_pernah && memcmp(b, s_status_paket, 4) == 0) return;
+   * detik selamanya. Yang menarik bagi aplikasi adalah empat byte pertama.
+   *
+   * Byte 8..9 juga TIDAK ikut dibandingkan, dan alasannya sama: sisa detik
+   * berubah tiap detik. Yang mengatur kedatangannya adalah denyut di bawah --
+   * dan denyut itu dikirim walaupun kedua byte kebetulan tidak berubah, karena
+   * yang menjadi bukti hidup adalah PAKET YANG SAMPAI, bukan angka yang
+   * bergeser: persen yang mandek pada nadi yang sulit ditemukan adalah keadaan
+   * yang sah, dan aplikasi memberinya kalimatnya sendiri. */
+  bool berubah = !s_status_pernah || memcmp(b, s_status_paket, 4) != 0;
+  bool denyut  = s_ukur_aktif &&
+                 (uint32_t)(millis() - s_status_kirim_ms) >= STATUS_DENYUT_UKUR_MS;
+  if (!berubah && !denyut) return;
+
   memcpy(s_status_paket, b, sizeof(b));
   s_status_pernah = true;
+  s_status_kirim_ms = millis();
   aw_ble_set_status(b);
+
+  /* Denyut dicetak, perubahan biasa tidak. Bukan simetri yang hilang melainkan
+   * satu-satunya cara membedakan dua kegagalan yang di layar aplikasi terlihat
+   * sama persis: jam yang tidak berdenyut, dan denyut yang berangkat tetapi
+   * tidak pernah sampai. Barisnya hanya muncul selama mengukur, tiap 2 detik. */
+  if (!berubah && denyut)
+    Serial.printf("[status] denyut persen=%u sisa=%u\n",
+                  (unsigned)b[8], (unsigned)b[9]);
 }
 
 /* ================= Pengukuran ================= */
@@ -530,6 +596,33 @@ static void ukur_putar(void) {
 
 /* ================= Mesin status sesi (dokumen 12) ================= */
 static void ke_idle(void) {
+  /* Tombol ukur milik sesi INI dipadamkan, dan urutannya tidak boleh dibalik:
+   * s_sesi_id dihapus beberapa baris di bawah, jadi perbandingannya harus
+   * terjadi sekarang.
+   *
+   * Ini BUKAN pelanggaran aturan "ARM_TITIK hidup lebih lama daripada mesin
+   * status" (dokumen 12 poin 5). Aturan itu tentang IDLE yang lahir dari DAYA
+   * DIPUTUS, dan jalur itu tidak lewat sini sama sekali -- ia memuat titiknya
+   * dari NVS di jam_mulai(). Yang lewat sini cuma dua, BATAL_SESI dan ARM yang
+   * kedaluwarsa, dan keduanya berarti sesinya SELESAI.
+   *
+   * Titik milik sesi yang selesai tidak akan pernah bisa terisi lagi: aplikasi
+   * membuang sampel yang sesiId-nya tidak dikenalnya. Tombol yang tetap menyala
+   * untuknya karena itu kebohongan di layar jam -- jenis yang sama persis
+   * dengan yang sudah dilarang dokumen 5 pada titik yang sudah terukur, dan
+   * dengan akibat yang sama: pengguna menekannya, satu siklus sensor terbuang
+   * di perangkat yang umur nyalanya ~50 menit, dan tidak ada yang sampai.
+   *
+   * Dokumen 12 poin 5 sudah mengandaikan perilaku ini. Kalimatnya soal titik
+   * basi -- "BATAL_SESI penutupnya tidak sampai karena jam sedang mati" --
+   * hanya masuk akal kalau BATAL_SESI yang SAMPAI memang memadamkannya. */
+  if (s_titik_ada && memcmp(s_titik_sesi, s_sesi_id, 16) == 0) {
+    s_titik_ada = false;
+    aw_titik_hapus();
+    Serial.printf("[titik] sesi berakhir -- tombol ukur index %u dipadamkan\n",
+                  (unsigned)s_titik_index);
+  }
+
   s_status = AW_SESI_IDLE;
   memset(s_sesi_id, 0, 16);
   s_t0_uptime = 0;
@@ -540,8 +633,8 @@ static void ke_idle(void) {
    * datang sesudah BATAL_SESI mengukur ulang titik yang sudah terisi -- dan
    * sejak v1.3 jam ada di IDLE hampir sepanjang sesi, jadi itu jalur biasa.
    *
-   * ARM_TITIK juga tidak disentuh: ia sengaja hidup lebih lama daripada mesin
-   * status, karena penyalaan di tengah sesi selalu mendarat di IDLE. */
+   * Perhatikan bedanya dengan ARM_TITIK di atas: dedup dibatasi masa hidup
+   * DAYA, titik ter-ARM dibatasi masa hidup SESI. */
   kirim_status();
 }
 
@@ -740,6 +833,18 @@ static void jalankan_perintah(const aw_perintah_t *p) {
   uint8_t op = p->data[0];
   const uint8_t *arg = &p->data[1];
   uint8_t narg = (uint8_t)(p->panjang - 1);
+
+  /* Setiap perintah yang SAMPAI dicatat, tepat di sini -- sesudah antrean,
+   * sebelum penanganannya. Inilah yang memisahkan "write tidak pernah tiba"
+   * dari "tiba, dikerjakan, tapi balasannya tidak sampai": dua kegagalan yang
+   * di layar aplikasi sama-sama muncul sebagai "tidak dijawab jam".
+   *
+   * ACK_EVENT dikecualikan karena ia datang sekali per entri buffer, dan
+   * mencatatnya berarti membanjiri konsol tepat pada saat yang paling perlu
+   * dibaca -- yaitu selagi buffer dikuras. */
+  if (op != AW_OP_ACK_EVENT)
+    Serial.printf("[cmd] opcode 0x%02X, %u byte argumen\n",
+                  (unsigned)op, (unsigned)narg);
 
   switch (op) {
 
@@ -1161,6 +1266,12 @@ void jam_putar(void) {
   putar_perintah_ble();      /* ambil dari antrean, jalankan opcode */
   putar_sesi();              /* timeout ARM, jadwal index 2 dan 3   */
   ukur_putar();              /* panen metrik, padamkan LED bila cukup */
+
+  /* Denyut Status selama mengukur (dokumen 8, v1.4). Dipanggil tiap putaran;
+   * kadensinya yang menahan, bukan pemanggilnya -- supaya tidak ada satu pun
+   * jalur yang bisa lupa menyalakan denyutnya, dan supaya paket terakhir
+   * (kemajuan 100 / selesai) tetap datang dari ukur_selesai() seperti biasa. */
+  if (s_ukur_aktif) kirim_status();
 
   /* Jumlah entri tertunda dititipkan SEBELUM aw_ble_putar(), supaya keputusan
    * interval iklan di putaran ini memakai angka putaran ini juga. */

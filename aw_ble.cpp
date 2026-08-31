@@ -85,6 +85,32 @@ static volatile bool     s_siap_baru = false;
 #define ADV_LAMBAT     1600     /* 1000 ms */
 #define ADV_JENDELA_MS 30000UL
 
+/* Jendela iklan cepat selama masih ada entri yang menunggu diambil.
+ *
+ * Ini MENGHIDUPKAN KEMBALI mekanisme yang dicabut di v1.2, dengan bentuk yang
+ * berbeda dan dengan alasan yang berubah. Versi lama memakai 10 menit dan
+ * dinyalakan ulang oleh entri mana pun yang masih ada, sehingga jam yang
+ * ditinggal seharian dengan hasil yang tidak pernah diambil mengiklan 10x lebih
+ * sering sepanjang hari demi HP yang memang tidak datang.
+ *
+ * Yang berubah adalah pola pemakaiannya. Di v1.3 jam TIDAK ditinggal menyala:
+ * ia dinyalakan sebentar, diukur, lalu dimatikan lagi -- jadi "baru menyala dan
+ * masih memegang hasil" hampir selalu berarti seseorang sedang berdiri di depan
+ * HP-nya menunggu sinkronisasi. Justru di situ iklan 1000 ms paling merugikan:
+ * Android connect() memindai dengan duty cycle rendah, dan pada pengiklan satu
+ * detik, timeout 15 detik sudah marjinal bahkan tanpa gangguan apa pun. Gejala
+ * yang muncul bukan "lambat" melainkan "selalu timeout" -- perangkat ditemukan
+ * saat memindai, tetapi tidak pernah bisa disambungi.
+ *
+ * Dua hal yang membuat ini tidak mengulang kesalahan yang sama:
+ *
+ *   - Jendelanya 5 menit, bukan 10 menit.
+ *   - Yang menyalakan ulang adalah entri BARU, bukan entri yang sekadar masih
+ *     ada (lihat aw_ble_tertunda()). Jam dengan tujuh hasil basi dan tidak ada
+ *     yang menambah karena itu gesit selama lima menit sesudah dinyalakan, lalu
+ *     diam -- bukan gesit selamanya. */
+#define ADV_GESIT_MS   (5UL * 60UL * 1000UL)
+
 /* Evaluasi ulang dijadwalkan, bukan tiap iterasi loop: loop() berputar tiap
  * ~2 ms dan menanyakan jumlah bond ke stack sesering itu adalah pekerjaan yang
  * tidak menghasilkan apa pun. Satu detik sudah jauh lebih cepat daripada
@@ -106,12 +132,18 @@ static volatile bool     s_siap_baru = false;
 #define AW_DAYA_PANCAR  ESP_PWR_LVL_P9
 
 static uint32_t s_adv_jendela_sampai = 0;   /* akhir jendela cepat 30 detik  */
+static uint32_t s_gesit_sampai      = 0;   /* akhir jendela "ada entri menunggu" */
 static uint16_t s_adv_itvl          = 0;   /* 0 = iklan belum pernah dipasang */
 static uint32_t s_adv_eval_ms       = 0;
 static volatile bool s_perlu_iklan_ulang = false;
 
-/* Jumlah entri yang belum di-ACK aplikasi, dititipkan aw_jam tiap putaran. */
-static uint8_t  s_tertunda      = 0;
+/* Jumlah entri yang belum di-ACK aplikasi, dititipkan aw_jam tiap putaran.
+ *
+ * volatile karena net_task ikut membacanya lewat aw_ble_jumlah_tertunda(), dan
+ * satu byte adalah satu-satunya bentuk yang boleh menyeberang task di sini --
+ * aw_ring_tertunda() yang sebenarnya menyusuri 64 slot yang sedang diubah task
+ * loop, dan memanggilnya dari luar melanggar dokumen 13.2. */
+static volatile uint8_t s_tertunda = 0;
 
 /* Kapan terakhir keaktifan iklan diperiksa -- lihat penjaga di aw_ble_putar(). */
 static uint32_t s_periksa_iklan_ms = 0;
@@ -300,7 +332,9 @@ static bool adv_ada_bond(void) {
 static void perbarui_interval_iklan(bool paksa) {
   bool     ada_bond = adv_ada_bond();
   bool     jendela  = (int32_t)(millis() - s_adv_jendela_sampai) < 0;
-  uint16_t mau      = (!ada_bond || jendela) ? ADV_CEPAT : ADV_LAMBAT;
+  bool     gesit    = s_tertunda > 0 &&
+                      (int32_t)(millis() - s_gesit_sampai) < 0;
+  uint16_t mau      = (!ada_bond || jendela || gesit) ? ADV_CEPAT : ADV_LAMBAT;
 
   if (!paksa && mau == s_adv_itvl) return;
   setel_iklan(mau);
@@ -308,8 +342,11 @@ static void perbarui_interval_iklan(bool paksa) {
   if (!ada_bond)     Serial.println("[ble] iklan 100 ms (tanpa bond, tanpa batas waktu)");
   else if (jendela)  Serial.printf("[ble] iklan 100 ms (jendela %lu dtk lagi)\n",
                                    (unsigned long)((s_adv_jendela_sampai - millis()) / 1000UL));
+  else if (gesit)    Serial.printf("[ble] iklan 100 ms (%u entri menunggu, %lu dtk lagi)\n",
+                                   (unsigned)s_tertunda,
+                                   (unsigned long)((s_gesit_sampai - millis()) / 1000UL));
   else               Serial.printf("[ble] iklan 1000 ms (ber-bond, hemat)%s\n",
-                                   s_tertunda ? " -- catatan: masih ada entri tertunda" : "");
+                                   s_tertunda ? " -- entri tertunda, jendela gesit habis" : "");
 }
 
 /* ---------------- Init ---------------- */
@@ -415,17 +452,21 @@ void aw_ble_begin(void) {
 
 /* ---------------- Putaran ---------------- */
 void aw_ble_tertunda(uint8_t n) {
-  /* Dulu angka ini memaksa iklan cepat selama 10 menit sejak entri baru masuk.
-   * Itu dihapus di v1.2: dokumen 3.3 sudah menimbang kasus yang sama persis dan
-   * membatasinya pada jendela 30 detik per peristiwa putus, karena jam yang
-   * ditinggal seharian dengan hasil yang tidak pernah diambil akan mengiklan
-   * 10x lebih sering sepanjang hari demi HP yang memang tidak datang.
+  /* NAIKNYA angka ini yang membuka jendela gesit, bukan nilainya yang bukan nol.
+   * Bedanya itu yang menjaga jam tetap hemat: hasil yang sama, yang sudah lama
+   * menunggu, tidak memperpanjang apa pun -- ia hanya sempat gesit sekali,
+   * selama ADV_GESIT_MS, lalu ikut turun ke 1000 ms bersama yang lain.
    *
-   * Angkanya tetap disimpan -- ia dipakai baris log perbarui_interval_iklan()
-   * supaya "1000 ms padahal ada entri menunggu" terlihat saat menguji, bukan
-   * jadi tebakan. */
+   * Boot ikut tercakup tanpa baris khusus: s_tertunda mulai dari 0, jadi
+   * panggilan pertama sesudah aw_store_begin() memuat ring buffer yang tidak
+   * kosong selalu terbaca sebagai kenaikan. Itu justru kasus yang paling sering
+   * di v1.3 -- jam dinyalakan membawa hasil, dan detik-detik pertamanya adalah
+   * saat seseorang mencoba menyambung. */
+  if (n > s_tertunda) s_gesit_sampai = millis() + ADV_GESIT_MS;
   s_tertunda = n;
 }
+
+uint8_t aw_ble_jumlah_tertunda(void) { return s_tertunda; }
 
 void aw_ble_putar(void) {
   /* Parameter cepat dipasang di konteks loop, bukan di dalam onConnect: aturan
