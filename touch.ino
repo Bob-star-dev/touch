@@ -86,6 +86,7 @@
 #include "rtc.h"
 #include "time_manager.h"
 #include "net.h"
+#include "weather.h"
 #include "battery.h"
 #include "ppg.h"
 #include "aw_jam.h"
@@ -101,6 +102,18 @@
  * Apa arti tombol fisik saat ini. HANYA untuk label dan pesan -- tidak pernah
  * untuk memilih fungsi mana yang dipanggil (dokumen 12 poin 5 & 13.4). */
 typedef enum { TBL_MATI = 0, TBL_UKUR, TBL_SELESAI_MAKAN, TBL_CEK_MANUAL } tombol_arti_t;
+
+/* BATT_N_KOTAK dan batt_widget_t juga harus di sini, alasan sama persis dengan
+ * tombol_arti_t di atas: batt_gambar()/batt_buat() memakai batt_widget_t*
+ * sebagai parameter, dan prototipe otomatisnya disisipkan tepat di bawah blok
+ * #include -- sebelum typedef yang ditulis di dekat pemakainya sendiri sempat
+ * ada. Definisi ukuran/posisi ikon baterai yang sesungguhnya tetap di bagian
+ * Geometri seperti biasa; ini cuma bentuk handle-nya. */
+#define BATT_N_KOTAK 3
+typedef struct {
+  lv_obj_t *cangkang, *nub, *petir;
+  lv_obj_t *kotak[BATT_N_KOTAK];
+} batt_widget_t;
 
 /* Subset digit-only dari montserrat_48 (cuma glyph '-' '.' '/' dan 0-9),
  * dipakai untuk jam besar. Font bawaan LVGL di ukuran itu ikut membawa seluruh
@@ -295,6 +308,16 @@ static bool s_bl_tunda    = false;
  * menyalakan layarnya sendiri lagi karena ada pengukuran yang jatuh tempo. */
 static bool pwr_daya_lepas = false;
 
+/* true kalau halaman kedua (wajah metrik) yang sedang tampil, false kalau
+ * halaman utama. Dideklarasikan di sini, jauh dari halaman_set()/
+ * halaman_evaluasi() yang memakainya (ada di bagian "Pembaruan isi" di
+ * bawah), karena splash_tutup() -- yang ada JAUH lebih awal di berkas ini --
+ * juga perlu menyetelnya saat menentukan halaman awal. Arduino menyisipkan
+ * prototipe otomatis untuk FUNGSI, tidak untuk variabel, jadi variabel globalnya
+ * sendiri harus sudah ada sebelum pemakaian pertamanya. */
+static bool     s_di_wajah = false;
+static uint32_t s_pulang_home_pada = 0;   /* 0 = tidak ada tenggat berjalan */
+
 /* Layar pembuka. Definisinya jauh di bawah (butuh scr_wajah dan helper widget),
  * tetapi layar_set() adalah satu-satunya pintu menyala/mati layar dan karena itu
  * juga satu-satunya tempat yang benar untuk memulai dan membatalkannya.
@@ -407,33 +430,86 @@ static void layar_nyala_sementara(uint32_t ms) {
  * wajah_jam_modular_240x280.png, bukan tafsiran. */
 #define C_BG_ATAS   0x06070B   /* latar di tepi atas   */
 #define C_BG_BAWAH  0x0D0C18   /* latar di tepi bawah  */
+
+/* Kartu halaman kedua: dikembalikan ke warna asli wajah_jam_modular_240x280.png
+ * atas permintaan langsung ("buat seperti ini lagi") -- sempat diganti ke
+ * sampel dari WhatsApp Image 2026-09-02 at 00.33.37.jpeg, tapi itu dibatalkan. */
 #define C_KARTU     0x171A21
 #define C_KARTU_BRD 0x23262D
 #define C_PUTIH     0xFFFFFF   /* angka besar & jam    */
 #define C_TANGGAL   0xB9C1D0   /* baris tanggal        */
 #define C_REDUP     0x8E96A6   /* judul kartu, satuan, ikon baterai   */
 #define C_ISI       0xA2E32B   /* petir "sedang mengisi" */
-#define C_TRACK     0x2E3444   /* jalur gelap di belakang cincin */
+/* Jalur di belakang cincin. Sebelumnya 0x2E3444, kontras baik terhadap latar
+ * navy nyaris-hitam yang lama (C_BG_ATAS/C_BG_BAWAH). Sejak latar halaman ini
+ * disamakan dengan C_HOME_BG_BODY (teal, jauh lebih terang), warna lama itu
+ * nyaris melebur -- luminansinya nyaris sama, cuma rona yang beda, dan mata
+ * jauh lebih peka pada beda terang-gelap daripada beda rona. Disamakan dengan
+ * C_HOME_VSEP: sudah terbukti terlihat di garis pemisah header halaman utama
+ * di atas latar yang sama persis. */
+#define C_TRACK     0x3D747B
 #define C_CINCIN_HR 0xFF3B5C
 #define C_CINCIN_SP 0xA2E32B
 #define C_CINCIN_GL 0x22D3EE
 
-/* ================= Geometri =================
- * Diukur dari gambar desain, bukan dikira-kira:
- *   kartu kiri  x=10..115   kartu kanan x=124..229   (lebar 106, jarak 8)
- *   baris atas  y=101..180  baris bawah y=191..270   (tinggi 80, jarak 10)
- *   cincin      bbox x=11..79, y=15..83 -> pusat (45,49), jari-jari luar 34
- *   pita cincin 7 px, jari-jari luar 34 / 25 / 16 */
-#define KARTU_W   106
-#define KARTU_H   80
-#define KARTU_X1  10
-#define KARTU_X2  124
-#define KARTU_Y1  101
-#define KARTU_Y2  191
+/* ---- Palet halaman utama (home) ----
+ * Diambil dari piksel 1baru.png dengan sample langsung (bukan tafsiran),
+ * sama seperti palet di atas. Skema warnanya beda sengaja -- teal + emas,
+ * bukan navy + neon -- karena halaman ini "kartu ucapan" yang dilihat
+ * sepanjang hari, sementara wajah jam adalah dasbor metrik yang hanya
+ * tampil saat ada pengukuran. */
+#define C_HOME_BG_HDR   0x04363D   /* latar bilah header       */
+#define C_HOME_BG_BODY  0x034B55   /* latar badan halaman      */
+#define C_HOME_DIVIDER  0xB79E2E   /* garis pemisah header     */
+#define C_HOME_VSEP     0x3D747B   /* garis pemisah tegak      */
+#define C_HOME_GOLD     0xECC94B   /* wajik & titik dua jam    */
+#define C_HOME_MUTED    0xCFE3DE   /* nama hari, tanggal       */
 
-#define CINCIN_CX 45
-#define CINCIN_CY 49
+/* ================= Geometri =================
+ * Cincin di PITA HORIZONTAL DI TENGAH, persis di antara baris kartu atas dan
+ * bawah, dan karena x pusatnya juga di tengah layar, ia otomatis berjarak
+ * sama dari kartu kiri MAUPUN kanan, di kedua baris.
+ *
+ * Baris atas dan baris bawah HAMPIR bertemu di garis tengah (KARTU_TENGAH,
+ * pertengahan GEOMETRI_ATAS/BAWAH) -- disisakan celah KARTU_GAP kecil di
+ * antara keduanya (bukan 0, dan bukan pula jarak napas lebar seperti
+ * sebelumnya) supaya kedua baris tidak terlihat "bertabrakan" lewat garis
+ * bordernya sendiri. Cincin tetap dipusatkan tepat di KARTU_TENGAH dan
+ * radiusnya jauh lebih besar daripada celah ini -- ia SENGAJA menimpa kedua
+ * baris kartu, dan lencana di baliknya (lihat build_wajah()) yang membuat
+ * tumpang-tindih itu terlihat sebagai fondasi, bukan tabrakan.
+ *
+ * Lebar dan posisi X kartu TIDAK berubah dari desain asli:
+ *   kartu kiri  x=10..115   kartu kanan x=124..229   (lebar 106, jarak 8) */
+#define KARTU_W        106
+#define KARTU_X1        10
+#define KARTU_X2       124
+
+#define GEOMETRI_ATAS   32    /* di bawah baris status (y13) & baterai (y14+14) */
+#define GEOMETRI_BAWAH 276    /* sisa 4 px ke tepi layar (280)                  */
+#define KARTU_GAP        8    /* celah tegak antar baris -- sama seperti jarak
+                                * mendatar antar kolom (KARTU_X2 - KARTU_X1 - KARTU_W) */
+
+#define KARTU_TENGAH  ((GEOMETRI_ATAS + GEOMETRI_BAWAH) / 2)          /* 154 */
+#define KARTU_Y1      GEOMETRI_ATAS
+#define KARTU_H       (KARTU_TENGAH - KARTU_GAP / 2 - KARTU_Y1)       /* 118 */
+#define KARTU_Y2      (KARTU_TENGAH + KARTU_GAP / 2)                  /* 158 */
+
+/* Cincin dipusatkan di tengah layar (x=120) dan tepat di KARTU_TENGAH --
+ * diturunkan dari tata letak kartu supaya keduanya tidak bisa diam-diam
+ * saling menyimpang kalau salah satu diubah lagi. */
+#define CINCIN_CX (SCREEN_W / 2)
+#define CINCIN_CY KARTU_TENGAH
 #define CINCIN_W  7
+
+/* Blok isi kartu (ikon+judul di atas, nilai+satuan di bawahnya) tingginya
+ * sekitar 52 px (relatif y=8 sampai dasar nilai di y=26+~34) -- angka tetap
+ * dari font_nilai terbesar yang dipakai (montserrat_30), bukan dihitung
+ * ulang per kartu. KARTU_ISI_DY memusatkannya vertikal dalam kartu yang kini
+ * jauh lebih tinggi (118px) daripada blok isinya sendiri; tanpa ini isi kartu
+ * akan menempel di atas dengan rongga kosong besar di bawahnya -- persis
+ * kesan "tata letak berantakan" yang diminta dirapikan. */
+#define KARTU_ISI_DY  ((KARTU_H - 52) / 2 - 8)
 
 /* ---- Ikon baterai berkotak ----
  * Bentuknya mengikuti images (2).jpeg. Proporsinya diukur dari gambar itu, di
@@ -457,8 +533,8 @@ static void layar_nyala_sementara(uint32_t ms) {
  *
  * Tepi kanan dikunci di x=232 supaya sejajar dengan tepi kanan kartu di
  * bawahnya -- sama seperti angka persen yang digantikannya. */
-#define BATT_N_KOTAK 3
-#define BATT_KANAN   232                     /* tepi kanan tonjolan          */
+/* BATT_N_KOTAK didefinisikan di dekat tombol_arti_t, dekat kepala berkas --
+ * lihat komentar di sana kenapa. */
 #define BATT_BRD     2                       /* tebal garis badan            */
 #define BATT_PAD     1                       /* jarak kotak ke garis badan   */
 #define BATT_KOTAK_W 6
@@ -476,10 +552,40 @@ static void layar_nyala_sementara(uint32_t ms) {
 #define BATT_W  (BATT_N_KOTAK * BATT_KOTAK_W + (BATT_N_KOTAK - 1) * BATT_CELAH \
                  + 2 * BATT_PAD + 2 * BATT_BRD)                       /* 28 */
 #define BATT_H  (BATT_KOTAK_H + 2 * BATT_PAD + 2 * BATT_BRD)          /* 14 */
-#define BATT_X  (BATT_KANAN - BATT_NUB_W - BATT_W)                    /* 201 */
-#define BATT_Y  14                           /* pusatnya sejajar teks header */
-#define BATT_KOTAK_X (BATT_X + BATT_BRD + BATT_PAD)                   /* 204 */
-#define BATT_KOTAK_Y (BATT_Y + BATT_BRD + BATT_PAD)                   /* 17  */
+
+/* Posisinya kini per-layar (halaman utama DAN halaman kedua masing-masing
+ * punya ikonnya sendiri, lihat batt_widget_t), jadi tepi kanan/atas diteruskan
+ * sebagai argumen ke batt_buat() alih-alih dipatok satu makro seperti dulu. */
+#define BATT_KANAN_WAJAH 232                 /* tepi kanan tonjolan, halaman kedua */
+#define BATT_Y_WAJAH     14                  /* sejajar teks header halaman kedua  */
+#define BATT_KANAN_HOME  228                 /* diukur dari 1baru.png / 2          */
+#define BATT_Y_HOME       8                  /* sejajar teks header halaman utama  */
+
+/* ================= Geometri: halaman utama (home) =================
+ * Diukur dari 1baru.png (mockup 2x = 480x560) dibagi 2, persis konvensi yang
+ * sama dipakai wajah_jam_modular_240x280.png. Lihat pesan commit/PR untuk skrip
+ * pengukuran pikselnya kalau tata letak ini perlu diubah lagi. */
+#define HOME_HDR_H       31    /* tinggi bilah header, sampai garis pemisah  */
+#define HOME_VSEP_X     120    /* garis pemisah tegak di header, tengah layar */
+
+#define HOME_PLANE_X     40
+#define HOME_PLANE_Y     50    /* img_plane 152x122 ditempel apa adanya      */
+
+/* Pemisah "garis - wajik - garis" di atas nama hari. */
+#define HOME_SEP_Y      183
+#define HOME_SEP_GAP      3    /* jarak ujung garis ke wajik                 */
+#define HOME_SEP_LINE_W  28
+
+#define HOME_HARI_Y     193
+#define HOME_TANGGAL_Y  259
+
+/* Jam besar, font_digits_48 -- SAMA dengan halaman kedua, cuma dipusatkan di
+ * x=120 alih-alih rata kanan ke kartu. Titik dua di sini emas, bukan putih,
+ * karena desainnya begitu (lihat 1baru.png). */
+#define HOME_JAM_Y      207
+#define HOME_TITIK_DUA_X 116   /* 120 - lebar/2 */
+#define HOME_TITIK_DUA_W   8
+#define HOME_JAM_GAP       5   /* jarak digit ke titik dua, kedua sisi */
 
 /* ================= SUMBER DATA =================
  * Tidak ada angka yang dikarang di layar ini. Kalau sebuah nilai belum
@@ -497,20 +603,33 @@ static void layar_nyala_sementara(uint32_t ms) {
 
 /* ================= Handle widget ================= */
 static lv_obj_t *scr_wajah;
+static lv_obj_t *scr_home;
 
-static lv_obj_t *lbl_jam_hh, *lbl_jam_mm;   /* "14" dan "35"                  */
 static lv_obj_t *lbl_status;                /* baris tanggal / status         */
+
 /* Ikon baterai digambar sendiri dari objek LVGL, bukan glyph LV_SYMBOL_*.
  * Sebabnya bukan selera: lambang baterai di font hanya punya lima tingkat
  * tetap dan tidak bisa diberi tahu berapa kotak yang boleh menyala, jadi
- * satu-satunya cara menampilkan tepat tiga kotak adalah menggambarnya. */
-static lv_obj_t *batt_cangkang, *batt_nub, *batt_petir;
-static lv_obj_t *batt_kotak[BATT_N_KOTAK];
+ * satu-satunya cara menampilkan tepat tiga kotak adalah menggambarnya.
+ *
+ * Sejak halaman utama ditambahkan, ikonnya ada DUA SALINAN -- satu objek LVGL
+ * cuma boleh py satu induk, jadi halaman utama dan halaman kedua tidak bisa
+ * berbagi objek yang sama. batt_buat()/batt_gambar() dipanggil dua kali,
+ * sekali per struct, dan keduanya selalu disegarkan bersamaan (lihat
+ * refresh_cb) supaya tidak ada halaman yang menampilkan angka basi begitu
+ * pengguna berpindah. batt_widget_t sendiri ada di dekat tombol_arti_t di
+ * kepala berkas -- lihat komentar di sana. */
+static batt_widget_t batt_wajah, batt_home;
 
 static lv_obj_t *cincin_hr, *cincin_sp, *cincin_gl;
 
 static lv_obj_t *lbl_hr, *lbl_sp, *lbl_gl, *lbl_bp;          /* angka besar   */
 static lv_obj_t *sat_hr, *sat_sp, *sat_gl;                   /* satuan        */
+
+/* ---- Halaman utama ---- */
+static lv_obj_t *lbl_home_suhu, *lbl_home_kondisi;
+static lv_obj_t *lbl_home_hari, *lbl_home_tanggal;
+static lv_obj_t *lbl_home_hh, *lbl_home_mm;
 
 /* ================= Helper pembuat widget ================= */
 
@@ -560,33 +679,40 @@ static void satuan_sejajar(lv_obj_t *satuan, lv_obj_t *nilai, const lv_font_t *f
   lv_obj_align_to(satuan, nilai, LV_ALIGN_OUT_RIGHT_TOP, 4, dy);
 }
 
-/* Satu kartu metrik: ikon, judul, angka besar, satuan.
+/* Isi satu kuadran kartu metrik pada `parent`: ikon, judul, angka besar,
+ * satuan -- TANPA kotak/border sendiri. Dulu tiap kartu punya kotaknya
+ * sendiri-sendiri (mk_kartu() lama), tapi atas permintaan langsung keempat
+ * kuadran digabung jadi SATU kartu (lihat build_wajah()) supaya terlihat
+ * lebih rapi -- kotaknya kini digambar sekali oleh pemanggil, dan fungsi ini
+ * cuma menempelkan isi di titik (x,y) yang diberikan, relatif terhadap
+ * `parent` (di sini selalu scr_wajah, jadi x/y-nya tetap koordinat layar
+ * penuh persis seperti KARTU_X1/X2/Y1/Y2).
  *
- * font_nilai diparameterkan karena kartu tekanan memuat enam karakter
+ * font_nilai diparameterkan karena kuadran tekanan memuat enam karakter
  * ("118/76") sedangkan yang lain paling banyak tiga -- memaksakan satu ukuran
- * untuk keempatnya akan membuat tekanan meluber keluar kartu. Gambar desainnya
- * sendiri sudah merender kartu itu lebih kecil (tinggi ink 21 px lawan 23 px),
- * jadi ini mengikuti desain, bukan menyimpang darinya. */
-static lv_obj_t *mk_kartu(lv_obj_t *scr, int x, int y, const lv_img_dsc_t *ikon,
-                          const char *judul, const char *satuan,
-                          const lv_font_t *font_nilai,
-                          lv_obj_t **out_nilai, lv_obj_t **out_satuan) {
-  lv_obj_t *k = mk_box(scr, x, y, KARTU_W, KARTU_H, C_KARTU, 14);
-  lv_obj_set_style_border_width(k, 1, 0);
-  lv_obj_set_style_border_color(k, lv_color_hex(C_KARTU_BRD), 0);
-  lv_obj_set_style_border_opa(k, LV_OPA_COVER, 0);
+ * untuk keempatnya akan membuat tekanan meluber. Gambar desainnya sendiri
+ * sudah merender kuadran itu lebih kecil (tinggi ink 21 px lawan 23 px), jadi
+ * ini mengikuti desain, bukan menyimpang darinya. */
+static void mk_isi_kartu(lv_obj_t *parent, int x, int y, const lv_img_dsc_t *ikon,
+                         const char *judul, const char *satuan,
+                         const lv_font_t *font_nilai,
+                         lv_obj_t **out_nilai, lv_obj_t **out_satuan) {
+  /* +KARTU_ISI_DY di ketiga y: memusatkan blok ikon/judul/nilai vertikal
+   * dalam kartu yang sekarang jauh lebih tinggi daripada blok isinya sendiri
+   * -- lihat definisi makronya. */
+  mk_img(parent, ikon, x + 10, y + 9 + KARTU_ISI_DY);
+  /* Kembali ke C_REDUP untuk judul & satuan, seperti desain asli -- sempat
+   * diputihkan mengikuti referensi WhatsApp, tapi itu dibatalkan bersama
+   * seluruh perombakan kartu ke gaya itu. */
+  mk_label(parent, judul, &lv_font_montserrat_12, C_REDUP, x + 33, y + 8 + KARTU_ISI_DY);
 
-  mk_img(k, ikon, 10, 9);
-  mk_label(k, judul, &lv_font_montserrat_12, C_REDUP, 33, 8);
-
-  *out_nilai = mk_label(k, "--", font_nilai, C_PUTIH, 10, 26);
+  *out_nilai = mk_label(parent, "--", font_nilai, C_PUTIH, x + 10, y + 26 + KARTU_ISI_DY);
   if (satuan) {
-    *out_satuan = mk_label(k, satuan, &lv_font_montserrat_12, C_REDUP, 0, 0);
+    *out_satuan = mk_label(parent, satuan, &lv_font_montserrat_12, C_REDUP, 0, 0);
     satuan_sejajar(*out_satuan, *out_nilai, font_nilai);
   } else if (out_satuan) {
     *out_satuan = NULL;
   }
-  return k;
 }
 
 /* ================= Garis kemajuan di TEPI LAYAR =================
@@ -838,18 +964,14 @@ static void build_wajah(void) {
   scr_wajah = lv_obj_create(NULL);
   lv_obj_remove_style_all(scr_wajah);
   lv_obj_clear_flag(scr_wajah, LV_OBJ_FLAG_SCROLLABLE);
-  /* Latarnya gradien tipis seperti di desain (tepi atas lebih gelap daripada
-   * tepi bawah). Bedanya cuma beberapa digit, tapi tanpa itu layar terlihat
-   * datar dan kartu-kartunya kehilangan kedalaman. */
-  lv_obj_set_style_bg_color(scr_wajah, lv_color_hex(C_BG_ATAS), 0);
-  lv_obj_set_style_bg_grad_color(scr_wajah, lv_color_hex(C_BG_BAWAH), 0);
-  lv_obj_set_style_bg_grad_dir(scr_wajah, LV_GRAD_DIR_VER, 0);
+  /* Latar rata, SAMA PERSIS dengan C_HOME_BG_BODY halaman utama -- disamakan
+   * atas permintaan langsung, supaya berpindah halaman tidak terasa seperti
+   * berpindah aplikasi. Sebelumnya di sini gradien navy tipis (C_BG_ATAS ->
+   * C_BG_BAWAH) yang diambil dari wajah_jam_modular_240x280.png; makronya
+   * sudah tidak dipakai di mana pun, sengaja tidak dihapus dari palet supaya
+   * gampang dikembalikan kalau dua halaman ini nanti perlu dibedakan lagi. */
+  lv_obj_set_style_bg_color(scr_wajah, lv_color_hex(C_HOME_BG_BODY), 0);
   lv_obj_set_style_bg_opa(scr_wajah, LV_OPA_COVER, 0);
-
-  /* --- tiga cincin, dari luar ke dalam --- */
-  cincin_hr = mk_cincin(scr_wajah, 34, C_CINCIN_HR);
-  cincin_sp = mk_cincin(scr_wajah, 25, C_CINCIN_SP);
-  cincin_gl = mk_cincin(scr_wajah, 16, C_CINCIN_GL);
 
   /* --- baris tanggal / status ---
    * x=82, bukan 86, untuk memberi ruang tambahan ke kelompok baterai di kanan --
@@ -875,62 +997,143 @@ static void build_wajah(void) {
    * mk_box() selalu memasang latar rapat, sedangkan yang dibutuhkan di sini
    * justru rongga tembus pandang supaya kotak-kotak di dalamnya -- yang dibuat
    * SESUDAH badan, jadi tergambar di atasnya -- benar-benar terlihat. */
-  batt_cangkang = lv_obj_create(scr_wajah);
-  lv_obj_remove_style_all(batt_cangkang);
-  lv_obj_set_pos(batt_cangkang, BATT_X, BATT_Y);
-  lv_obj_set_size(batt_cangkang, BATT_W, BATT_H);
-  lv_obj_set_style_bg_opa(batt_cangkang, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(batt_cangkang, BATT_BRD, 0);
-  lv_obj_set_style_border_color(batt_cangkang, lv_color_hex(C_REDUP), 0);
-  lv_obj_set_style_border_opa(batt_cangkang, LV_OPA_COVER, 0);
-  lv_obj_set_style_radius(batt_cangkang, 3, 0);
-  lv_obj_clear_flag(batt_cangkang, LV_OBJ_FLAG_SCROLLABLE);
+  batt_buat(scr_wajah, &batt_wajah, BATT_KANAN_WAJAH, BATT_Y_WAJAH);
 
-  batt_nub = mk_box(scr_wajah, BATT_X + BATT_W, BATT_Y + (BATT_H - BATT_NUB_H) / 2,
-                    BATT_NUB_W, BATT_NUB_H, C_REDUP, 1);
+  /* Jam besar (dulu di sini, font_digits_48 rata kanan ke x=153 + titik dua +
+   * "35" dari x=172) DIHAPUS atas permintaan -- waktu sudah tampil di halaman
+   * utama, dan halaman ini murni dasbor metrik. Ruangnya sengaja dibiarkan
+   * kosong, bukan diisi widget lain, karena itu bukan bagian dari permintaan
+   * ini. */
 
-  for (int i = 0; i < BATT_N_KOTAK; i++)
-    batt_kotak[i] = mk_box(scr_wajah, BATT_KOTAK_X + i * BATT_KOTAK_D, BATT_KOTAK_Y,
-                           BATT_KOTAK_W, BATT_KOTAK_H, C_REDUP, 1);
+  /* --- empat kotak kartu, posisi & ukuran asli desain, dengan border ---
+   * mk_isi_kartu() di bawah cuma menempel ISI-nya (ikon/judul/nilai/satuan);
+   * kotaknya sendiri digambar di sini, sekali per kuadran, persis seperti
+   * mk_kartu() versi asli (border 1px C_KARTU_BRD, sudut 14px). */
+  for (int qy = 0; qy < 2; qy++) {
+    for (int qx = 0; qx < 2; qx++) {
+      lv_obj_t *k = mk_box(scr_wajah, qx ? KARTU_X2 : KARTU_X1,
+                           qy ? KARTU_Y2 : KARTU_Y1, KARTU_W, KARTU_H,
+                           C_KARTU, 14);
+      lv_obj_set_style_border_width(k, 1, 0);
+      lv_obj_set_style_border_color(k, lv_color_hex(C_KARTU_BRD), 0);
+      lv_obj_set_style_border_opa(k, LV_OPA_COVER, 0);
+    }
+  }
 
-  batt_petir = mk_label(scr_wajah, LV_SYMBOL_CHARGE, &lv_font_montserrat_12,
-                        C_ISI, 0, 0);
-  lv_obj_update_layout(scr_wajah);
-  lv_obj_align_to(batt_petir, batt_cangkang, LV_ALIGN_OUT_LEFT_MID, -3, 0);
+  /* --- lencana bulat: fondasi cincin di atas kartu ---
+   * Kartu sekarang mengisi penuh kiri-kanan cincin (lihat definisi KARTU_H),
+   * jadi cincin SELALU menimpa keempat kotak kartu di titik pertemuannya --
+   * itu disengaja, bukan cacat, tapi arc telanjang di atas kartu+border begitu
+   * saja terlihat seperti tabrakan, bukan elemen yang sengaja diletakkan di
+   * sana. Piringan solid ini memberinya fondasi yang jelas, persis seperti
+   * lencana pada rujukan yang diberikan (WhatsApp Image 2026-09-02).
+   *
+   * Digambar SEBELUM ketiga arc supaya arc (dan isi kartu) tergambar DI ATAS
+   * piringan ini, dan SESUDAH keempat kotak kartu supaya piringan ini yang
+   * menimpa kartu -- bukan sebaliknya. Radius 999 sengaja jauh melebihi
+   * setengah sisi; LVGL memotongnya sendiri jadi lingkaran penuh. */
+  {
+    int r_lencana = 34 + CINCIN_W / 2;
+    mk_box(scr_wajah, CINCIN_CX - r_lencana, CINCIN_CY - r_lencana,
+          2 * r_lencana, 2 * r_lencana, C_PUTIH, 999);
+  }
 
-  /* Mulai dari keadaan "belum ada bacaan": badan kosong, warna peringatan.
-   * Bukan tiga kotak penuh -- ikon penuh sebelum ADC sempat mengukur adalah
-   * angka karangan dalam bentuk gambar. */
-  batt_gambar(0, false);
+  /* --- tiga cincin, dari luar ke dalam --- */
+  cincin_hr = mk_cincin(scr_wajah, 34, C_CINCIN_HR);
+  cincin_sp = mk_cincin(scr_wajah, 25, C_CINCIN_SP);
+  cincin_gl = mk_cincin(scr_wajah, 16, C_CINCIN_GL);
 
-  /* --- jam besar ---
-   * font_digits_48 punya 9 px kosong di atas ink digit, jadi label di y=33
-   * menaruh ink di y=42 -- persis seperti desain. "14" dirata-kanan ke x=153
-   * dan "35" mulai di x=172; celah di antaranya diisi titik dua. */
-  lbl_jam_hh = mk_label(scr_wajah, "--", &font_digits_48, C_PUTIH, 0, 33);
-  lv_obj_set_width(lbl_jam_hh, 153);
-  lv_obj_set_style_text_align(lbl_jam_hh, LV_TEXT_ALIGN_RIGHT, 0);
-
-  /* Titik dua digambar sebagai dua kotak, bukan glyph: font_digits_48 memang
-   * tidak punya ':' (rentangnya cuma 45..57, yaitu '-' '.' '/' dan 0-9). */
-  mk_box(scr_wajah, 158, 51, 8, 8, C_PUTIH, 2);
-  mk_box(scr_wajah, 158, 68, 8, 8, C_PUTIH, 2);
-
-  lbl_jam_mm = mk_label(scr_wajah, "--", &font_digits_48, C_PUTIH, 172, 33);
-
-  /* --- empat kartu metrik --- */
-  mk_kartu(scr_wajah, KARTU_X1, KARTU_Y1, &ic_detak,   "DETAK",   "BPM",
-           &lv_font_montserrat_30, &lbl_hr, &sat_hr);
-  mk_kartu(scr_wajah, KARTU_X2, KARTU_Y1, &ic_spo2,    "SpO2",    "%",
-           &lv_font_montserrat_30, &lbl_sp, &sat_sp);
-  mk_kartu(scr_wajah, KARTU_X1, KARTU_Y2, &ic_glukosa, "GLUKOSA", "mg/dL",
-           &lv_font_montserrat_30, &lbl_gl, &sat_gl);
-  mk_kartu(scr_wajah, KARTU_X2, KARTU_Y2, &ic_tekanan, "TEKANAN", NULL,
-           &lv_font_montserrat_26, &lbl_bp, NULL);
+  /* --- empat kuadran metrik, isi saja -- kotaknya sudah digambar di atas --- */
+  mk_isi_kartu(scr_wajah, KARTU_X1, KARTU_Y1, &ic_detak,   "DETAK",   "BPM",
+              &lv_font_montserrat_30, &lbl_hr, &sat_hr);
+  mk_isi_kartu(scr_wajah, KARTU_X2, KARTU_Y1, &ic_spo2,    "SpO2",    "%",
+              &lv_font_montserrat_30, &lbl_sp, &sat_sp);
+  mk_isi_kartu(scr_wajah, KARTU_X1, KARTU_Y2, &ic_glukosa, "GLUKOSA", "mg/dL",
+              &lv_font_montserrat_30, &lbl_gl, &sat_gl);
+  mk_isi_kartu(scr_wajah, KARTU_X2, KARTU_Y2, &ic_tekanan, "TEKANAN", NULL,
+              &lv_font_montserrat_26, &lbl_bp, NULL);
 
   /* Paling akhir supaya pita tepi berada DI ATAS segalanya: cahayanya memang
    * dimaksudkan jatuh menimpa apa pun yang kebetulan ada di dekat tepi. */
   build_tepi(scr_wajah);
+}
+
+/* ================= Halaman utama (home) =================
+ * Dari 1.png/1baru.png -- "kartu ucapan" yang tampil begitu jam dinyalakan
+ * dan setiap kali tidak ada apa pun yang perlu diperhatikan pengguna. Jam
+ * tidak punya layar sentuh, jadi satu-satunya jalan berpindah ke halaman
+ * kedua (wajah metrik) adalah aplikasi memicu sesuatu yang mengubah keadaan
+ * jam -- ARM_SESI/ARM_TITIK/UKUR/MULAI_SESI -- dan tombol fisik yang menyusul
+ * di belakangnya. Lihat halaman_evaluasi() untuk aturannya.
+ *
+ * img_plane/img_weather/img_diamond sudah lama ada di ui_assets.h (sisa
+ * desain 7-layar lama) tapi baru dipakai di sini. Warna latar (C_HOME_BG_HDR/
+ * C_HOME_BG_BODY) HARUS sama persis dengan yang dipanggang ke ketiga bitmap
+ * itu di 1baru.png, kalau tidak kotak potongannya akan terlihat -- sama
+ * seperti syarat SPL_BG untuk splash_assets.h. */
+static void build_home(void) {
+  scr_home = lv_obj_create(NULL);
+  lv_obj_remove_style_all(scr_home);
+  lv_obj_clear_flag(scr_home, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_style_bg_color(scr_home, lv_color_hex(C_HOME_BG_BODY), 0);
+  lv_obj_set_style_bg_opa(scr_home, LV_OPA_COVER, 0);
+
+  /* --- bilah header: cuaca (kiri), pemisah tegak, baterai (kanan) --- */
+  mk_box(scr_home, 0, 0, SCREEN_W, HOME_HDR_H, C_HOME_BG_HDR, 0);
+  mk_box(scr_home, 0, HOME_HDR_H - 1, SCREEN_W, 1, C_HOME_DIVIDER, 0);
+
+  mk_img(scr_home, &img_weather, 12, 5);
+  lbl_home_suhu = mk_label(scr_home, "--" TXT_DEG "C", &lv_font_montserrat_14,
+                           C_PUTIH, 46, 7);
+  lbl_home_kondisi = mk_label(scr_home, "CUACA " TXT_DOT " --",
+                              &lv_font_montserrat_10, C_HOME_MUTED, 46, 21);
+  lv_obj_set_style_text_letter_space(lbl_home_kondisi, 1, 0);
+
+  mk_box(scr_home, HOME_VSEP_X, 8, 1, 16, C_HOME_VSEP, 0);
+
+  batt_buat(scr_home, &batt_home, BATT_KANAN_HOME, BATT_Y_HOME);
+
+  /* --- ilustrasi --- */
+  mk_img(scr_home, &img_plane, HOME_PLANE_X, HOME_PLANE_Y);
+
+  /* --- pemisah "garis - wajik - garis" --- */
+  mk_box(scr_home, HOME_VSEP_X - 5 - HOME_SEP_GAP - HOME_SEP_LINE_W, HOME_SEP_Y,
+        HOME_SEP_LINE_W, 1, C_HOME_GOLD, 0);
+  mk_img(scr_home, &img_diamond, HOME_VSEP_X - 5, HOME_SEP_Y - 5);
+  mk_box(scr_home, HOME_VSEP_X + 5 + HOME_SEP_GAP, HOME_SEP_Y,
+        HOME_SEP_LINE_W, 1, C_HOME_GOLD, 0);
+
+  /* --- nama hari --- */
+  lbl_home_hari = mk_label(scr_home, "--", &lv_font_montserrat_12, C_HOME_MUTED,
+                           0, HOME_HARI_Y);
+  lv_obj_set_width(lbl_home_hari, SCREEN_W);
+  lv_obj_set_style_text_align(lbl_home_hari, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_text_letter_space(lbl_home_hari, 2, 0);
+
+  /* --- jam besar, dipusatkan di x=120 (bukan rata kanan ke kartu seperti
+   * halaman kedua) -- lihat definisi HOME_JAM_Y dkk. untuk pengukurannya. */
+  lbl_home_hh = mk_label(scr_home, "--", &font_digits_48, C_PUTIH, 0, HOME_JAM_Y);
+  lv_obj_set_width(lbl_home_hh, HOME_TITIK_DUA_X - HOME_JAM_GAP);
+  lv_obj_set_style_text_align(lbl_home_hh, LV_TEXT_ALIGN_RIGHT, 0);
+
+  /* Offset +18/+35 dari y label sama persis dengan yang dipakai titik dua
+   * halaman kedua (lihat build_wajah()) -- font dan ukurannya identik, cuma
+   * warnanya beda (emas di sini, sesuai desain). */
+  mk_box(scr_home, HOME_TITIK_DUA_X, HOME_JAM_Y + 18,
+        HOME_TITIK_DUA_W, HOME_TITIK_DUA_W, C_HOME_GOLD, 2);
+  mk_box(scr_home, HOME_TITIK_DUA_X, HOME_JAM_Y + 35,
+        HOME_TITIK_DUA_W, HOME_TITIK_DUA_W, C_HOME_GOLD, 2);
+
+  lbl_home_mm = mk_label(scr_home, "--", &font_digits_48, C_PUTIH,
+                         HOME_TITIK_DUA_X + HOME_TITIK_DUA_W + HOME_JAM_GAP,
+                         HOME_JAM_Y);
+
+  /* --- tanggal --- */
+  lbl_home_tanggal = mk_label(scr_home, "--", &lv_font_montserrat_12,
+                              C_HOME_MUTED, 0, HOME_TANGGAL_Y);
+  lv_obj_set_width(lbl_home_tanggal, SCREEN_W);
+  lv_obj_set_style_text_align(lbl_home_tanggal, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_text_letter_space(lbl_home_tanggal, 2, 0);
 }
 
 /* ================= Layar pembuka =================
@@ -992,25 +1195,26 @@ static void build_wajah(void) {
  * setiap unsur mulai sebelum unsur sebelumnya betul-betul selesai, sehingga
  * tidak pernah ada saat layar diam menunggu giliran berikutnya.
  *
- * Ketujuh angka pertama adalah jadwal 850 ms yang lama DIKALI ~1,6 -- dikali,
- * bukan ditulis ulang, supaya tumpang tindih yang sudah ditimbang itu tetap
- * utuh dan yang berubah cuma kecepatannya. Busur menyapu lebih tenang, tanda
- * jam memudar cukup lama untuk benar-benar terlihat memudar, dan kata
- * "ASAWatch" menempuh 8 px-nya sebagai gerakan alih-alih sebagai lompatan.
+ * Ketujuh angka pertama tadinya jadwal 850 ms lama DIKALI ~1,6, dan sekarang
+ * DIKALI ~1,3 LAGI di atas itu (atas permintaan langsung: animasinya diminta
+ * sedikit lebih lama supaya terasa lebih halus) -- dikali, bukan ditulis
+ * ulang, supaya tumpang tindih yang sudah ditimbang itu tetap utuh dan yang
+ * berubah cuma kecepatannya. Busur menyapu lebih tenang, tanda jam memudar
+ * cukup lama untuk benar-benar terlihat memudar, dan kata "ASAWatch"
+ * menempuh 8 px-nya sebagai gerakan alih-alih sebagai lompatan.
  *
- * Jeda bacanya naik lebih dari faktor itu (90 -> 180 ms) karena ia menjawab
- * pertanyaan yang berbeda dari keenam lainnya: bukan seberapa cepat sebuah
- * unsur masuk, melainkan berapa lama logo yang SUDAH utuh boleh berdiri diam
- * sebelum layar berganti. Pada 90 ms anak judul praktis belum sempat terbaca
- * penuh saat wajah jam sudah menggantikannya. */
-#define SPL_ARC_MS     680
-#define SPL_MARK_TUNDA 210
-#define SPL_MARK_MS    420
-#define SPL_KATA_TUNDA 610
-#define SPL_KATA_MS    400
-#define SPL_SUB_TUNDA  870
-#define SPL_SUB_MS     350
-#define SPL_TOTAL_MS   1400     /* 1220 ms animasi + 180 ms jeda baca */
+ * Jeda bacanya (180 ms) TIDAK ikut dikalikan lagi -- ia menjawab pertanyaan
+ * yang berbeda dari keenam lainnya: bukan seberapa cepat sebuah unsur masuk,
+ * melainkan berapa lama logo yang SUDAH utuh boleh berdiri diam sebelum layar
+ * berganti, dan itu tidak berubah hanya karena animasi masuknya lebih halus. */
+#define SPL_ARC_MS     880
+#define SPL_MARK_TUNDA 270
+#define SPL_MARK_MS    550
+#define SPL_KATA_TUNDA 790
+#define SPL_KATA_MS    520
+#define SPL_SUB_TUNDA  1130
+#define SPL_SUB_MS     450
+#define SPL_TOTAL_MS   1760     /* 1580 ms animasi + 180 ms jeda baca */
 
 /* LV_DISP_DEF_REFR_PERIOD 30 ms berarti 33 frame/detik, dan pudaran 260 ms
  * hanya kebagian 9 langkah opasitas -- terlihat sebagai tangga, bukan pudaran.
@@ -1113,8 +1317,17 @@ static void splash_tutup(bool tuntas) {
   lv_anim_del(spl_o_kata, NULL);
   lv_anim_del(spl_o_sub,  NULL);
 
-  spl_periode(LV_DISP_DEF_REFR_PERIOD);
-  lv_scr_load(scr_wajah);
+  /* Selalu ke halaman utama dulu, BUKAN scr_wajah seperti versi sebelum ada
+   * halaman ini. Bukan pilihan sewenang-wenang: dokumen 13.4 mengunci urutan
+   * init "... -> splash -> jam_mulai() -> net_begin()", dan splash ini
+   * berakhir SEBELUM jam_mulai() pernah dipanggil -- jam_status()/
+   * jam_titik_armed() belum berarti apa-apa di titik ini (nilainya kebetulan
+   * "IDLE, tidak ada titik" dari inisialisasi statis, bukan dari NVS yang
+   * sungguhan dimuat). Kalau ARM_TITIK selamat lintas boot, setup() akan
+   * meluruskan ke halaman kedua sendiri tepat setelah jam_mulai() kembali --
+   * lihat baris itu untuk alasan kenapa koreksinya di sana, bukan di sini. */
+  s_di_wajah = false;
+  lv_scr_load(scr_home);
 
   uint32_t lama = millis() - spl_mulai_ms;
   s_splash_tampil = false;
@@ -1279,18 +1492,18 @@ static int batt_hitung_kotak(int persen, int lalu) {
 /* Warna memikul satu-satunya peringatan yang tersisa setelah angka dibuang.
  * Nol kotak berarti badan baterai kosong melompong -- tanpa warna merah, layar
  * yang kosong itu tidak bisa dibedakan dari ikon yang belum sempat digambar. */
-static void batt_gambar(int kotak, bool mengisi) {
+static void batt_gambar(batt_widget_t *w, int kotak, bool mengisi) {
   uint32_t warna = mengisi ? C_ISI : (kotak == 0 ? C_CINCIN_HR : C_REDUP);
 
-  lv_obj_set_style_border_color(batt_cangkang, lv_color_hex(warna), 0);
-  lv_obj_set_style_bg_color(batt_nub, lv_color_hex(warna), 0);
+  lv_obj_set_style_border_color(w->cangkang, lv_color_hex(warna), 0);
+  lv_obj_set_style_bg_color(w->nub, lv_color_hex(warna), 0);
 
   for (int i = 0; i < BATT_N_KOTAK; i++) {
     if (i < kotak) {
-      lv_obj_set_style_bg_color(batt_kotak[i], lv_color_hex(warna), 0);
-      lv_obj_clear_flag(batt_kotak[i], LV_OBJ_FLAG_HIDDEN);
+      lv_obj_set_style_bg_color(w->kotak[i], lv_color_hex(warna), 0);
+      lv_obj_clear_flag(w->kotak[i], LV_OBJ_FLAG_HIDDEN);
     } else {
-      lv_obj_add_flag(batt_kotak[i], LV_OBJ_FLAG_HIDDEN);
+      lv_obj_add_flag(w->kotak[i], LV_OBJ_FLAG_HIDDEN);
     }
   }
 
@@ -1299,8 +1512,47 @@ static void batt_gambar(int kotak, bool mengisi) {
    * tanggal; sekarang angka persen sudah pergi dan ruangnya cukup, jadi
    * "sedang mengisi" bisa ditandai dua kali -- warna DAN lambang -- tanpa
    * mengorbankan jumlah kotak yang terbaca. */
-  if (mengisi) lv_obj_clear_flag(batt_petir, LV_OBJ_FLAG_HIDDEN);
-  else         lv_obj_add_flag(batt_petir, LV_OBJ_FLAG_HIDDEN);
+  if (mengisi) lv_obj_clear_flag(w->petir, LV_OBJ_FLAG_HIDDEN);
+  else         lv_obj_add_flag(w->petir, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* Bangun satu ikon baterai berkotak di `parent` (tepi kanan tonjolan di
+ * `kanan`, tepi atas badan di `y`) dan simpan handle-nya di `w`. Dipanggil
+ * sekali per layar -- lihat kenapa di komentar batt_widget_t. */
+static void batt_buat(lv_obj_t *parent, batt_widget_t *w, int kanan, int y) {
+  int bx = kanan - BATT_NUB_W - BATT_W;
+
+  /* Badan digambar sebagai objek bergaris tanpa isi, bukan lewat mk_box():
+   * mk_box() selalu memasang latar rapat, sedangkan yang dibutuhkan di sini
+   * justru rongga tembus pandang supaya kotak-kotak di dalamnya -- yang dibuat
+   * SESUDAH badan, jadi tergambar di atasnya -- benar-benar terlihat. */
+  w->cangkang = lv_obj_create(parent);
+  lv_obj_remove_style_all(w->cangkang);
+  lv_obj_set_pos(w->cangkang, bx, y);
+  lv_obj_set_size(w->cangkang, BATT_W, BATT_H);
+  lv_obj_set_style_bg_opa(w->cangkang, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(w->cangkang, BATT_BRD, 0);
+  lv_obj_set_style_border_color(w->cangkang, lv_color_hex(C_REDUP), 0);
+  lv_obj_set_style_border_opa(w->cangkang, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(w->cangkang, 3, 0);
+  lv_obj_clear_flag(w->cangkang, LV_OBJ_FLAG_SCROLLABLE);
+
+  w->nub = mk_box(parent, bx + BATT_W, y + (BATT_H - BATT_NUB_H) / 2,
+                  BATT_NUB_W, BATT_NUB_H, C_REDUP, 1);
+
+  for (int i = 0; i < BATT_N_KOTAK; i++)
+    w->kotak[i] = mk_box(parent, bx + BATT_BRD + BATT_PAD + i * BATT_KOTAK_D,
+                         y + BATT_BRD + BATT_PAD, BATT_KOTAK_W, BATT_KOTAK_H,
+                         C_REDUP, 1);
+
+  w->petir = mk_label(parent, LV_SYMBOL_CHARGE, &lv_font_montserrat_12, C_ISI, 0, 0);
+  lv_obj_update_layout(parent);
+  lv_obj_align_to(w->petir, w->cangkang, LV_ALIGN_OUT_LEFT_MID, -3, 0);
+
+  /* Mulai dari keadaan "belum ada bacaan": badan kosong, warna peringatan.
+   * Bukan tiga kotak penuh -- ikon penuh sebelum ADC sempat mengukur adalah
+   * angka karangan dalam bentuk gambar. */
+  batt_gambar(w, 0, false);
 }
 
 /* ---- Baris tanggal yang merangkap baris status ----
@@ -1338,32 +1590,15 @@ static void status_baris(void) {
   pesan_sampai_ms = 0;
 
   if (jam_sedang_mengukur()) {
-    /* Kemajuan persen, bukan sisa detik. Keduanya jujur -- keduanya dihitung
-     * ulang dari laju detak yang sungguhan terjadi -- tetapi keduanya berbeda
-     * pada satu hal yang menentukan: SISA BOLEH BERTAMBAH.
-     *
-     * Angka sisa memanjang setiap kali nadinya susah ditemukan, dan itu persis
-     * keadaan yang paling sering dialami pengguna lansia (pergelangan dingin,
-     * tali agak longgar). Hitung mundur yang naik dari 12 ke 25 terbaca sebagai
-     * alat yang rusak atau bertambah lama karena penggunanya salah, dan orang
-     * lalu MENGGERAKKAN TANGAN untuk "membetulkan" -- persis hal yang merusak
-     * pembacaannya. Persen dijamin tidak pernah mundur (lihat jam_ukur_persen()
-     * di aw_jam.cpp): pada nadi yang susah ia berhenti, dan berhenti jauh lebih
-     * mudah dibaca sebagai "sedang berusaha" daripada angka yang naik.
-     *
-     * Ia juga menyamakan bahasa dengan aplikasi, yang menampilkan persen yang
-     * SAMA dari byte 8 paket Status (dokumen 8) -- dua layar yang menyebut satu
-     * pengukuran dengan dua satuan berbeda mengundang pertanyaan mana yang
-     * benar.
-     *
-     * Kata "UKUR" tetap dipakai walau cincin tepi sudah menggambarkan persen
-     * yang sama: baris ini bersebelahan dengan angka baterai, dan "45%" telanjang
-     * di sebelah ikon baterai punya satu bacaan yang salah dan sangat wajar.
-     * Panjangnya masih aman -- "UKUR 100%" lebih pendek daripada "SISA 120 dtk"
-     * yang selama ini muat di ~100 px baris ini (lihat build_wajah()). */
-    snprintf(buf, sizeof(buf), "UKUR %u%%", (unsigned)jam_ukur_persen());
-    if (set_jika_beda(lbl_status, buf))
-      lv_obj_set_style_text_color(lbl_status, lv_color_hex(C_ISI), 0);
+    /* Teks "UKUR n%" DIHAPUS dari baris ini atas permintaan -- sejak cincin
+     * pindah ke tengah layar (di antara keempat kartu), cincin ITU SENDIRI
+     * sudah menggambarkan kemajuan yang sama persis (jam_ukur_persen(), lihat
+     * cincin_set() di refresh_cb), jadi angka di baris status jadi keterangan
+     * ganda. Cabang ini TETAP ADA dan tetap return lebih awal -- bukan sekadar
+     * dihapus -- supaya selama mengukur baris ini tidak jatuh ke cabang
+     * TEKAN: UKUR n di bawah (yang keliru: tombolnya sedang tidak menunggu
+     * ditekan, sensornya sedang bekerja). */
+    set_jika_beda(lbl_status, "");
     return;
   }
 
@@ -1385,32 +1620,105 @@ static void status_baris(void) {
       lv_obj_set_style_text_color(lbl_status, lv_color_hex(C_ISI), 0);
     return;
   }
-  if (jam_status() == AW_SESI_ARMED) {
-    if (set_jika_beda(lbl_status, "TEKAN: SELESAI MAKAN"))
-      lv_obj_set_style_text_color(lbl_status, lv_color_hex(C_ISI), 0);
-    return;
+  /* Petunjuk "TEKAN: SELESAI MAKAN" untuk status ARMED tetap tidak ada (lihat
+   * riwayat di atas -- sesi ARMED jatuh ke baris kosong di bawah, sama seperti
+   * IDLE). Ini TIDAK mengubah aturan tombol fisik sama sekali: jam_tekan_tombol()
+   * masih memvalidasi status sesi sendiri (dokumen 12), cuma layar yang tidak
+   * mengumumkannya lebih dulu.
+   *
+   * Jam/hari/tanggal/bulan DIHAPUS dari baris ini atas permintaan -- halaman
+   * kedua murni dasbor metrik, kalender sepenuhnya jadi urusan halaman utama.
+   * Baris ini karena itu kosong di luar cabang TEKAN: UKUR n di atas, yang
+   * tetap dipertahankan karena itu umpan balik pengukuran, bukan kalender. */
+  set_jika_beda(lbl_status, "");
+}
+
+/* ================= Halaman utama: isi ================= */
+static const char *HARI_ID[7] = {
+  "MINGGU", "SENIN", "SELASA", "RABU", "KAMIS", "JUMAT", "SABTU"
+};
+static const char *BULAN_ID[12] = {
+  "JANUARI", "FEBRUARI", "MARET",     "APRIL",   "MEI",      "JUNI",
+  "JULI",    "AGUSTUS",  "SEPTEMBER", "OKTOBER", "NOVEMBER", "DESEMBER"
+};
+
+/* Disegarkan tiap putaran TERLEPAS dari halaman mana yang sedang aktif -- sama
+ * seperti isi halaman kedua di refresh_cb(). Alasannya sama juga: begitu
+ * halaman_evaluasi() memutuskan pindah, isinya harus sudah benar di frame
+ * pertama, bukan menyusul beberapa ratus milidetik kemudian. */
+static void home_refresh(void) {
+  struct tm t;
+  if (tm_now(&t)) {
+    static int menit_lalu = -1;
+    if (t.tm_min != menit_lalu) {
+      menit_lalu = t.tm_min;
+      lv_label_set_text_fmt(lbl_home_hh, "%02d", t.tm_hour);
+      lv_label_set_text_fmt(lbl_home_mm, "%02d", t.tm_min);
+    }
+    set_jika_beda(lbl_home_hari,
+                  HARI_ID[(t.tm_wday >= 0 && t.tm_wday < 7) ? t.tm_wday : 0]);
+
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%d %s %04d", t.tm_mday,
+             BULAN_ID[(t.tm_mon >= 0 && t.tm_mon < 12) ? t.tm_mon : 0],
+             t.tm_year + 1900);
+    set_jika_beda(lbl_home_tanggal, buf);
   }
 
-  struct tm t;
-  if (!tm_now(&t)) {
-    if (set_jika_beda(lbl_status, "--"))
-      lv_obj_set_style_text_color(lbl_status, lv_color_hex(C_TANGGAL), 0);
+  /* Cuaca MATI secara bawaan (AW_PAKAI_WIFI 0, config.h): weather_get()
+   * menjawab valid=false apa adanya, dan yang tampil "--" -- bukan angka
+   * karangan -- persis filosofi yang sama dengan seluruh layar kesehatan. */
+  weather_t w;
+  weather_get(&w);
+
+  char suhu[12];
+  if (w.valid) snprintf(suhu, sizeof(suhu), "%d" TXT_DEG "C", w.temp_c);
+  else         snprintf(suhu, sizeof(suhu), "--" TXT_DEG "C");
+  set_jika_beda(lbl_home_suhu, suhu);
+
+  char kondisi[24];
+  snprintf(kondisi, sizeof(kondisi), "CUACA " TXT_DOT " %s", w.valid ? w.cond : "--");
+  set_jika_beda(lbl_home_kondisi, kondisi);
+}
+
+/* ================= Halaman utama <-> halaman kedua =================
+ * Jam ini tidak berlayar sentuh (touch_poll() dipertahankan hanya demi board
+ * yang sentuhannya sehat, lihat catatan di kepala berkas), jadi pengguna tidak
+ * bisa mengetuk apa pun untuk berpindah halaman. Perpindahannya karena itu
+ * murni REAKSI atas keadaan sesi yang memang sudah datang dari aplikasi:
+ * ARM_SESI/ARM_TITIK/UKUR/MULAI_SESI masing-masing mengubah salah satu dari
+ * tiga hal yang diperiksa di bawah. TIDAK ADA opcode baru untuk ini, dan tidak
+ * boleh ada -- dokumen protokol tidak menyebut halaman sama sekali, navigasi
+ * adalah urusan tampilan lokal, bukan kontrak kawat (dokumen 1).
+ *
+ * Ke halaman kedua: SEKETIKA, begitu ada sesuatu yang perlu dilihat pengguna --
+ * sesi ARMED/RUNNING, titik ukur menyala, atau sedang mengukur (termasuk cek
+ * manual dari tombol fisik, lihat boot_aktifkan() yang memaksa halaman ini
+ * juga supaya umpan balik penolakan tetap terlihat).
+ * Ke halaman utama: hanya setelah HALAMAN_PULANG_MS tenang PENUH, supaya hasil
+ * terakhir sempat terbaca dulu -- persis alasan yang sama dengan tenggat auto-
+ * mati layar di layar_nyala_sementara(). */
+#define HALAMAN_PULANG_MS 5000UL
+
+static void halaman_set(bool wajah) {
+  if (wajah == s_di_wajah) return;
+  s_di_wajah = wajah;
+  s_pulang_home_pada = 0;
+  lv_scr_load(wajah ? scr_wajah : scr_home);
+}
+
+static void halaman_evaluasi(void) {
+  bool perlu_wajah = jam_status() != AW_SESI_IDLE || jam_titik_armed() ||
+                     jam_sedang_mengukur();
+
+  if (perlu_wajah) {
+    halaman_set(true);
     return;
   }
-  /* "Wed, 1 Jan 26" -- singkatan bahasa Inggris, tanggal tanpa nol di depan,
-   * tahun dua digit. Tabel singkatannya ada di time_manager.cpp, jadi di sini
-   * tidak ada pemotongan "%.3s" lagi.
-   *
-   * Tahunnya muat karena letter_space baris ini dinolkan (lihat build_wajah()):
-   * "Wed, 15 Aug 26" berakhir sekitar x=168, sementara kelompok baterai paling
-   * lebar ("100%" + ikon) baru mulai di sekitar x=183. Kalau format ini
-   * diperpanjang lagi, itulah 15 piksel yang tersisa. */
-  const char *hari  = tm_day_name(t.tm_wday);
-  const char *bulan = tm_month_name(t.tm_mon);
-  snprintf(buf, sizeof(buf), "%s, %d %s %02d", hari, t.tm_mday, bulan,
-           (t.tm_year + 1900) % 100);
-  if (set_jika_beda(lbl_status, buf))
-    lv_obj_set_style_text_color(lbl_status, lv_color_hex(C_TANGGAL), 0);
+  if (!s_di_wajah) return;      /* sudah di home, tidak ada yang perlu ditunda */
+
+  if (!s_pulang_home_pada) s_pulang_home_pada = millis() + HALAMAN_PULANG_MS;
+  else if ((int32_t)(millis() - s_pulang_home_pada) >= 0) halaman_set(false);
 }
 
 static void refresh_cb(lv_timer_t *tm) {
@@ -1418,24 +1726,26 @@ static void refresh_cb(lv_timer_t *tm) {
   /* Konteks loop: di sinilah RTC dibaca dan hasil NTP diterapkan. */
   tm_tick();
 
-  /* ---- jam besar ---- */
+  /* struct tm/have_time TIDAK dibuang walau jam besar sudah dihapus dari
+   * halaman ini (lihat build_wajah()): heartbeat serial di bawah masih
+   * memakai keduanya. */
   struct tm t;
   bool have_time = tm_now(&t);
-  if (have_time) {
-    static int menit_lalu = -1;
-    if (t.tm_min != menit_lalu) {
-      menit_lalu = t.tm_min;
-      lv_label_set_text_fmt(lbl_jam_hh, "%02d", t.tm_hour);
-      lv_label_set_text_fmt(lbl_jam_mm, "%02d", t.tm_min);
-    }
-  }
 
   status_baris();
+  home_refresh();
 
   /* ---- pita kemajuan di tepi layar ----
    * Hanya hidup selama pengukuran; di luar itu tepi layar harus bersih supaya
    * wajah jam kembali seperti desainnya. */
   tepi_set(jam_sedang_mengukur() ? (int)jam_ukur_persen() : 0);
+
+  /* ---- halaman utama <-> halaman kedua ----
+   * SEBELUM blok bangun-layar di bawah: kalau keduanya terjadi di putaran yang
+   * sama (mis. UKUR datang lewat BLE selagi layar mati), lv_obj_invalidate()
+   * yang dipanggil layar_set() harus sudah menunjuk ke layar yang BARU dipilih
+   * di sini, bukan layar lama yang sebentar lagi diganti. */
+  halaman_evaluasi();
 
   /* ---- pengukuran yang tidak dimulai tombol membangunkan layar ----
    * Alasannya berubah di v1.3 tetapi barisnya tetap perlu, dan justru lebih
@@ -1486,7 +1796,11 @@ static void refresh_cb(lv_timer_t *tm) {
       if (chg && isi_lalu == 0) layar_nyala_sementara(LAYAR_AUTO_MATI_MS);
       kotak_lalu = kotak;
       isi_lalu   = chg;
-      batt_gambar(kotak, chg != 0);
+      /* Kedua salinan disegarkan bersamaan -- lihat komentar batt_widget_t --
+       * supaya halaman mana pun yang aktif saat halaman_evaluasi() berikutnya
+       * berpindah tidak pernah menampilkan ikon yang basi. */
+      batt_gambar(&batt_wajah, kotak, chg != 0);
+      batt_gambar(&batt_home, kotak, chg != 0);
     }
   }
 
@@ -1802,6 +2116,15 @@ static void boot_aktifkan(void) {
    * dipetakan ke satu-satunya keadaan yang tersisa -- IDLE tanpa titik ter-ARM --
    * jadi ia tidak pernah bisa mencuri giliran dari jalur protokol mana pun. */
   tombol_arti_t arti = tombol_arti();
+
+  /* Tombol fisik SELALU membawa ke halaman kedua, diterima atau ditolak.
+   * Tanpa ini, menekan tombol saat berdiri di halaman utama tidak
+   * menghasilkan apa pun yang terlihat: status_pesan()/status_baris() cuma
+   * menulis ke lbl_status, dan label itu cuma ada di scr_wajah. Ini jalur
+   * yang sama dengan halaman_evaluasi(), sengaja dipaksa lebih awal supaya
+   * umpan baliknya tampil sejak frame pertama, bukan menyusul di putaran
+   * refresh berikutnya. */
+  halaman_set(true);
 
   if (arti == TBL_CEK_MANUAL) jam_cek_manual();
   else                        jam_tekan_tombol();
@@ -2165,6 +2488,7 @@ void setup() {
   ppg_begin();
 
   build_wajah();
+  build_home();
   build_splash();
   splash_mulai();
 
@@ -2230,6 +2554,16 @@ void setup() {
    * (NVS -> boot_id naik -> muat ring -> sesi dipaksa IDLE -> BLE -> event
    * BOOT); lihat aw_jam.cpp. */
   jam_mulai();
+
+  /* Koreksi halaman: splash_tutup() sudah memuat scr_home lebih dulu karena
+   * urutan init ini WAJIB splash sebelum jam_mulai() (dokumen 13.4), jadi ia
+   * tidak bisa tahu ada ARM_TITIK yang selamat lintas boot (dokumen 5 & 11).
+   * Sekarang jam_mulai() sudah memuat NVS dan mencerminkannya ke RAM, jadi
+   * jam_titik_armed() dkk. baru berarti sungguhan mulai dari sini -- kalau
+   * tombol ukur memang harus menyala, halaman kedua yang tampil sejak frame
+   * pertama loop(), bukan menyusul satu putaran refresh_cb() kemudian. */
+  halaman_evaluasi();
+
   net_begin();
 
   Serial.printf("[ok] setup selesai, free heap = %lu\n", (unsigned long)ESP.getFreeHeap());

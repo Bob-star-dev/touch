@@ -25,7 +25,10 @@ ASSETS = [
     ("img_diamond",  "1baru.png", (230, 358, 250, 378), (10, 10)),
 
     # --- Ikon kartu wajah jam baru ---
-    # Diambil 1:1 dari wajah_jam_modular_240x280.png, yang memang sudah dibuat
+    # Sempat diganti (2026-09-02) ke ikon hasil crop dari WhatsApp Image
+    # 2026-09-02 at 00.33.37.jpeg, tapi itu dibatalkan atas permintaan "buat
+    # seperti wajah_jam_modular_240x280.png lagi". Dikembalikan ke sumber asli:
+    # diambil 1:1 dari wajah_jam_modular_240x280.png, yang memang sudah dibuat
     # pada ukuran layar sebenarnya -- jadi tidak ada penskalaan sama sekali dan
     # ikonnya setajam di desain. Kotak 16x18 dipakai untuk KEEMPATNYA walau
     # ikonnya sendiri berbeda ukuran (hati 12x11, tetes 10x12, segi enam 12x14,
@@ -34,8 +37,8 @@ ASSETS = [
     #
     # Aset LVGL ini TRUE_COLOR tanpa alpha, jadi latar yang ikut terpotong
     # menjadi bagian gambar. Itu justru yang diinginkan di sini: latarnya persis
-    # warna kartu (#171A21), dan kartu di layar memakai warna yang sama, jadi
-    # potongannya melebur tanpa kotak yang terlihat.
+    # warna kartu (#171A21, lihat C_KARTU di touch.ino), dan kartu di layar
+    # memakai warna yang sama, jadi potongannya melebur tanpa kotak terlihat.
     ("ic_detak",   "wajah_jam_modular_240x280.png", (20, 110, 36, 128), (16, 18)),
     ("ic_spo2",    "wajah_jam_modular_240x280.png", (134, 110, 150, 128), (16, 18)),
     ("ic_glukosa", "wajah_jam_modular_240x280.png", (20, 200, 36, 218), (16, 18)),
