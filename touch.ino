@@ -116,11 +116,18 @@ typedef struct {
 } batt_widget_t;
 
 /* Subset digit-only dari montserrat_48 (cuma glyph '-' '.' '/' dan 0-9),
- * dipakai untuk jam besar. Font bawaan LVGL di ukuran itu ikut membawa seluruh
- * ASCII + ikon FontAwesome (~90 KB) yang tak pernah dirender di sini.
- * font_digits_46 tetap ada di direktori sketsa tapi tidak lagi dipakai. */
+ * dipakai untuk jam besar di halaman KEDUA (wajah metrik). Font bawaan LVGL
+ * di ukuran itu ikut membawa seluruh ASCII + ikon FontAwesome (~90 KB) yang
+ * tak pernah dirender di sini. font_digits_46 tetap ada di direktori sketsa
+ * tapi tidak lagi dipakai.
+ *
+ * font_jam_home: subset serupa tapi Montserrat BOLD 64px, dipakai KHUSUS jam
+ * besar halaman UTAMA (lihat font_jam_home.c untuk alasan bold-nya). Dua font
+ * beda, bukan satu dipakai dua kali -- lihat komentar di build_home() untuk
+ * kenapa keduanya tidak (lagi) berbagi geometri. */
 extern "C" {
 LV_FONT_DECLARE(font_digits_48)
+LV_FONT_DECLARE(font_jam_home)
 }
 
 /* ---------------- Pin map ESP32-C6-Touch-LCD-1.69 ---------------- */
@@ -568,24 +575,50 @@ static void layar_nyala_sementara(uint32_t ms) {
 #define HOME_HDR_H       31    /* tinggi bilah header, sampai garis pemisah  */
 #define HOME_VSEP_X     120    /* garis pemisah tegak di header, tengah layar */
 
-#define HOME_PLANE_X     40
-#define HOME_PLANE_Y     50    /* img_plane 152x122 ditempel apa adanya      */
+/* img_plane (ilustrasi pesawat kertas, sisa desain 7-layar lama) sengaja
+ * TIDAK dipakai lagi di sini -- permintaan langsung supaya halaman utama
+ * tidak ada pesawatnya. Ruang 122px yang dulu dipakainya (y 50-172) itulah
+ * yang sekarang membiarkan jam besar dan blok hari/tanggal dipusatkan
+ * vertikal di bawah, alih-alih berdesakan di bagian bawah layar seperti
+ * sebelumnya. img_weather dan img_diamond TETAP dipakai. */
 
-/* Pemisah "garis - wajik - garis" di atas nama hari. */
-#define HOME_SEP_Y      183
+/* Pemisah "garis - wajik - garis" di atas nama hari. Y ini plus seluruh blok
+ * hari/jam/tanggal di bawahnya dipusatkan vertikal pada badan layar (di bawah
+ * header, 31-280px): jarak header->pemisah dan tanggal->tepi bawah sengaja
+ * dibuat sama (55px) supaya blok ini terasa mengambang di tengah, bukan
+ * menempel ke salah satu tepi. */
+#define HOME_SEP_Y       91
 #define HOME_SEP_GAP      3    /* jarak ujung garis ke wajik                 */
 #define HOME_SEP_LINE_W  28
 
-#define HOME_HARI_Y     193
-#define HOME_TANGGAL_Y  259
+#define HOME_HARI_Y     108
+#define HOME_TANGGAL_Y  210
 
-/* Jam besar, font_digits_48 -- SAMA dengan halaman kedua, cuma dipusatkan di
- * x=120 alih-alih rata kanan ke kartu. Titik dua di sini emas, bukan putih,
- * karena desainnya begitu (lihat 1baru.png). */
-#define HOME_JAM_Y      207
-#define HOME_TITIK_DUA_X 116   /* 120 - lebar/2 */
-#define HOME_TITIK_DUA_W   8
-#define HOME_JAM_GAP       5   /* jarak digit ke titik dua, kedua sisi */
+/* Jam besar, font_jam_home (Montserrat Bold 64px) -- BUKAN font_digits_48
+ * yang dipakai halaman kedua. Sebelum halaman ini dirombak (hapus pesawat)
+ * keduanya sengaja berbagi font supaya geometrinya identik; sekarang jam di
+ * sini jauh lebih besar (ink ~47px vs ~34px) jadi offset titik dua dan
+ * lebar kotak HH/MM di bawah ini dihitung ULANG dari metrik font_jam_home,
+ * BUKAN diturunkan dari halaman kedua lagi -- jangan disamakan lagi tanpa
+ * menghitung ulang dari font_jam_home.c.
+ *
+ * Titik dua di sini emas, bukan putih, karena desainnya begitu (lihat
+ * 1baru.png). Lebar kotak HH/MM (94px) dan GAP (8px) dipilih supaya kombinasi
+ * dua-digit terlebar font_jam_home (mis. "04"/"44", ~89px) tetap muat dengan
+ * sisa ruang di kedua tepi layar -- JANGAN diperkecil tanpa mengukur ulang
+ * adv_w terlebar di font_jam_home.c kalau font itu diganti lagi. */
+#define HOME_JAM_Y       143
+#define HOME_JAM_W        94   /* cukup utk kombinasi 2 digit terlebar font_jam_home */
+#define HOME_TITIK_DUA_X 114   /* 120 - lebar/2 */
+#define HOME_TITIK_DUA_W  12
+#define HOME_JAM_GAP       8   /* jarak digit ke titik dua, kedua sisi */
+
+/* Offset vertikal kedua kotak titik dua, relatif ke HOME_JAM_Y -- dihitung
+ * dari ink height font_jam_home (47px) dibagi rata: pra-jarak, kotak,
+ * jarak-tengah, kotak masing-masing ~12/12/11/12px. Lihat font_jam_home.c
+ * (glyph_dsc, line_height=47) kalau ukuran fontnya berubah lagi. */
+#define HOME_JAM_DOT1_DY  12
+#define HOME_JAM_DOT2_DY  35
 
 /* ================= SUMBER DATA =================
  * Tidak ada angka yang dikarang di layar ini. Kalau sebuah nilai belum
@@ -1066,11 +1099,13 @@ static void build_wajah(void) {
  * jam -- ARM_SESI/ARM_TITIK/UKUR/MULAI_SESI -- dan tombol fisik yang menyusul
  * di belakangnya. Lihat halaman_evaluasi() untuk aturannya.
  *
- * img_plane/img_weather/img_diamond sudah lama ada di ui_assets.h (sisa
- * desain 7-layar lama) tapi baru dipakai di sini. Warna latar (C_HOME_BG_HDR/
- * C_HOME_BG_BODY) HARUS sama persis dengan yang dipanggang ke ketiga bitmap
- * itu di 1baru.png, kalau tidak kotak potongannya akan terlihat -- sama
- * seperti syarat SPL_BG untuk splash_assets.h. */
+ * img_weather/img_diamond sudah lama ada di ui_assets.h (sisa desain 7-layar
+ * lama) tapi baru dipakai di sini. img_plane (ilustrasi pesawat) ada di berkas
+ * yang sama tapi SENGAJA tidak dipanggil lagi -- lihat catatan di dekat
+ * HOME_SEP_Y. Warna latar (C_HOME_BG_HDR/C_HOME_BG_BODY) HARUS sama persis
+ * dengan yang dipanggang ke bitmap img_weather/img_diamond di 1baru.png,
+ * kalau tidak kotak potongannya akan terlihat -- sama seperti syarat SPL_BG
+ * untuk splash_assets.h. */
 static void build_home(void) {
   scr_home = lv_obj_create(NULL);
   lv_obj_remove_style_all(scr_home);
@@ -1093,9 +1128,6 @@ static void build_home(void) {
 
   batt_buat(scr_home, &batt_home, BATT_KANAN_HOME, BATT_Y_HOME);
 
-  /* --- ilustrasi --- */
-  mk_img(scr_home, &img_plane, HOME_PLANE_X, HOME_PLANE_Y);
-
   /* --- pemisah "garis - wajik - garis" --- */
   mk_box(scr_home, HOME_VSEP_X - 5 - HOME_SEP_GAP - HOME_SEP_LINE_W, HOME_SEP_Y,
         HOME_SEP_LINE_W, 1, C_HOME_GOLD, 0);
@@ -1111,20 +1143,23 @@ static void build_home(void) {
   lv_obj_set_style_text_letter_space(lbl_home_hari, 2, 0);
 
   /* --- jam besar, dipusatkan di x=120 (bukan rata kanan ke kartu seperti
-   * halaman kedua) -- lihat definisi HOME_JAM_Y dkk. untuk pengukurannya. */
-  lbl_home_hh = mk_label(scr_home, "--", &font_digits_48, C_PUTIH, 0, HOME_JAM_Y);
-  lv_obj_set_width(lbl_home_hh, HOME_TITIK_DUA_X - HOME_JAM_GAP);
+   * halaman kedua) -- font_jam_home, bukan font_digits_48; lihat definisi
+   * HOME_JAM_Y dkk. untuk pengukurannya. Lebar kotak HOME_JAM_W dipatok
+   * (bukan cuma HOME_TITIK_DUA_X - HOME_JAM_GAP seperti dulu) supaya rata-
+   * kanan/kirinya tidak diam-diam berubah kalau HOME_JAM_GAP disetel ulang. */
+  lbl_home_hh = mk_label(scr_home, "--", &font_jam_home, C_PUTIH, 0, HOME_JAM_Y);
+  lv_obj_set_width(lbl_home_hh, HOME_JAM_W);
   lv_obj_set_style_text_align(lbl_home_hh, LV_TEXT_ALIGN_RIGHT, 0);
 
-  /* Offset +18/+35 dari y label sama persis dengan yang dipakai titik dua
-   * halaman kedua (lihat build_wajah()) -- font dan ukurannya identik, cuma
-   * warnanya beda (emas di sini, sesuai desain). */
-  mk_box(scr_home, HOME_TITIK_DUA_X, HOME_JAM_Y + 18,
+  /* Offset HOME_JAM_DOT1_DY/DOT2_DY dihitung dari metrik font_jam_home
+   * sendiri (lihat definisinya) -- BUKAN lagi disamakan dengan titik dua
+   * halaman kedua, karena font dan ukurannya sudah tidak sama lagi. */
+  mk_box(scr_home, HOME_TITIK_DUA_X, HOME_JAM_Y + HOME_JAM_DOT1_DY,
         HOME_TITIK_DUA_W, HOME_TITIK_DUA_W, C_HOME_GOLD, 2);
-  mk_box(scr_home, HOME_TITIK_DUA_X, HOME_JAM_Y + 35,
+  mk_box(scr_home, HOME_TITIK_DUA_X, HOME_JAM_Y + HOME_JAM_DOT2_DY,
         HOME_TITIK_DUA_W, HOME_TITIK_DUA_W, C_HOME_GOLD, 2);
 
-  lbl_home_mm = mk_label(scr_home, "--", &font_digits_48, C_PUTIH,
+  lbl_home_mm = mk_label(scr_home, "--", &font_jam_home, C_PUTIH,
                          HOME_TITIK_DUA_X + HOME_TITIK_DUA_W + HOME_JAM_GAP,
                          HOME_JAM_Y);
 
