@@ -190,6 +190,13 @@ titik <idx>  ARM_TITIK index idx
 now          UKUR_SEKARANG
 tombol       tekan tombol fisik (bukan BLE — menguji dispatcher satu tombol)
 status       cetak keadaan jam
+id <1-99>    atur label uji manual (bukan protokol) — nama BLE jadi
+             "AsaWatch NN" alih-alih suffix hex MAC, disimpan di NVS,
+             kepakai setelah boot ulang. Berguna kalau banyak jam identik
+             disambungkan berurutan dan suffix hex MAC-nya kebetulan sama
+             (unit dari batch produksi yang sama — TERBUKTI terjadi pada
+             batch 10 unit pengujian, bukan cuma teori: bahkan suffix
+             6-hex/3-byte pun masih bisa bertabrakan).
 ```
 
 Satu sesi utuh: `arm` → `ukur 0` → `tombol` → `titik 2` → `tombol` →

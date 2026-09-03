@@ -90,6 +90,7 @@
 #include "ppg.h"
 #include "aw_jam.h"
 #include "aw_ble.h"
+#include "aw_store.h"
 
 /* Ditaruh SETINGGI ini, jauh dari satu-satunya pemakainya di bawah, karena
  * praprosesor Arduino menyisipkan prototipe otomatis tepat setelah blok #include
@@ -2374,6 +2375,13 @@ static void konsol_jalankan(char *baris) {
   }
   else if (!strcmp(baris, "sag"))    sag_ukur(true);
   else if (!strcmp(baris, "saglog")) sag_cetak_log();
+  else if (!strcmp(baris, "id")) {
+    /* Label uji manual (bukan bagian protokol) -- lihat komentar
+     * aw_label_set(). Nama BLE baru kepakai setelah boot ulang karena
+     * NimBLEDevice::init() cuma dipanggil sekali di aw_ble_begin(). */
+    if (sp && arg >= 1 && arg <= 99) aw_label_set((uint8_t)arg);
+    else Serial.println("[konsol] pakai: id <1-99>");
+  }
   else if (baris[0]) Serial.printf("[konsol] tidak dikenal: \"%s\"\n", baris);
 }
 

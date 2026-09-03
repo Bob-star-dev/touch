@@ -21,6 +21,7 @@ uint32_t aw_uptime_s(void) {
 #define K_ANCHORED    "anchored"
 #define K_KALIB       "kalib"
 #define K_TITIK       "titik"
+#define K_LABEL       "label"
 
 /* Blob ring dibubuhi magic + versi. Kalau tata letak aw_entri_t berubah (mis.
  * field baru ditambahkan), blob lama dibuang alih-alih dibaca sebagai sampah:
@@ -73,6 +74,7 @@ static ring_blob_t  s_ring;
 static anchored_t   s_anchored;
 static kalib_t      s_kalib;
 static titik_t      s_titik;
+static uint8_t      s_label = 0;
 static uint16_t     s_boot_id = 0;
 static bool         s_anchor_boot_ini = false;
 static bool         s_flag_penuh = false;
@@ -171,6 +173,8 @@ void aw_store_begin(void) {
   size_t nt = s_nvs.getBytes(K_TITIK, &s_titik, sizeof(s_titik));
   if (nt != sizeof(s_titik)) memset(&s_titik, 0, sizeof(s_titik));
 
+  s_label = s_nvs.getUChar(K_LABEL, 0);
+
   /* Disalin ke RAM saat boot justru karena membacanya dari NVS di dalam
    * callback onRead terlarang (dokumen 4 & 13.1). */
   s_anchor_boot_ini = aw_boot_punya_anchor(s_boot_id);
@@ -182,6 +186,9 @@ void aw_store_begin(void) {
   if (s_titik.valid)
     Serial.printf("[store] ARM_TITIK selamat: index %u -- tombol ukur menyala\n",
                   (unsigned)s_titik.index_);
+  if (s_label)
+    Serial.printf("[store] label uji: %u -- nama BLE \"AsaWatch %02u\"\n",
+                  (unsigned)s_label, (unsigned)s_label);
   Serial.printf("[store] boot_id=%u, %d entri tersisa di buffer, kalibrasi=%s\n",
                 (unsigned)s_boot_id, tertunda, s_kalib.valid ? "ada" : "kosong");
 }
@@ -235,6 +242,16 @@ void aw_kalibrasi_set(int16_t offset_sis, int16_t offset_dia) {
   if (s_nvs_ok) s_nvs.putBytes(K_KALIB, &s_kalib, sizeof(s_kalib));
   Serial.printf("[store] kalibrasi disimpan: %+d/%+d mmHg\n",
                 (int)offset_sis, (int)offset_dia);
+}
+
+/* ---------------- Label uji ---------------- */
+uint8_t aw_label_get(void) { return s_label; }
+
+void aw_label_set(uint8_t n) {
+  s_label = n;
+  if (s_nvs_ok) s_nvs.putUChar(K_LABEL, n);
+  Serial.printf("[store] label disimpan: %u -- perlu boot ulang supaya nama "
+                "BLE ikut berubah\n", (unsigned)n);
 }
 
 /* ---------------- Titik yang ter-ARM (v1.3) ---------------- */

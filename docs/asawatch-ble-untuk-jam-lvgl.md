@@ -216,9 +216,19 @@ Battery Level memakai standar `0x180F` / `0x2A19`, bukan karakteristik kustom.
 ### 3.2 Iklan — butir paling mudah dilewatkan
 
 Paket iklan wajib memuat **Complete List of 128-bit Service UUIDs**. Scan response memuat
-**Complete Local Name** (`AsaWatch<4 hex terakhir serial>`, tanpa spasi, mis. `AsaWatch3F1A`) dan
+**Complete Local Name** (`AsaWatch<6 hex terakhir serial>`, tanpa spasi, mis. `AsaWatch2C3F1A` --
+sempat 4 hex/2 byte, dinaikkan ke 6 hex/3 byte setelah pengujian nyata pada batch 10 unit
+menemukan 2 byte terakhir MAC bisa kebetulan identik pada beberapa unit sekaligus) dan
 **Manufacturer Specific Data** (1 byte versi mayor, agar app bisa menandai firmware terlalu tua
 sebelum menyambung).
+
+Nama boleh berbeda bentuk tanpa mengubah kontrak apa pun: kalau label uji manual diatur lewat
+konsol serial jam (`id N`, `N` 1-99 — lihat `aw_store.aw_label_get()`), nama BLE-nya jadi
+`AsaWatch NN` (dua digit desimal) alih-alih suffix hex MAC. Ini murni kenyamanan lab untuk
+membedakan banyak unit identik di meja uji — suffix hex dari MAC TERBUKTI bisa kebetulan sama
+pada beberapa unit dari satu batch produksi sekaligus (bukan cuma 4-hex, 6-hex pun pernah
+bertabrakan pada pengujian batch 10 unit) — app tidak perlu tahu bedanya, cukup tampilkan nama
+apa adanya dari hasil scan seperti biasa.
 
 > **Ketiganya tidak muat dalam satu paket iklan legacy.** Batas 31 byte; UUID 128-bit memakan 18
 > byte, nama 15 byte, manufacturer data 5 byte — total 38. Nama dan manufacturer data **harus**
@@ -235,7 +245,7 @@ data_iklan.setFlags(BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP);
 data_iklan.setCompleteServices(NimBLEUUID(UUID_SERVICE));   // WAJIB di sini
 
 NimBLEAdvertisementData data_scan;
-data_scan.setName(nama);                                    // "AsaWatch3F1A"
+data_scan.setName(nama);                                    // "AsaWatch2C3F1A"
 std::vector<uint8_t> md = {0xFF, 0xFF, VERSI_MAYOR};        // 0xFFFF = company id uji
 data_scan.setManufacturerData(md);
 

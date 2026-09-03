@@ -355,7 +355,20 @@ void aw_ble_begin(void) {
    * seperti id perangkat dari OS (MAC di Android, UUID di iOS). */
   esp_efuse_mac_get_default(s_serial);
 
-  snprintf(s_nama, sizeof(s_nama), "AsaWatch%02X%02X", s_serial[4], s_serial[5]);
+  /* Label uji (aw_store, "id N" di konsol serial) MENANG atas suffix hex
+   * MAC kalau sudah diatur -- lihat komentar aw_label_get(). Diperlukan
+   * karena suffix MAC terbukti TIDAK cukup unik pada batch 10 unit
+   * pengujian: bukan cuma 2 byte terakhir (3 dari 10 kebetulan sama,
+   * "FE16"), 3 byte terakhir (6 hex) pun masih kebetulan bertabrakan pada
+   * unit lain -- variasi byte rendah MAC batch ini ternyata sempit. Label
+   * manual adalah satu-satunya cara yang PASTI, tidak bergantung MAC sama
+   * sekali. 0 = belum diatur, jatuh ke suffix MAC 6-hex seperti biasa. */
+  uint8_t label = aw_label_get();
+  if (label)
+    snprintf(s_nama, sizeof(s_nama), "AsaWatch %02u", (unsigned)label);
+  else
+    snprintf(s_nama, sizeof(s_nama), "AsaWatch%02X%02X%02X",
+             s_serial[3], s_serial[4], s_serial[5]);
 
   s_antrean = xQueueCreate(8, sizeof(aw_perintah_t));
 

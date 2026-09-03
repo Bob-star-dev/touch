@@ -87,6 +87,20 @@ bool aw_kalibrasi_ada(void);
 void aw_kalibrasi_get(int16_t *offset_sis, int16_t *offset_dia);
 void aw_kalibrasi_set(int16_t offset_sis, int16_t offset_dia);
 
+/* ---- Label uji (nomor 1-99 yang diatur MANUAL lewat konsol serial, "id N")
+ * ----
+ * BUKAN bagian protokol/kontrak kawat -- murni kenyamanan lab. Sempat
+ * dihapus (MAC 6-hex dianggap cukup unik), tapi PENGUJIAN NYATA pada batch
+ * 10 unit membuktikan itu salah: bukan cuma 2 byte terakhir MAC yang bisa
+ * kebetulan sama pada beberapa unit sekaligus (3 dari 10, ditemukan
+ * duluan), TERNYATA 3 byte terakhir pun masih bisa kebetulan sama (unit
+ * "jam ke-4"). Dipasang lagi sebagai jalan pasti yang tidak bergantung pada
+ * variasi MAC unit sama sekali. Kalau diatur (bukan 0), nama BLE jadi
+ * "AsaWatch NN" alih-alih suffix hex MAC -- lihat aw_ble_begin(). 0 =
+ * belum diatur, jatuh kembali ke suffix hex MAC seperti biasa. */
+uint8_t aw_label_get(void);
+void    aw_label_set(uint8_t n);
+
 /* ---- Ring buffer ----
  * Kedua fungsi penambah mengembalikan seq entri baru (1..255), atau 0 kalau
  * entri ditolak. Keduanya TIDAK mengirim event BUFFER_PENUH sendiri: itu
