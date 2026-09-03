@@ -216,7 +216,7 @@ Battery Level memakai standar `0x180F` / `0x2A19`, bukan karakteristik kustom.
 ### 3.2 Iklan — butir paling mudah dilewatkan
 
 Paket iklan wajib memuat **Complete List of 128-bit Service UUIDs**. Scan response memuat
-**Complete Local Name** (`AsaWatch <4 hex terakhir serial>`, mis. `AsaWatch 3F1A`) dan
+**Complete Local Name** (`AsaWatch<4 hex terakhir serial>`, tanpa spasi, mis. `AsaWatch3F1A`) dan
 **Manufacturer Specific Data** (1 byte versi mayor, agar app bisa menandai firmware terlalu tua
 sebelum menyambung).
 
@@ -235,7 +235,7 @@ data_iklan.setFlags(BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP);
 data_iklan.setCompleteServices(NimBLEUUID(UUID_SERVICE));   // WAJIB di sini
 
 NimBLEAdvertisementData data_scan;
-data_scan.setName(nama);                                    // "AsaWatch 3F1A"
+data_scan.setName(nama);                                    // "AsaWatch3F1A"
 std::vector<uint8_t> md = {0xFF, 0xFF, VERSI_MAYOR};        // 0xFFFF = company id uji
 data_scan.setManufacturerData(md);
 

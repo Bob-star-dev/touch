@@ -354,7 +354,8 @@ void aw_ble_begin(void) {
   /* Serial 6 byte dari MAC efuse: stabil lintas boot DAN lintas platform, tidak
    * seperti id perangkat dari OS (MAC di Android, UUID di iOS). */
   esp_efuse_mac_get_default(s_serial);
-  snprintf(s_nama, sizeof(s_nama), "AsaWatch %02X%02X", s_serial[4], s_serial[5]);
+
+  snprintf(s_nama, sizeof(s_nama), "AsaWatch%02X%02X", s_serial[4], s_serial[5]);
 
   s_antrean = xQueueCreate(8, sizeof(aw_perintah_t));
 
