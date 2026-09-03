@@ -1132,17 +1132,28 @@ static void build_home(void) {
 
   /* --- jam: dua baris rata kiri di dalam LING1, font_home_big putih rata
    * (lihat komentar LV_FONT_DECLARE kenapa boleh balik pakai font biasa).
-   * Dibuat SESUDAH kedua lingkaran supaya tergambar di atasnya. */
-  lbl_home_jam   = mk_label(scr_home, "--", &font_home_big, C_PUTIH,
+   * Dibuat SESUDAH kedua lingkaran supaya tergambar di atasnya.
+   *
+   * Isi awal "00"/"00", BUKAN "--" -- font_home_big cuma memuat glyph
+   * '0'-'9' (lihat genhomefont.sh), jadi "--" akan tampil sebagai KOTAK
+   * (glyph hilang) selama tm_now() belum berhasil (RTC tidak terpasang di
+   * board ini DAN BLE belum tersambung -- lihat riwayat percakapan/foto).
+   * "00" aman karena '0' ADA di font, dan home_refresh() menimpanya begitu
+   * tm_now() berhasil, jadi pengguna melihat "00:00" yang wajar, bukan
+   * kotak kosong, sebelum tersambung. */
+  lbl_home_jam   = mk_label(scr_home, "00", &font_home_big, C_PUTIH,
                             HOME_JAM_X, HOME_JAM_Y);
-  lbl_home_menit = mk_label(scr_home, "--", &font_home_big, C_PUTIH,
+  lbl_home_menit = mk_label(scr_home, "00", &font_home_big, C_PUTIH,
                             HOME_JAM_X, HOME_MENIT_Y);
 
   /* --- hari/tanggal gabungan, satu baris di bawah LING1 (baris cuaca
    * kece.png sengaja tidak ada -- lihat komentar HOME_TANGGAL_X).
-   * font_home_kecil (Poppins Black 26px, bukan lv_font_montserrat_20 lagi)
+   * font_home_kecil (Poppins Black 20px, bukan lv_font_montserrat_20 lagi)
    * atas permintaan eksplisit supaya tulisannya BOLD -- Montserrat bawaan
-   * LVGL cuma satu ketebalan, tidak ada varian bold yang bisa dipilih. */
+   * LVGL cuma satu ketebalan, tidak ada varian bold yang bisa dipilih.
+   * Isi awal "--" AMAN di sini (beda dari lbl_home_jam di atas) karena
+   * font_home_kecil SUDAH memuat glyph '-' (0x2D) -- sempat tidak, itu
+   * bug yang sama persis, sudah diperbaiki lewat genhomefont.sh. */
   lbl_home_tanggal = mk_label(scr_home, "--", &font_home_kecil, C_PUTIH,
                               HOME_TANGGAL_X, HOME_TANGGAL_Y);
 }

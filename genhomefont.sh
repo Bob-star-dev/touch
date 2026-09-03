@@ -3,10 +3,13 @@
 # lingkaran" (lihat komentar C_HOME_BG di touch.ino):
 #   font_home_big.c    digit-saja (0-9), 90px  -- jam besar "10"/"08"
 #     (sempat 80px, diperbesar ke 90px atas permintaan lanjutan)
-#   font_home_kecil.c  spasi+koma+digit+A-Z, 20px -- baris "SENIN, OKT 24"
-#     (dibuat tebal atas permintaan eksplisit -- lv_font_montserrat_20
-#     bawaan LVGL cuma satu ketebalan, tidak ada varian bold; sempat 26px,
-#     diperkecil lagi ke 20px atas permintaan lanjutan)
+#   font_home_kecil.c  spasi+koma+strip+digit+A-Z, 20px -- baris
+#     "SENIN, OKT 24" (dibuat tebal atas permintaan eksplisit --
+#     lv_font_montserrat_20 bawaan LVGL cuma satu ketebalan, tidak ada
+#     varian bold; sempat 26px, diperkecil lagi ke 20px atas permintaan
+#     lanjutan). STRIP (0x2D) WAJIB ada -- placeholder "--" sebelum BLE
+#     tersambung/RTC terbaca dulu sempat tampil KOTAK (glyph hilang) karena
+#     rentang awal tidak menyertakannya -- lihat riwayat percakapan.
 # Beda dari genhomedigits.py (revisi sebelumnya, sudah tidak dipakai): jam
 # sekarang PUTIH RATA, bukan bergradasi, jadi boleh balik jadi font LVGL
 # biasa alih-alih bitmap.
@@ -38,7 +41,7 @@ npx --yes lv_font_conv@1.5.3 --no-compress --no-prefilter --bpp 4 --size 90 \
 rapikan_include font_home_big.c
 
 npx --yes lv_font_conv@1.5.3 --no-compress --no-prefilter --bpp 4 --size 20 \
-  --font "$FONT_TTF" -r "0x20,0x2C,0x30-0x39,0x41-0x5A" \
+  --font "$FONT_TTF" -r "0x20,0x2C,0x2D,0x30-0x39,0x41-0x5A" \
   --format lvgl -o font_home_kecil.c --force-fast-kern-format
 rapikan_include font_home_kecil.c
 
